@@ -1,0 +1,231 @@
+# RFB 真机 forkd E2E（Real-VM）：在 KVM 可用的 GitHub runner 上驱动真实
+# Firecracker/forkd 栈跑 tests/forkd_real_e2e.rs 的全部 #[ignore] 测试。
+# 与 ci.yml 保持同一约定：本工作流随 rfb 子树作为独立 GitHub 仓库推送时，
+# checkout 根目录即 rfb 工作区（Cargo.toml/resx/ 所在地），因此各步骤无需再
+# 进入子目录。触发仅限 push 到 main 与 workflow_dispatch（按需求，不跑 PR）。
+#
+# 无任何 secret：forkd controller 不启用认证（不设 FORKD_TOKEN），凭据面为零。
+# 真机测试需要独占 VM/网络资源：用并发组排队，避免两次运行互相踩踏。
+
+name: RFB forkd real-VM E2E
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rfb-forkd-real-e2e
+  cancel-in-progress: false
+
+jobs:
+  forkd-real-e2e:
+    name: forkd real-VM E2E (KVM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FORKD_URL: http://127.0.0.1:8889
+      FORKD_TAP: forkd-tap0
+      FORKD_BIN: ${{ github.workspace }}/resx/forkd/forkd
+      FORKD_KERNEL: ${{ github.workspace }}/resx/kernel/vmlinux-5.10.225
+    steps:
+      - uses: actions/checkout@v4
+
+      # 第 0 步：fail fast —— 没有 /dev/kvm 就不要浪费构建时间。
+      # GitHub 托管 runner 通常已带 /dev/kvm 且对 runner 用户可读写；
+      # 若权限不符，补 kvm 组并放宽设备位后复检，仍失败则明确报错退出。
+      - name: Verify /dev/kvm
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm 不存在：runner 不支持 KVM，真机 E2E 无法运行"
+            exit 1
+          fi
+          if ! [ -w /dev/kvm ]; then
+            echo "/dev/kvm 对当前用户不可写，尝试补 kvm 组并放宽设备权限"
+            sudo groupadd -f kvm
+            sudo usermod -aG kvm "$USER" || true
+            sudo chmod 666 /dev/kvm
+          fi
+          if ! [ -w /dev/kvm ]; then
+            echo "::error::/dev/kvm 仍不可读写（需 root:kvm 组权限）"
+            exit 1
+          fi
+          ls -l /dev/kvm
+
+      # 工具链：musl 目标（build-static 用）+ mke2fs/debugfs（e2fsprogs，
+      # preflight 的 tool:mke2fs 检查与 build-rootfs 依赖）+ binutils
+      # （readelf/objdump，preflight tool 检查）+ 网络/TAP 工具。
+      - name: Install toolchain and system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs binutils iproute2 iptables kmod
+          rustup target add x86_64-unknown-linux-musl
+
+      # resx 内置资产完整性：forkd/forkd-controller/firecracker/kernel 全量校验。
+      - name: Verify resx checksums
+        run: |
+          set -euo pipefail
+          sha256sum -c resx/SHA256SUMS
+          # Windows 检出等场景可能丢失可执行位，统一恢复（controller 启动与
+          # rfb-cli 委托 forkd 都要求可直接执行）。
+          chmod +x resx/forkd/forkd resx/forkd/forkd-controller
+
+      # Firecracker：先校验并解包 resx 自带的 v1.16.1 官方压缩包（chmod +x）。
+      # 实际投入使用的二进制是 resx/firecracker/firecracker-v1.12.1：
+      # tests/forkd_real_e2e.rs 的 provenance 测试把 /usr/local/bin/firecracker
+      # 的版本钉在 1.12.1，且 acceptance-evidence-2026-09-03.md 记录 v1.16.1
+      # 会被版本门禁拒绝（快照与 Firecracker 版本绑定）。两者都先过 sha256。
+      - name: Extract and install Firecracker
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/firecracker"
+          (
+            cd resx/firecracker
+            sha256sum -c firecracker-v1.16.1-x86_64.tgz.sha256
+          )
+          tar -xzf resx/firecracker/firecracker-v1.16.1-x86_64.tgz \
+            -C "$RUNNER_TEMP/firecracker"
+          find "$RUNNER_TEMP/firecracker" -name 'firecracker-*-x86_64' -type f \
+            -exec chmod +x {} +
+          sudo install -m 755 resx/firecracker/firecracker-v1.12.1 \
+            /usr/local/bin/firecracker
+          firecracker --version
+
+      # 构建：CLI（含 rfb-cli bin）→ musl 静态 rfb-runtime → forkd-agent rootfs。
+      # 与 sdk/BACKEND_SETUP.md 的文档流程一致。
+      - name: Build rfb-cli and forkd-agent rootfs
+        run: |
+          set -euo pipefail
+          cargo build -p rfb --features cli --release
+          ./target/release/rfb-cli image build-static \
+            --root . --target x86_64-unknown-linux-musl --package rfb-runtime
+          ./target/release/rfb-cli image build-rootfs \
+            target/x86_64-unknown-linux-musl/release/rfb-runtime \
+            resx/rootfs/forkd-agent.ext4 --mode forkd-agent --force
+          ./target/release/rfb-cli image check-kernel resx/kernel/vmlinux-5.10.225
+
+      # 临时 TAP：preflight 的 forkd_tap 检查要求 forkd-tap0 存在且 UP，
+      # 地址段 10.42.0.1/24 与 real-machine-runbook.md 一致（全新 runner 无
+      # cni0 冲突）。创建动作需要 root，结束后在 teardown 步骤删除。
+      - name: Create forkd-tap0
+        run: |
+          set -euo pipefail
+          sudo ip tuntap add dev forkd-tap0 mode tap
+          sudo ip addr add 10.42.0.1/24 dev forkd-tap0
+          sudo ip link set forkd-tap0 up
+          ip -o link show forkd-tap0
+
+      # forkd controller（官方二进制）：独立 state/audit/pid 目录，snapshot
+      # root 指向默认快照目录（provenance 测试从 $HOME/.local/share/forkd/
+      # snapshots/<tag> 读取 snapshot.json/memory.bin/vmstate）。
+      - name: Start forkd-controller
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR/controller/state" "$HOME/.local/share/forkd/snapshots"
+          resx/forkd/forkd-controller \
+            --state-dir "$RUN_DIR/controller/state" \
+            --audit-log "$RUN_DIR/controller/audit.log" \
+            --snapshot-root "$HOME/.local/share/forkd/snapshots" \
+            --listen 127.0.0.1:8889 &
+          echo $! > "$RUN_DIR/controller/pid"
+          for i in $(seq 1 60); do
+            if curl -fsS "$FORKD_URL/v1/snapshots" > /dev/null 2>&1; then
+              echo "controller ready (pid $(cat "$RUN_DIR/controller/pid"))"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::forkd-controller 60s 内未就绪，audit 日志："
+          cat "$RUN_DIR/controller/audit.log" || true
+          exit 1
+
+      # 创建本轮专属快照并等待 ready+bootable（就绪判定以 GET /v1/snapshots
+      # 的 list 条目为准，与 preflight 的 forkd_snapshot 检查同源）。
+      - name: Create snapshot and wait until ready
+        run: |
+          set -euo pipefail
+          TAG="ci-e2e-$GITHUB_RUN_ID"
+          echo "tag=$TAG" >> "$GITHUB_ENV"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          ./target/release/rfb-cli forkd snapshot-create \
+            --tag "$TAG" --tap forkd-tap0 --json \
+            | tee "$RUN_DIR/snapshot-create.json"
+          for i in $(seq 1 60); do
+            if curl -fsS "$FORKD_URL/v1/snapshots" | python3 -c '
+              import json, sys
+              tag = sys.argv[1]
+              snaps = json.load(sys.stdin)
+              ok = any(s.get("tag") == tag
+                       and str(s.get("status", "")).lower() == "ready"
+                       and s.get("bootable") is True for s in snaps)
+              sys.exit(0 if ok else 1)
+            ' "$TAG"; then
+              echo "snapshot $TAG ready+bootable"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::快照 $TAG 300s 内未进入 ready+bootable 状态"
+          curl -sS "$FORKD_URL/v1/snapshots" || true
+          exit 1
+
+      # 跑真机 E2E：三重门（unix+cli cfg、#[ignore]、RFB_REAL_E2E=1）。
+      # RFB_E2E_SNAPSHOT_TAG / RFB_E2E_ROOTFS_DIR 是 tests/common/mod.rs 要求
+      # 的 harness 环境变量；FORKD_* 是 rfb-cli 与 preflight 检查所需。
+      # 注意：--test-threads=1 是真机 E2E 的明确例外 —— 真实 VM/快照无法安全
+      # 并行（多个测试会同时 boot/删除同一个快照栈）；仓库“默认并行”的规则
+      # 针对单元测试，这里必须串行，与 run-real.sh 保持一致。
+      - name: Run real-VM E2E tests
+        run: |
+          set -euo pipefail
+          export RFB_REAL_E2E=1
+          export RFB_E2E_SNAPSHOT_TAG="$TAG"
+          export RFB_E2E_ROOTFS_DIR="$PWD/resx/rootfs"
+          export FORKD_SNAPSHOT_TAG="$TAG"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          cargo test -p rfb --features cli --test forkd_real_e2e \
+            -- --ignored --test-threads=1
+
+      # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
+      # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
+      # FORKD_TOKEN），日志天然脱敏 —— 若未来引入认证，必须先过滤再上传。
+      - name: Teardown
+        if: always()
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          TAG="${TAG:-}"
+          if [ -n "$TAG" ] && [ -x target/release/rfb-cli ]; then
+            FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4" \
+              ./target/release/rfb-cli forkd snapshot-delete \
+              --tag "$TAG" --force --json || \
+              echo "warning: snapshot-delete $TAG 失败（可能未创建）"
+          fi
+          if [ -f "$RUN_DIR/controller/pid" ]; then
+            kill "$(cat "$RUN_DIR/controller/pid")" 2>/dev/null || true
+          fi
+          pkill -f forkd-controller 2>/dev/null || true
+          sudo ip link set forkd-tap0 down 2>/dev/null || true
+          sudo ip tuntap del dev forkd-tap0 mode tap 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/forkd-e2e-logs"
+          if [ -d "$RUN_DIR" ]; then
+            mv "$RUN_DIR"/* "$RUNNER_TEMP/forkd-e2e-logs"/ 2>/dev/null || true
+          fi
+          rm -rf "$RUN_DIR"
+
+      - name: Upload sanitized logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forkd-e2e-logs-${{ github.run_id }}
+          path: ${{ runner.temp }}/forkd-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7

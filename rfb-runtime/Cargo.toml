@@ -1,0 +1,91 @@
+[package]
+name = "rfb-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PLACEHOLDER_ORG/rfb"
+description = "Runtime components for RFB sandbox services"
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+async-trait = "0.1"
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+zstd = "0.13"
+thiserror = "2"
+libc = { version = "0.2", optional = true }
+uuid = { version = "1", features = ["v7"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { version = "0.7.2", optional = true }
+# Note: KVM is driven exclusively through the external `firecracker` binary
+# over its HTTP-on-UDS API; this crate deliberately has no in-process KVM
+# ioctl dependencies.
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "mem"
+harness = false
+
+[[bench]]
+name = "orchestration"
+harness = false
+
+[[bench]]
+name = "soak"
+harness = false
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+default = ["core"]
+core = ["dep:tokio"]
+guest = ["core", "dep:anyhow", "dep:libc", "dep:serde_json", "dep:tokio-vsock"]
+host-vsock = ["core", "dep:serde_json", "dep:uuid"]
+forkd = ["guest"]
+firecracker = ["core", "dep:anyhow", "dep:serde_json"]
+zeroboot = ["guest"]
+cli = ["guest", "forkd", "firecracker", "zeroboot"]
+
+[[bin]]
+name = "rfb-runtime"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "agent_contract"
+required-features = ["forkd"]
+[[test]]
+name = "firecracker"
+required-features = ["firecracker"]
+[[test]]
+name = "firecracker_controller"
+required-features = ["firecracker"]
+[[test]]
+name = "vsock"
+required-features = ["guest"]
+[[test]]
+name = "guest_transport"
+required-features = ["guest"]
+[[test]]
+name = "runtime"
+required-features = ["guest"]
+[[test]]
+name = "runtime_service"
+required-features = ["guest"]
+[[test]]
+name = "sandbox"
+required-features = ["guest"]
+[[test]]
+name = "zeroboot_connection"
+required-features = ["zeroboot"]
+[[bin]]
+name = "rfb1-workspace-client"
+path = "tests/clients/rfb1_workspace_client.rs"
+required-features = ["core"]

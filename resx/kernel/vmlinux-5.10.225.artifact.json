@@ -1,0 +1,18 @@
+{
+  "schema": "rfb-artifact/v1",
+  "backend": "rfb1",
+  "profile": "rfb1-kernel",
+  "arch": "x86_64",
+  "transport": "vsock",
+  "protocol": "rfb1",
+  "entrypoint": "/sbin/rfb-runtime",
+  "guest_port": 5000,
+  "kernel": {
+    "path": "/mnt/c/workplace/mm/monitor/rfb/resx/kernel/vmlinux-5.10.225",
+    "sha256": "14e25497df87b5c69a32231749bb694bb025164728e5d7ab5ec88793a7929ca6"
+  },
+  "vm": {
+    "cpus": 1,
+    "memory_bytes": 0
+  }
+}

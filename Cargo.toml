@@ -1,0 +1,21 @@
+[workspace]
+members = ["rfb", "rfb-rig", "rfb-runtime"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# Replace before publishing this workspace.
+repository = "https://github.com/Cricle/rfb"
+
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

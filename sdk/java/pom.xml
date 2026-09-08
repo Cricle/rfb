@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RFB Java SDK — 主 POM（parent + 主 jar 构建）。
+
+  主代码位于本目录 src/main/java/io/rfb/sdk（公共门面 io.rfb.sdk 与内部协议实现
+  io.rfb.sdk.internal），本 POM 的主构建产物即 io.rfb:rfb-sdk jar。Maven 3 要求
+  aggregator 必须是 packaging=pom，而本 POM 需要产出 rfb-sdk jar，因此不能声明
+  <modules>；tests 模块（io.rfb:rfb-sdk-tests）独立构建并依赖 io.rfb:rfb-sdk，
+  需先在本目录 mvn install 再以 -f tests/pom.xml 运行测试。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.rfb</groupId>
+  <artifactId>rfb-sdk</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>rfb-sdk</name>
+  <description>RFB Java SDK: unified RfbClient facade over forkd controller (HTTP/JSON), forkd guest (TCP NDJSON) and ZBRT v1 (binary frames) — mirror port of the Rust reference implementation</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>17</maven.compiler.release>
+    <jackson.version>2.17.2</jackson.version>
+    <junit.version>5.10.2</junit.version>
+    <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
+    <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>${maven-compiler-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${maven-surefire-plugin.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

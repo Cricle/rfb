@@ -1,0 +1,45 @@
+[package]
+name = "rfb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PLACEHOLDER_ORG/rfb"
+description = "RFB sandbox contracts and integrations"
+
+[features]
+default = []
+forkd = ["dep:reqwest", "dep:tokio", "dep:url"]
+# The ZBRT V1 protocol types live in rfb-runtime (`zeroboot_protocol`); `rfb`
+# re-exports them so host/provider consumers share one wire implementation
+# without a `rfb` <-> `rfb-runtime` dependency cycle.
+zeroboot = ["dep:anyhow", "dep:tokio", "dep:tokio-vsock", "dep:uuid", "dep:rfb-runtime"]
+# The CLI reuses the runtime's RFB1 framed codec and session contract for its
+# rfb1 acceptance/verify commands instead of reimplementing the wire format.
+cli = ["dep:clap", "dep:sha2", "dep:rfb-runtime", "rfb-runtime/host-vsock", "forkd", "zeroboot"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
+url = { version = "2", optional = true }
+anyhow = { version = "1", optional = true }
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+sha2 = { version = "0.10", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+rfb-runtime = { path = "../rfb-runtime", version = "0.1.0", optional = true, default-features = false, features = ["core"] }
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { version = "0.5", optional = true }
+
+[[bin]]
+name = "rfb-cli"
+path = "src/bin/rfb-cli.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time"] }
+futures = "0.3"
+futures-lite = "2"

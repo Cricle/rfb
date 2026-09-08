@@ -1,0 +1,32 @@
+name: Coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Per-crate line coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install lightweight coverage tool
+        run: cargo install cargo-tarpaulin --locked
+      - name: Check test layout and framework boundary
+        run: |
+          bash scripts/check-tests-folder.sh
+          bash scripts/check-boundary.sh
+      - name: Coverage gates (90% line minimum)
+        run: |
+          set -euo pipefail
+          for crate in rfb rfb-runtime rfb-rig; do
+            cargo tarpaulin --package "$crate" --all-features --tests \
+              --fail-under 90 \
+              --exclude-files 'benches/*' 'tests/*' '*real_vm*' \
+              --out Stdout
+          done

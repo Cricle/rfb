@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "title": "eval over ZBRT v1 — 四语言黄金向量（基准：Rust rfb::client）",
+  "spec": ["../PROTOCOL.md#3", "../UNIFIED_API.md"],
+  "request_id_hex": "000102030405060708090a0b0c0d0e0f",
+  "convention": {
+    "summary": "Sandbox.eval 在 ZBRT 传输下编码为一轮 Execute（kind=3）：argv=[\"eval\", code]，stdin 为空；timeout_s 为 None 时 timeout_ms=0，否则秒数×1000。",
+    "execute_fields": {
+      "argc": 2,
+      "argv": ["eval", "<code 原文>"],
+      "cwd": "Some(cwd) → 标志 1 + u32 前缀字符串；None → 标志 0（无 cwd 字节）",
+      "stdin": "u32 长度前缀，恒为空（00000000）",
+      "timeout_ms": "u32 BE；None → 0"
+    },
+    "result_mapping": "Output(stream=0) → stdout，Output(stream=1) → stderr，终结 Exit(code) → exit_code，timed_out 恒为 false（与 NDJSON 传输同形）",
+    "validation": "发送前本地校验：code 去空白非空且 ≤1 MiB；cwd 合法文件路径；timeout_s 不得为 0。失败抛 ValidationError，不发帧。ZBRT 下 eval 不允许以『不支持』为由拒绝。"
+  },
+  "vectors": [
+    {
+      "name": "EVAL_ZBRT_BASIC",
+      "description": "eval('1+1', cwd='/workspace', timeout_s=5)",
+      "input": { "code": "1+1", "cwd": "/workspace", "timeout_s": 5 },
+      "expected_execute": {
+        "kind": 3,
+        "argc": 2,
+        "argv": ["eval", "1+1"],
+        "cwd_flag": 1,
+        "cwd": "/workspace",
+        "stdin_hex": "",
+        "timeout_ms": 5000
+      },
+      "expected_frame_hex": "5a42525401030000000102030405060708090a0b0c0d0e0f0000002702000000046576616c00000003312b31010000000a2f776f726b73706163650000000000001388",
+      "expected_response_mapping_example": {
+        "frames": [
+          { "kind": 4, "stream": 0, "data_hex": "32" },
+          { "kind": 5, "exit_code": 0 }
+        ],
+        "exec_result": { "exit_code": 0, "stdout_hex": "32", "stderr_hex": "", "timed_out": false }
+      }
+    },
+    {
+      "name": "EVAL_ZBRT_DEFAULTS",
+      "description": "eval('print(40+2)') — 无 cwd、无 timeout（cwd 标志 0，timeout_ms=0）",
+      "input": { "code": "print(40+2)", "cwd": null, "timeout_s": null },
+      "expected_execute": {
+        "kind": 3,
+        "argc": 2,
+        "argv": ["eval", "print(40+2)"],
+        "cwd_flag": 0,
+        "cwd": null,
+        "stdin_hex": "",
+        "timeout_ms": 0
+      },
+      "expected_frame_hex": "5a42525401030000000102030405060708090a0b0c0d0e0f0000002102000000046576616c0000000b7072696e742834302b3229000000000000000000",
+      "expected_response_mapping_example": {
+        "frames": [
+          { "kind": 4, "stream": 0, "data_hex": "3432" },
+          { "kind": 5, "exit_code": 0 }
+        ],
+        "exec_result": { "exit_code": 0, "stdout_hex": "3432", "stderr_hex": "", "timed_out": false }
+      }
+    },
+    {
+      "name": "EVAL_ZBRT_VALIDATION_REJECTED",
+      "description": "本地校验失败必须抛 ValidationError 且不发送任何帧（各语言异常/错误类型按 UNIFIED_API.md §1 命名）",
+      "input": { "code": "   ", "cwd": null, "timeout_s": null },
+      "expected": { "error": "ValidationError", "frames_sent": 0 }
+    },
+    {
+      "name": "EVAL_ZBRT_TIMEOUT_ZERO_REJECTED",
+      "description": "timeout_s=0 本地校验失败抛 ValidationError（PROTOCOL.md §2.3：timeout 不得为 0）",
+      "input": { "code": "1", "cwd": null, "timeout_s": 0 },
+      "expected": { "error": "ValidationError", "frames_sent": 0 }
+    }
+  ],
+  "per_language_test_names": {
+    "rust": "rfb/tests/client_facade.rs::eval_zbrt_matches_shared_vector",
+    "python": "tests/test_zbrt.py::test_eval_zbrt_matches_shared_vector",
+    "csharp": "tests/Rfb.Sdk.Tests::Eval_Zbrt_MatchesSharedVector",
+    "java": "tests::evalZbrtMatchesSharedVector"
+  }
+}
