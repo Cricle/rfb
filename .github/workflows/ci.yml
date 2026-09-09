@@ -30,7 +30,35 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # 失败现场要能被公开 API 读到（日志下载需 token）：失败时把 FAILED
+      # 测试名、failures 块与 panic 信息拆成 ::error:: 注解带出。
       - name: Tests
-        run: cargo test --workspace --all-features
+        run: |
+          set -uo pipefail
+          log=/tmp/cargo-test.log
+          set +e
+          cargo test --workspace --all-features 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "cargo test passed"
+            exit 0
+          fi
+          {
+            echo "== FAILED tests =="
+            grep -E "^test .* FAILED|test result: FAILED" "$log" || true
+            echo "== failures block =="
+            awk '/^failures:$/{f=1} f' "$log" | head -40 || true
+            echo "== panics =="
+            grep -B1 -A6 "panicked at" "$log" | head -100 || true
+            echo "== tail =="
+            tail -c 1500 "$log"
+          } > /tmp/test-diag.txt 2>&1
+          echo "::error::cargo test 失败 rc=$rc（详情见注解）"
+          tr '\r\n' '::' < /tmp/test-diag.txt \
+            | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+            | LC_ALL=C fold -w 700 \
+            | awk -v t=ci-test '{print "::error title="t"-"NR"::"$0}'
+          exit "$rc"
       - name: Documentation
         run: RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
