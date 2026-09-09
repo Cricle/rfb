@@ -31,7 +31,11 @@ jobs:
     name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0：release.sh 用 git describe --tags --exact-match 校验
+      # tag 与 workspace 版本一致，浅克隆拿不到 tag 会导致发布误判失败。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Validate tag matches workspace version
         env:

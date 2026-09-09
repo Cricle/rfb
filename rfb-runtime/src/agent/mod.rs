@@ -64,7 +64,7 @@ fn container_path() -> String {
 
 /// Run the forkd NDJSON guest agent on the given TCP address.
 pub async fn run(addr: &str) -> io::Result<()> {
-    std::fs::create_dir_all(transport::WORKSPACE)?;
+    std::fs::create_dir_all(transport::workspace_root())?;
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;

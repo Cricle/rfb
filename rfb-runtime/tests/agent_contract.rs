@@ -6,6 +6,19 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+/// Spawn the agent against a temporary workspace: CI runners run as a
+/// non-root user that cannot create `/workspace`, so every test points
+/// `RFB_AGENT_WORKSPACE` at one shared temp dir (initialized once).
+fn spawn_agent(addr: &'static str) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let dir = std::env::temp_dir().join("rfb-agent-contract-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RFB_AGENT_WORKSPACE", &dir);
+    });
+    tokio::spawn(agent::run(addr))
+}
+
 async fn request(stream: &mut TcpStream, value: Value) -> Value {
     stream
         .write_all(serde_json::to_string(&value).unwrap().as_bytes())
@@ -31,7 +44,7 @@ fn forkd_agent_entrypoint_is_explicit_and_vsock_remains_default() {
 
 #[tokio::test]
 async fn ping_and_unknown_actions_are_ndjson_responses() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18888"));
+    let task = spawn_agent("127.0.0.1:18888");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18888").await.unwrap();
     assert_eq!(
@@ -76,7 +89,7 @@ fn forkd_image_build_supports_a_separate_entrypoint() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_timeout_returns_terminal_response_and_does_not_wait_for_child() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18892"));
+    let task = spawn_agent("127.0.0.1:18892");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18892").await.unwrap();
     let started = tokio::time::Instant::now();
@@ -94,7 +107,7 @@ async fn exec_timeout_returns_terminal_response_and_does_not_wait_for_child() {
 
 #[tokio::test]
 async fn shell_free_builtins_execute_without_host_commands() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18895"));
+    let task = spawn_agent("127.0.0.1:18895");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18895").await.unwrap();
     let echo = request(
@@ -112,7 +125,7 @@ async fn shell_free_builtins_execute_without_host_commands() {
 
 #[tokio::test]
 async fn shell_free_builtin_stream_emits_started_output_and_exit() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18896"));
+    let task = spawn_agent("127.0.0.1:18896");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18896").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -149,7 +162,7 @@ async fn shell_free_builtin_stream_emits_started_output_and_exit() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stream_fast_child_drains_output_before_exit_frame() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18894"));
+    let task = spawn_agent("127.0.0.1:18894");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18894").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -197,7 +210,7 @@ async fn stream_fast_child_drains_output_before_exit_frame() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stream_stdin_round_trip_writes_into_child_and_stops() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18897"));
+    let task = spawn_agent("127.0.0.1:18897");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18897").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -269,7 +282,7 @@ async fn stream_stdin_round_trip_writes_into_child_and_stops() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18893"));
+    let task = spawn_agent("127.0.0.1:18893");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18893").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -302,7 +315,7 @@ async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
 
 #[tokio::test]
 async fn exec_cwd_rejects_workspace_escape() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18891"));
+    let task = spawn_agent("127.0.0.1:18891");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18891").await.unwrap();
     let response = request(
@@ -316,7 +329,7 @@ async fn exec_cwd_rejects_workspace_escape() {
 
 #[tokio::test]
 async fn filesystem_paths_reject_escape_and_absolute_directory_paths() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18889"));
+    let task = spawn_agent("127.0.0.1:18889");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18889").await.unwrap();
     for path in ["../escape", "/etc", "workspace\\escape"] {
@@ -364,7 +377,7 @@ async fn nested_subdirectory_write_and_read_round_trip() {
         eprintln!("{SKIP_WORKSPACE_MESSAGE}");
         return;
     }
-    let task = tokio::spawn(agent::run("127.0.0.1:18887"));
+    let task = spawn_agent("127.0.0.1:18887");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18887").await.unwrap();
     let path = "/workspace/nested/deep/file.txt";
@@ -401,7 +414,7 @@ async fn nested_subdirectory_write_and_read_round_trip() {
 
 #[tokio::test]
 async fn protocol_invalid_and_oversized_lines() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18901"));
+    let task = spawn_agent("127.0.0.1:18901");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18901").await.unwrap();
     stream.write_all(b"\nnot-json\n").await.unwrap();
@@ -435,7 +448,7 @@ async fn filesystem_search_edges_and_append() {
         eprintln!("{SKIP_WORKSPACE_MESSAGE}");
         return;
     }
-    let task = tokio::spawn(agent::run("127.0.0.1:18902"));
+    let task = spawn_agent("127.0.0.1:18902");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18902").await.unwrap();
     assert!(
@@ -490,7 +503,7 @@ async fn filesystem_search_edges_and_append() {
 /// Python/Node interpreter can produce.
 #[tokio::test]
 async fn ping_golden_contract_matches_official_field_set() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18903"));
+    let task = spawn_agent("127.0.0.1:18903");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18903").await.unwrap();
     let ping = request(&mut stream, json!({"action":"ping"})).await;
@@ -527,7 +540,7 @@ async fn ping_golden_contract_matches_official_field_set() {
 /// aliases, along with `exit_code`, `error`, and the terminal `timed_out` flag.
 #[tokio::test]
 async fn exec_builtin_golden_response_matches_frozen_contract() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18904"));
+    let task = spawn_agent("127.0.0.1:18904");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18904").await.unwrap();
     let result = request(
@@ -552,7 +565,7 @@ async fn exec_builtin_golden_response_matches_frozen_contract() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_contract_aliases_spawned_stdout_and_stderr() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18905"));
+    let task = spawn_agent("127.0.0.1:18905");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18905").await.unwrap();
     let result = request(
@@ -573,7 +586,7 @@ async fn exec_contract_aliases_spawned_stdout_and_stderr() {
 /// builtin path (no child process) reports a null pid and non-PTY mode.
 #[tokio::test]
 async fn stream_started_frame_carries_pid_and_pty_fields() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18906"));
+    let task = spawn_agent("127.0.0.1:18906");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18906").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -600,7 +613,7 @@ async fn stream_started_frame_carries_pid_and_pty_fields() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stream_started_frame_reports_spawned_pid() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18907"));
+    let task = spawn_agent("127.0.0.1:18907");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let stream = TcpStream::connect("127.0.0.1:18907").await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -634,7 +647,7 @@ async fn stream_started_frame_reports_spawned_pid() {
 /// PTY requests must be explicitly rejected, never silently degraded to pipes.
 #[tokio::test]
 async fn stream_pty_true_is_explicitly_rejected_not_silently_degraded() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18908"));
+    let task = spawn_agent("127.0.0.1:18908");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18908").await.unwrap();
     let result = request(
@@ -654,7 +667,7 @@ async fn stream_pty_true_is_explicitly_rejected_not_silently_degraded() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_timeout_keeps_official_aliases_and_terminal_state() {
-    let task = tokio::spawn(agent::run("127.0.0.1:18909"));
+    let task = spawn_agent("127.0.0.1:18909");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let mut stream = TcpStream::connect("127.0.0.1:18909").await.unwrap();
     let result = request(

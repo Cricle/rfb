@@ -11,6 +11,17 @@ pub const MAX_BYTES: usize = 50 * 1024;
 pub const MAX_CODE: usize = 1024 * 1024;
 pub const WORKSPACE: &str = "/workspace";
 
+/// Effective agent workspace root. The guest default is `/workspace` (tmpfs
+/// mounted by the rootfs init); `RFB_AGENT_WORKSPACE` overrides it so
+/// host-side contract tests can point the agent at a temporary directory —
+/// a CI runner's non-root user cannot create `/workspace`.
+pub fn workspace_root() -> &'static str {
+    static ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        std::env::var("RFB_AGENT_WORKSPACE").unwrap_or_else(|_| WORKSPACE.to_owned())
+    })
+}
+
 /// Resolve a guest-relative path against the opaque `/workspace` root. The
 /// caller only ever sees paths underneath the workspace; absolute paths must
 /// stay inside it and any `..` segment is rejected outright.
@@ -28,18 +39,19 @@ pub fn guest_path(value: Option<&Value>, _directory: bool) -> io::Result<PathBuf
             "invalid guest path",
         ));
     }
+    let workspace = workspace_root();
     let rel = raw
-        .strip_prefix(WORKSPACE)
+        .strip_prefix(workspace)
         .map(|s| s.trim_start_matches('/'))
         .unwrap_or(raw);
-    if raw.starts_with('/') && !raw.starts_with(WORKSPACE) {
+    if raw.starts_with('/') && !raw.starts_with(workspace) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid guest path",
         ));
     }
-    let root = std::fs::canonicalize(Path::new(WORKSPACE))
-        .unwrap_or_else(|_| Path::new(WORKSPACE).to_path_buf());
+    let root = std::fs::canonicalize(Path::new(workspace))
+        .unwrap_or_else(|_| Path::new(workspace).to_path_buf());
     let path = root.join(rel);
     // Canonicalize the deepest *existing* ancestor and re-join the remainder
     // lexically. This lets callers create new subdirectories (write already
