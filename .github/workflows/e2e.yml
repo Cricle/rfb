@@ -179,7 +179,9 @@ jobs:
           ./target/release/rfb-cli forkd snapshot-create \
             --tag "$TAG" --tap forkd-tap0 --json \
             | tee "$RUN_DIR/snapshot-create.json"
-          for i in $(seq 1 60); do
+          # daemon 异步收编快照（周期性扫描 snapshot-root，实测约 300s 才置
+          # ready+bootable），等待窗给足 900s；就绪即提前退出。
+          for i in $(seq 1 180); do
             if curl -fsS "$FORKD_URL/v1/snapshots" | python3 -c '
               import json, sys
               tag = sys.argv[1]
@@ -194,7 +196,7 @@ jobs:
             fi
             sleep 5
           done
-          echo "::error::快照 $TAG 300s 内未进入 ready+bootable 状态"
+          echo "::error::快照 $TAG 900s 内未进入 ready+bootable 状态"
           # 失败现场要能被公开 API 读到（日志下载需 token）：把快照列表、
           # snapshot-create 输出、快照目录与 audit 日志尾部拆成注解带出。
           emit_diag() {
