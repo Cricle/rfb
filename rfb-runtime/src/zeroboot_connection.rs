@@ -492,7 +492,7 @@ fn handle_health(request_id: [u8; 16], payload: &[u8]) -> Option<Frame> {
 
 /// Normalize a ZBRT request path onto the workspace executor's relative-path
 /// policy: `/workspace` (the host-side contract root, as used by forkd and the
-/// xpi-web tool surface) maps to `.`, `/workspace/x` maps to `x`. Anything else
+/// web tool surface) maps to `.`, `/workspace/x` maps to `x`. Anything else
 /// — including other absolute paths — is passed through unchanged so the
 /// workspace `PathPolicy` still rejects it with `path escapes allowed root`.
 fn normalize_workspace_path(path: &str) -> String {

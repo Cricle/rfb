@@ -3,13 +3,13 @@
 // Real-VM verification of the ZeroBoot provider itself (`ZeroBootProvider::create`
 // → `boot_and_open` → `ZeroBootSandbox`, one Firecracker VM per sandbox).
 // `rfb-cli zeroboot verify` exercises the wire protocol through its own driver;
-// these tests exercise the provider/session path that xpi-web consumes.
+// these tests exercise the provider/session path that embedders consume.
 // Triple gate: cfg + #[ignore] + RFB_REAL_E2E=1 (never in default `cargo test`).
 //
 // NOTE: a `ZeroBootSession` is bound to the tokio runtime that created it
 // (its UDS I/O and worker tasks live on that reactor), so every test runs its
 // whole lifecycle — create, operations, drop — inside ONE `futures_block_on`.
-// xpi-web must do the same: never move a live sandbox across runtimes.
+// Embedders must do the same: never move a live sandbox across runtimes.
 
 use rfb::core::{Capability, ExecSpec, Sandbox, SandboxProvider, SandboxSpec, TransportKind};
 use rfb::guest::{
