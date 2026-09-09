@@ -48,7 +48,22 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
           CRATES_IO_PROPAGATION_SECONDS: '30'
-        run: bash scripts/release.sh
+        run: |
+          set -uo pipefail
+          # 失败现场要能被公开 API 读到（日志下载需 token）：日志尾部拆成注解。
+          log=/tmp/release-crates.log
+          set +e
+          bash scripts/release.sh 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::release.sh 失败 rc=$rc（尾部见注解）"
+            tail -c 3000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-crates '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
       - name: Build CLI
         run: cargo build -p rfb-sdk --features cli --release
       - name: Package and checksum
@@ -79,9 +94,23 @@ jobs:
           python-version: '3.12'
       - name: Build sdist and wheel
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade build
-          python -m build sdk/python
+          set -uo pipefail
+          log=/tmp/release-pypi-build.log
+          set +e
+          {
+            python -m pip install --upgrade build
+            python -m build sdk/python
+          } 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::python -m build 失败 rc=$rc（尾部见注解）"
+            tail -c 3000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-pypi '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -142,9 +171,26 @@ jobs:
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          log=/tmp/release-maven.log
+          set +e
           mvn --batch-mode --no-transfer-progress -Pcentral-release deploy \
-            -f sdk/java/pom.xml -Dgpg.passphrase="$GPG_PASSPHRASE"
+            -f sdk/java/pom.xml -Dgpg.passphrase="$GPG_PASSPHRASE" 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::mvn deploy 失败 rc=$rc（ERROR 行与尾部见注解）"
+            {
+              echo "== ERROR lines =="
+              grep -E "\[ERROR\]" "$log" | head -30 || true
+              echo "== tail =="
+              tail -c 2000 "$log"
+            } | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-maven '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
 
   nuget:
     name: Publish Rfb.Sdk to NuGet
@@ -164,10 +210,22 @@ jobs:
         env:
           NUGET_KEY: ${{ secrets.NUGET_KEY }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           if [ -z "${NUGET_KEY:-}" ]; then
             echo "::error::secret NUGET_KEY 未配置（nuget.org API key）"
             exit 1
           fi
+          log=/tmp/release-nuget.log
+          set +e
           dotnet nuget push "dist/nuget/*.nupkg" --api-key "$NUGET_KEY" \
-            --source https://api.nuget.org/v3/index.json --skip-duplicate
+            --source https://api.nuget.org/v3/index.json --skip-duplicate 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::dotnet nuget push 失败 rc=$rc（尾部见注解）"
+            tail -c 2000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-nuget '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
