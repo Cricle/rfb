@@ -165,6 +165,10 @@ jobs:
               printf '</settings>\n'
             } > "$HOME/.m2/settings.xml"
           fi
+          # 诊断（不含密码）：central-publishing 插件要求 server id 必须为
+          # central，id 不对时插件报 "server is null"，这里直接列出实际 id。
+          echo "settings.xml server ids:"
+          grep -o '<id>[^<]*</id>' "$HOME/.m2/settings.xml" || echo "(none found)"
       - name: Check GPG key secret
         run: |
           set -euo pipefail

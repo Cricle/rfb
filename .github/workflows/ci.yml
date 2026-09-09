@@ -1,7 +1,8 @@
 name: CI
 
-# 触发约定：main 推送由 e2e.yml 负责跑真机 E2E；本工作流只跑其余分支
-# 的推送与所有 PR 的"简单测试"（fmt/clippy/test/doc，全部 --all-features）。
+# 触发约定：main 推送由 e2e.yml 负责跑真机 E2E；本工作流跑其余分支的推送与
+# 所有 PR 的 Rust 门禁（fmt/clippy/test/doc，全部 --all-features），以及
+# SDK 全量 build + 三套件测试（Python / C# / Java，debian:12 干净容器）。
 on:
   push:
     branches-ignore: [main]
@@ -62,3 +63,121 @@ jobs:
           exit "$rc"
       - name: Documentation
         run: RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
+
+  # SDK 全量验证：干净 debian:12 容器里从零装工具链，跑 Python/C#/Java 三套件
+  # 的 build + tests（脚本内聚，见 sdk/e2e/debian-e2e.sh）。
+  # 显式 shell: bash：debian:12 没有 which 命令，runner 探测 bash 失败会回退到
+  # sh（dash），而 dash 不支持 `set -o pipefail`，会立即以 exit 2 秒退。
+  sdk:
+    name: SDK build and tests (debian:12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: debian:12
+      options: --dns 8.8.8.8
+    env:
+      # 把脚本日志/汇总指到工作区内固定路径，供最后的 artifact 步骤上传
+      E2E_OUT_DIR: ${{ github.workspace }}/sdk-e2e-out
+    steps:
+      # debian:12 精简镜像连 git 都没有；actions/checkout 虽能回退到 API 下载，
+      # 但装上 git 更稳（完整 clone，保留 checkout 语义）。
+      - name: Install git（debian:12 精简镜像自带工具极少）
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 失败现场要能被公开 API 读到（日志下载需 token）：把诊断与 apt
+          # 输出拆成 ::error:: 注解带出来。
+          emit_diag() {
+            local f="$1" t="$2" data
+            data=$(LC_ALL=C tr '\r\n' '::' < "$f" | LC_ALL=C tr -d '%')
+            local n=${#data} i=0 c=1
+            while [ "$i" -lt "$n" ]; do
+              echo "::error title=$t-$c::${data:i:700}"
+              i=$((i+700)); c=$((c+1))
+            done
+          }
+          diag=/tmp/sdk-ci-diag.txt
+          {
+            echo "== resolv.conf before =="
+            cat /etc/resolv.conf
+            echo "== shell probe =="
+            echo "shell0=$0 BASH_VERSION=${BASH_VERSION:-unset}"
+            command -v bash || echo no-bash-in-path
+            echo "== getent deb.debian.org =="
+            rc=0
+            getent hosts deb.debian.org || rc=$?
+            echo "getent rc=$rc"
+          } > "$diag" 2>&1 || true
+          # 无条件改写公共 DNS：条件式改写覆盖不到 getent 成功但 apt 仍失败的
+          # 场景；resolv.conf 在同一 job 容器内跨步骤保留，后续 debian-e2e.sh
+          # 的 apt 同样受益。
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+          ok=0
+          for attempt in 1 2; do
+            if apt-get update -o Acquire::Retries=3 >> "$diag" 2>&1; then
+              ok=1
+              break
+            fi
+            echo "== apt-get update attempt $attempt failed, switch DNS ==" >> "$diag"
+            printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > /etc/resolv.conf
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then
+            emit_diag "$diag" apt-update
+            echo "::error::apt-get update 重试后仍失败（诊断见注解）"
+            exit 1
+          fi
+          if ! apt-get install -y git >> "$diag" 2>&1; then
+            emit_diag "$diag" apt-install
+            echo "::error::apt-get install git 失败"
+            exit 1
+          fi
+          git --version
+
+      - uses: actions/checkout@v4
+
+      # 依赖安装（apt：python3/libicu/maven 等；dotnet：官方安装脚本）与三个
+      # 套件的执行全部内聚在脚本内。容器默认即 root，无需 sudo。
+      # 注意：脚本自身把套件失败折叠为 rc=1，因此 rc=134 这类"进程被信号杀死"
+      # 只可能来自脚本内未受保护的段落（如 ensure_dotnet）。失败时把完整日志
+      # 尾部与各套件日志尾部拆成 ::error:: 注解带出（日志下载需 token）。
+      - name: Run sdk/e2e/debian-e2e.sh
+        shell: bash
+        run: |
+          set -uo pipefail
+          emit_file() {
+            tail -c "$3" "$1" 2>/dev/null \
+              | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
+          }
+          log=/tmp/debian-e2e-full.log
+          set +e
+          bash sdk/e2e/debian-e2e.sh 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::debian-e2e.sh 失败 rc=$rc（完整日志在 job log / artifact，以下为尾部）"
+            emit_file "$log" e2e-full 3000
+            for f in "$PWD"/sdk-e2e-out/*.log "$PWD"/sdk-e2e-out/summary.txt; do
+              [ -f "$f" ] || continue
+              b="e2e-$(basename "$f")"
+              emit_file "$f" "$b" 2000
+            done
+            exit "$rc"
+          fi
+          echo "debian-e2e.sh 全部通过"
+
+      # 失败也要留证据：脚本汇总/逐套件日志 + C# trx + Java surefire XML。
+      - name: Upload E2E summary and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-sdk-e2e-${{ github.run_id }}
+          path: |
+            sdk-e2e-out/
+            sdk/csharp/**/TestResults/
+            sdk/java/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
