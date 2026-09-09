@@ -159,7 +159,7 @@ fn reject_vsock_rootfs(path: &Path) -> Result<(), CliError> {
 }
 
 /// Resolve the kernel: `--kernel`, `FORKD_KERNEL`, or `resx/kernel` (preferring
-/// `vmlinux-5.10.225`, else the first `vmlinux*` file).
+/// `vmlinux-arcbox-0.0.24`, else the first `vmlinux*` file).
 fn resolve_kernel(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     if let Some(path) = explicit {
         require_asset(path, "kernel")?;
@@ -174,7 +174,7 @@ fn resolve_kernel(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     }
     if let Some(resx) = find_resx() {
         let kernel_dir = resx.join("kernel");
-        let preferred = kernel_dir.join("vmlinux-5.10.225");
+        let preferred = kernel_dir.join("vmlinux-arcbox-0.0.24");
         if preferred.is_file() {
             verify_resx_checksum(&preferred, "kernel")?;
             return Ok(preferred);

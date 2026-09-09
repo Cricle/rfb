@@ -67,9 +67,25 @@ impl WorkspaceGuestExecutor {
         let capture_limit = self.limits.max_event_bytes;
         let sink = self.event_sink.clone();
         let stdout_sink = sink.clone();
-        let stdout_thread =
-            std::thread::spawn(move || read_stream(stdout, 0, capture_limit, stdout_sink));
-        let stderr_thread = std::thread::spawn(move || read_stream(stderr, 1, capture_limit, sink));
+        let stderr_sink = sink;
+
+        // Reader completion is event-driven: the child's exit closes the
+        // pipes, both readers hit EOF and send immediately, so a fast command
+        // never pays a poll quantum between exit and terminal frame. The
+        // recv_timeout below only bounds cancel/deadline checks, which are
+        // latency-insensitive.
+        let (tx, rx) = std::sync::mpsc::channel::<(u8, std::io::Result<Vec<u8>>)>();
+        // Reader completion arrives through the channel; the handles are
+        // detached (they end at pipe EOF, including the kill-on-cancel path).
+        let stderr_tx = tx.clone();
+        std::thread::spawn(move || {
+            let result = read_stream(stdout, 0, capture_limit, stdout_sink);
+            let _ = tx.send((0, result));
+        });
+        std::thread::spawn(move || {
+            let result = read_stream(stderr, 1, capture_limit, stderr_sink);
+            let _ = stderr_tx.send((1, result));
+        });
         let timeout = value
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -88,32 +104,41 @@ impl WorkspaceGuestExecutor {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(std::time::Instant::now);
-        loop {
-            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                break;
+        let mut reader_results: [Option<std::io::Result<Vec<u8>>>; 2] = [None, None];
+        let status = loop {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok((stream, result)) => {
+                    reader_results[stream as usize] = Some(result);
+                    if reader_results.iter().all(Option::is_some) {
+                        break child.wait().map_err(|e| e.to_string())?;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        terminate_and_reap(&mut child, pid);
+                        // Do not block on the reader threads: on Linux the killed
+                        // process group closes the pipes so they drain immediately; on
+                        // Windows a surviving descendant may hold the pipe open. The
+                        // threads end when this process exits.
+                        return Err("request cancelled".into());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        terminate_and_reap(&mut child, pid);
+                        return Err("command timed out".into());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("stream reader failed".into());
+                }
             }
-            if cancel.load(Ordering::SeqCst) {
-                terminate_and_reap(&mut child, pid);
-                // Do not block on the reader threads: on Linux the killed
-                // process group closes the pipes so they drain immediately; on
-                // Windows a surviving descendant may hold the pipe open. The
-                // threads end when this process exits.
-                return Err("request cancelled".into());
-            }
-            if std::time::Instant::now() >= deadline {
-                terminate_and_reap(&mut child, pid);
-                return Err("command timed out".into());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let status = child.wait().map_err(|e| e.to_string())?;
-        let stdout = stdout_thread
-            .join()
-            .map_err(|_| "stdout reader failed")?
+        };
+        let stdout = reader_results[0]
+            .take()
+            .ok_or("stdout reader failed")?
             .map_err(|e| e.to_string())?;
-        let stderr = stderr_thread
-            .join()
-            .map_err(|_| "stderr reader failed")?
+        let stderr = reader_results[1]
+            .take()
+            .ok_or("stderr reader failed")?
             .map_err(|e| e.to_string())?;
         Ok(
             json!({"stdout": bounded(&stdout, self.limits.max_event_bytes), "stderr": bounded(&stderr, self.limits.max_event_bytes), "exit_code": status.code(), "success": status.success()}),

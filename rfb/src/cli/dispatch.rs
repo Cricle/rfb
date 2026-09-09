@@ -3,7 +3,9 @@
 //! operations (image, forkd, rfb1, zeroboot, cleanup, bench, web, doctor).
 
 use crate::cli::cleanup;
-use crate::cli::commands::{BenchCommand, CommandLine, ForkdCommand, ImageCommand, RunTarget};
+use crate::cli::commands::{
+    BenchCommand, CommandLine, ForkdCommand, ImageCommand, RunTarget, SkillsCommand,
+};
 #[cfg(unix)]
 use crate::cli::commands::{Rfb1Command, WebCommand, ZerobootCommand};
 use crate::cli::error::{render_output, validation, CliError};
@@ -32,6 +34,7 @@ pub fn run(cli: crate::cli::commands::Cli) -> Result<(), CliError> {
             render_output(cli.json, value, "cleanup".to_owned());
             Ok(())
         }
+        CommandLine::Skills { command } => skills(command),
         CommandLine::Run(args) => run_target(cli.json, args.target),
         CommandLine::Bench { command } => bench(cli.json, command),
         #[cfg(unix)]
@@ -99,6 +102,12 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
             Ok(())
         }
         ImageCommand::BuildRootfs(args) => {
+            let options = image_build::RootfsOptions {
+                with_python: args.with_python,
+                with_lua: args.with_lua,
+                py_site_dir: args.py_site_dir.clone(),
+                lua_lib_dir: args.lua_lib_dir.clone(),
+            };
             let value = image_build::build_rootfs(
                 &args.runtime,
                 &args.output,
@@ -106,6 +115,7 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
                 &args.mode,
                 args.allow_dynamic,
                 args.force,
+                &options,
             )?;
             render_output(json_out, value, "rootfs built".to_owned());
             Ok(())
@@ -116,8 +126,18 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
             Ok(())
         }
         ImageCommand::BuildStatic(args) => {
-            let value = image_build::build_static_runtime(&args.root, &args.target, &args.package)?;
+            let value = image_build::build_static_runtime(
+                &args.root,
+                &args.target,
+                &args.package,
+                &args.features,
+            )?;
             render_output(json_out, value, "static runtime built".to_owned());
+            Ok(())
+        }
+        ImageCommand::BuildAll(args) => {
+            let value = image_build::build_all(&args)?;
+            render_output(json_out, value, "image built".to_owned());
             Ok(())
         }
     }
@@ -295,6 +315,29 @@ fn web(json_out: bool, command: WebCommand) -> Result<(), CliError> {
         WebCommand::Bench(args) => {
             let value = block_on(crate::cli::web_bench::bench(args))?;
             render_output(json_out, value, "web bench".to_owned());
+            Ok(())
+        }
+    }
+}
+
+/// Embedded agent-readable skills: `list` advertises, `read` prints raw
+/// markdown (or a JSON envelope with `--json`).
+fn skills(command: SkillsCommand) -> Result<(), CliError> {
+    match command {
+        SkillsCommand::List { path } => {
+            let value = crate::cli::skills::list(path.as_deref());
+            // List output is machine-first (like `lark-cli skills list`):
+            // always a JSON envelope.
+            render_output(true, value, String::new());
+            Ok(())
+        }
+        SkillsCommand::Read { name, json } => {
+            let content = crate::cli::skills::read(&name)?;
+            if json {
+                println!("{}", crate::cli::skills::content_json(&content)?);
+            } else {
+                println!("{}", content.content);
+            }
             Ok(())
         }
     }

@@ -224,6 +224,30 @@ pub fn profile_summary() -> Value {
         .collect();
     json!(profiles)
 }
+/// Optional interpreter wiring for `image build-rootfs`.
+#[derive(Debug, Default, Clone)]
+pub struct RootfsOptions {
+    /// Install `/bin/python3` as a hardlink to the runtime binary (the
+    /// binary must be built with the `rustpython` cargo feature).
+    pub with_python: bool,
+    /// Install `/bin/lua` as a hardlink to the runtime binary (the binary
+    /// must be built with the `mlua` cargo feature).
+    pub with_lua: bool,
+    /// Local tree of pure-Python packages baked into the image at
+    /// `/usr/lib/python3/site-packages` (the offline `sys.path` root).
+    pub py_site_dir: Option<std::path::PathBuf>,
+    /// Local tree of Lua modules baked into the image at `/usr/lib/lua/5.4`
+    /// (the offline `package.path` root).
+    pub lua_lib_dir: Option<std::path::PathBuf>,
+}
+
+/// Python package root baked into the image; the embedded interpreter appends
+/// it to `sys.path`.
+pub const PY_SITE_PACKAGES: &str = "/usr/lib/python3/site-packages";
+/// Lua module root baked into the image; the embedded interpreter installs it
+/// into `package.path`.
+pub const LUA_LIB_DIR: &str = "/usr/lib/lua/5.4";
+
 /// Build a rootfs image directly from a runtime binary + mode (the `env
 /// setup`/`image build-rootfs` path). Creates the ext4 with a fixed 0755
 /// entrypoint, protocol marker, and (for rfb-vsock) the executor environment.
@@ -235,6 +259,7 @@ pub fn build_rootfs(
     mode: &str,
     allow_dynamic: bool,
     force: bool,
+    options: &RootfsOptions,
 ) -> Result<Value, CliError> {
     let (install_path, entrypoint, protocol): (&str, &str, &str) = match mode {
         "rfb-vsock" => ("/sbin/rfb-runtime", "/sbin/rfb-runtime", "rfb1"),
@@ -268,6 +293,17 @@ pub fn build_rootfs(
             "refusing dynamic runtime; build x86_64-unknown-linux-musl first (or set --allow-dynamic)",
         ));
     }
+    // Interpreter hardlinks/site dirs are only wired in the ZBRT image layout.
+    if mode != "zeroboot-zbrt"
+        && (options.with_python
+            || options.with_lua
+            || options.py_site_dir.is_some()
+            || options.lua_lib_dir.is_some())
+    {
+        return Err(validation(
+            "interpreter options (--with-python/--with-lua/--py-site-dir/--lua-lib-dir) require --mode zeroboot-zbrt",
+        ));
+    }
 
     // ZBRT images are read-mostly: only /workspace receives writes, so size
     // from the installed content plus a bounded write headroom instead of the
@@ -280,7 +316,8 @@ pub fn build_rootfs(
         .len();
     if zbrt {
         // The multi-call applets and (when present) the static busybox are
-        // installed alongside the runtime binary.
+        // installed alongside the runtime binary. Interpreter hardlinks add
+        // zero bytes; site-package trees are real content.
         if let Some(parent) = runtime_bin.parent() {
             content_bytes += fs::metadata(parent.join("rfb-mini-tools"))
                 .map(|meta| meta.len())
@@ -288,6 +325,15 @@ pub fn build_rootfs(
             content_bytes += fs::metadata(parent.join("rfb-busybox"))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
+        }
+        for dir in [
+            options.py_site_dir.as_deref(),
+            options.lua_lib_dir.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            content_bytes += site_tree_bytes(dir)?;
         }
     }
     let size_mb = match size_mb {
@@ -603,6 +649,24 @@ pub fn build_rootfs(
                 false,
             )?;
         }
+        // Interpreter multi-call hardlinks: /bin/python3 and /bin/lua point
+        // at /init, which dispatches on argv[0]. Zero extra image bytes; the
+        // interpreter itself must be compiled into the runtime binary via the
+        // `rustpython`/`mlua` cargo features.
+        if options.with_python {
+            install_hardlink(&image_path, "/init", "/bin/python3")?;
+        }
+        if options.with_lua {
+            install_hardlink(&image_path, "/init", "/bin/lua")?;
+        }
+        // Offline extension packages: static files under the interpreter
+        // import roots, written and digest-verified like every other payload.
+        install_site_dir(
+            &image_path,
+            options.py_site_dir.as_deref(),
+            PY_SITE_PACKAGES,
+        )?;
+        install_site_dir(&image_path, options.lua_lib_dir.as_deref(), LUA_LIB_DIR)?;
     }
     let logical_bytes = fs::metadata(&image_path)
         .map_err(|error| io(error.to_string()))?
@@ -637,6 +701,13 @@ pub fn build_rootfs(
     };
     let checksum = format!("{}  {}\n", digest, rel(output));
     atomic_write(&checksum_path, checksum.as_bytes())?;
+    let mut interpreters: Vec<&str> = Vec::new();
+    if options.with_python {
+        interpreters.push("python");
+    }
+    if options.with_lua {
+        interpreters.push("lua");
+    }
     let manifest = json!({
         "runtime": install_path,
         "entrypoint": entrypoint,
@@ -646,6 +717,11 @@ pub fn build_rootfs(
         "linkage": if allow_dynamic { "dynamically-linked-or-static" } else { "static" },
         "image": output.file_name().and_then(|n| n.to_str()).unwrap_or("image.ext4"),
         "digest": format!("sha256:{digest}"),
+        "interpreters": interpreters,
+        "site_dirs": {
+            "python": options.py_site_dir.as_ref().map(|p| p.to_string_lossy()),
+            "lua": options.lua_lib_dir.as_ref().map(|p| p.to_string_lossy()),
+        },
     });
     let manifest_path = output.with_extension("ext4.manifest.json");
     let manifest_contents =
@@ -680,6 +756,157 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), CliError> {
         .map_err(|error| io(error.to_string()))?;
     temp.persist(path)
         .map_err(|error| io(error.error.to_string()))?;
+    Ok(())
+}
+
+/// Hardlink `target_in_image` to `link_in_image` (same inode, zero extra
+/// image bytes), clearing any pre-created target first.
+fn install_hardlink(image_path: &Path, source: &str, link: &str) -> Result<(), CliError> {
+    if run_debugfs(image_path, &format!("stat {link}"), false).is_ok() {
+        let _ = run_debugfs(image_path, &format!("unlink {link}"), false);
+        let _ = run_debugfs(image_path, &format!("rm {link}"), false);
+    }
+    run_debugfs(
+        image_path,
+        &format!("ln {} {}", debugfs_quote(source), debugfs_quote(link)),
+        false,
+    )?;
+    let stat = run_debugfs(image_path, &format!("stat {link}"), true)?;
+    let stat = String::from_utf8_lossy(&stat);
+    if !stat.contains("Inode:") || !stat.contains("regular") {
+        return Err(external(format!(
+            "interpreter hardlink verification failed: {link}"
+        )));
+    }
+    Ok(())
+}
+
+/// Recursively collect regular files under `dir` as (relative path, source).
+/// Symlinks are rejected: baked extension packages must be plain content.
+fn collect_site_files(
+    dir: &Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) -> Result<(), CliError> {
+    let entries = fs::read_dir(dir).map_err(|error| io(format!("{}: {error}", dir.display())))?;
+    let mut entries: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| (entry.file_name(), entry.path()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path) in entries {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io(format!("{}: {error}", path.display())))?;
+        if metadata.file_type().is_symlink() {
+            return Err(validation(format!(
+                "refusing symlinked extension package content: {}",
+                path.display()
+            )));
+        }
+        let rel = name.to_string_lossy().replace('\\', "/");
+        if metadata.is_dir() {
+            let mut child_files = Vec::new();
+            collect_site_files(&path, &mut child_files)?;
+            out.extend(
+                child_files
+                    .into_iter()
+                    .map(|(child_rel, source)| (format!("{rel}/{child_rel}"), source)),
+            );
+        } else if metadata.is_file() {
+            out.push((rel, path));
+        }
+    }
+    Ok(())
+}
+
+/// Total byte size of a site tree, for the image size floor.
+fn site_tree_bytes(dir: &Path) -> Result<u64, CliError> {
+    let mut files = Vec::new();
+    collect_site_files(dir, &mut files)?;
+    Ok(files
+        .iter()
+        .filter_map(|(_, source)| fs::metadata(source).ok())
+        .map(|meta| meta.len())
+        .sum())
+}
+
+/// Write a local extension-package tree into `image_root/<rel>`, creating
+/// parent directories and digest-verifying every file like other payloads.
+fn install_site_dir(
+    image_path: &Path,
+    dir: Option<&Path>,
+    image_root: &str,
+) -> Result<(), CliError> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    if !dir.is_dir() {
+        return Err(validation(format!(
+            "site directory is not a readable directory: {}",
+            dir.display()
+        )));
+    }
+    let mut files = Vec::new();
+    collect_site_files(dir, &mut files)?;
+    // Create the root plus every parent directory first (debugfs mkdir fails
+    // on existing directories, and mke2fs only pre-creates the base layout).
+    let mut directories = std::collections::BTreeSet::new();
+    // debugfs mkdir does not create parents, so every ancestor of the root
+    // (e.g. /usr, /usr/lib, /usr/lib/python3) must exist before the root can
+    // be created. Ancestors sort before the root and its children, so one
+    // lexicographically ordered pass is enough.
+    let mut ancestor = String::new();
+    for component in image_root.split('/').filter(|part| !part.is_empty()) {
+        ancestor.push('/');
+        ancestor.push_str(component);
+        directories.insert(ancestor.clone());
+    }
+    for (rel, _) in &files {
+        let mut parent = Path::new(rel).parent();
+        while let Some(path) = parent {
+            if !path.as_os_str().is_empty() {
+                directories.insert(format!("{image_root}/{}", path.to_string_lossy()));
+            }
+            parent = path.parent();
+        }
+    }
+    for directory in directories {
+        if run_debugfs(
+            image_path,
+            &format!("stat {}", debugfs_quote(&directory)),
+            false,
+        )
+        .is_err()
+        {
+            run_debugfs(
+                image_path,
+                &format!("mkdir {}", debugfs_quote(&directory)),
+                false,
+            )?;
+        }
+    }
+    for (rel, source) in files {
+        let destination = format!("{image_root}/{rel}");
+        run_debugfs(
+            image_path,
+            &format!(
+                "write {} {}",
+                debugfs_quote(&source.to_string_lossy()),
+                debugfs_quote(&destination)
+            ),
+            false,
+        )?;
+        let expected = fs::read(&source).map_err(|error| io(error.to_string()))?;
+        let actual = run_debugfs(
+            image_path,
+            &format!("cat {}", debugfs_quote(&destination)),
+            true,
+        )?;
+        if actual != expected {
+            return Err(external(format!(
+                "site package verification failed: {destination}"
+            )));
+        }
+    }
     Ok(())
 }
 

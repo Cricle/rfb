@@ -1167,11 +1167,15 @@ fn check_kernel_never_succeeds_on_garbage_bytes() {
 fn build_static_runtime_rejects_empty_arguments_before_cargo() {
     let dir = tempfile::tempdir().expect("temporary directory");
     for (target, package) in [("", "forkd-agent"), ("x86_64-unknown-linux-musl", "")] {
-        let err = build_static_runtime(dir.path(), target, package)
+        let err = build_static_runtime(dir.path(), target, package, "cli")
             .expect_err("empty target/package rejected");
         assert_eq!(err.code, EXIT_VALIDATION);
         assert!(err.message.contains("target and package must not be empty"));
     }
+    let err = build_static_runtime(dir.path(), "x86_64-unknown-linux-musl", "rfb-runtime", "  ")
+        .expect_err("empty features rejected");
+    assert_eq!(err.code, EXIT_VALIDATION);
+    assert!(err.message.contains("features must not be empty"));
 }
 
 // ---------------------------------------------------------------------------

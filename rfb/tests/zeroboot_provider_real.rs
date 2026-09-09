@@ -38,7 +38,7 @@ fn provider() -> ZeroBootProvider {
         .map(PathBuf::from)
         .unwrap_or_else(|| resx("rootfs/zeroboot-zbrt-e2e.ext4"));
     ZeroBootProvider::new(Config {
-        kernel: Some(resx("kernel/vmlinux-5.10.225")),
+        kernel: Some(resx("kernel/vmlinux-arcbox-0.0.24")),
         rootfs: Some(rootfs),
         firecracker: Some(PathBuf::from("/usr/local/bin/firecracker")),
         guest_port: 5000,

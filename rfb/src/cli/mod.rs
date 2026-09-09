@@ -17,6 +17,7 @@ pub mod localhost;
 pub mod report;
 #[cfg(unix)]
 pub mod rfb1;
+pub mod skills;
 pub mod tool;
 #[cfg(unix)]
 pub mod web_bench;

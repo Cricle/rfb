@@ -939,6 +939,18 @@ fn stream_to_execute(spec: &StreamSpec, timeout: Duration) -> std::result::Resul
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const VM_MEM_MIB: u32 = 512;
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const VM_MEM_MIB_ENV: &str = "RFB_ZBRT_VM_MEM_MIB";
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn vm_mem_mib() -> u32 {
+    // Capacity-evaluation override: lets operators measure the real memory
+    // floor of a ZBRT microVM without touching wire behavior or defaults.
+    std::env::var(VM_MEM_MIB_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|mib| *mib > 0)
+        .unwrap_or(VM_MEM_MIB)
+}
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const VM_INIT_PATH: &str = "/init";
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const GUEST_CID: u32 = 3;
@@ -1077,7 +1089,7 @@ async fn boot_and_open(config: &Config) -> Result<ZeroBootSession> {
                 &kernel,
                 &rootfs,
                 &work_path,
-                VM_MEM_MIB,
+                vm_mem_mib(),
                 VM_INIT_PATH,
                 GUEST_CID,
             )

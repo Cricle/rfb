@@ -49,6 +49,10 @@ pub(crate) mod guest_vsock;
 /// Host-side Firecracker `/vsock` UDS relay and RFB1 client.
 #[cfg(feature = "host-vsock")]
 pub mod host_vsock;
+/// Optional embedded guest interpreters (`python3` via RustPython, `lua` via
+/// mlua), dispatched multi-call from `/init` by `argv[0]`.
+#[cfg(any(feature = "rustpython", feature = "mlua"))]
+pub mod interpreters;
 /// Path policy: workspace confinement and read-only host roots.
 pub mod policy;
 /// Runtime resource limits.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["rfb", "rfb-rig", "rfb-runtime"]
+members = ["rfb", "rfb-rig", "rfb-runtime", "ben"]
 resolver = "2"
 
 [workspace.package]

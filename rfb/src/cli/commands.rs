@@ -58,6 +58,12 @@ pub enum CommandLine {
     },
     /// Scoped artifact cleanup in an rfb-runtime tree.
     Cleanup(CleanupArgs),
+    /// Read agent-readable skill runbooks embedded in this CLI binary.
+    Skills {
+        /// Skills subcommand.
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     /// Unified entry point used by the thin shell wrappers.
     #[command(hide = true)]
     Run(RunArgs),
@@ -93,6 +99,9 @@ pub enum ImageCommand {
     CheckKernel(ImagePath),
     /// Build a static runtime binary for a target triple (build-static.sh).
     BuildStatic(BuildStaticArgs),
+    /// All-in-one: build the static runtime, assemble the rootfs, and (with
+    /// `--kernel`) verify the whole stack under Firecracker.
+    BuildAll(BuildAllArgs),
 }
 
 /// forkd controller/guest orchestration subcommands.
@@ -207,6 +216,34 @@ pub struct BuildRootfsArgs {
         help = "Refuse to overwrite an existing output without this flag"
     )]
     pub force: bool,
+    /// Install /bin/python3 (hardlink to the runtime, `rustpython` feature).
+    #[arg(
+        long,
+        help = "Install /bin/python3 (hardlink to the runtime; the binary must be built with the rustpython feature)"
+    )]
+    pub with_python: bool,
+    /// Install /bin/lua (hardlink to the runtime, `mlua` feature).
+    #[arg(
+        long,
+        help = "Install /bin/lua (hardlink to the runtime; the binary must be built with the mlua feature)"
+    )]
+    pub with_lua: bool,
+    /// Local directory of pure-Python packages to bake into the image
+    /// (/usr/lib/python3/site-packages).
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory of pure-Python packages baked into the image (offline import path)"
+    )]
+    pub py_site_dir: Option<PathBuf>,
+    /// Local directory of Lua modules to bake into the image
+    /// (/usr/lib/lua/5.4).
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory of Lua modules baked into the image (offline require path)"
+    )]
+    pub lua_lib_dir: Option<PathBuf>,
 }
 
 /// Arguments for `rfb-cli cleanup`.
@@ -240,6 +277,89 @@ pub struct BuildStaticArgs {
     /// Package to build within the workspace (default `rfb-runtime`).
     #[arg(long, default_value = "rfb-runtime")]
     pub package: String,
+    /// Cargo features for the runtime build (default `cli`; add
+    /// `rustpython`/`mlua` to embed interpreters).
+    #[arg(
+        long,
+        default_value = "cli",
+        help = "Cargo features for the runtime build (comma-separated)"
+    )]
+    pub features: String,
+}
+
+/// Arguments for `rfb-cli image build-all`.
+#[derive(clap::Args, Debug)]
+pub struct BuildAllArgs {
+    /// Workspace root (the directory containing the workspace Cargo.toml).
+    #[arg(
+        long,
+        default_value = ".",
+        value_name = "ROOT",
+        help = "Workspace root (Cargo.toml parent)"
+    )]
+    pub root: PathBuf,
+    /// Rust target triple to build for (default `x86_64-unknown-linux-musl`).
+    #[arg(long, default_value = "x86_64-unknown-linux-musl")]
+    pub target: String,
+    /// Package to build within the workspace (default `rfb-runtime`).
+    #[arg(long, default_value = "rfb-runtime")]
+    pub package: String,
+    /// Cargo features for the runtime build (default
+    /// `cli,rustpython,mlua`; python3/lua hardlinks follow this).
+    #[arg(
+        long,
+        default_value = "cli,rustpython,mlua",
+        help = "Cargo features for the runtime build (comma-separated)"
+    )]
+    pub features: String,
+    /// Output ext4 rootfs image path.
+    #[arg(value_name = "OUTPUT", help = "Output ext4 rootfs image path")]
+    pub output: PathBuf,
+    /// Rootfs size in MiB (defaults to an automatic size).
+    #[arg(long, value_name = "MIB")]
+    pub size_mb: Option<u64>,
+    /// Rootfs mode (default `zeroboot-zbrt`).
+    #[arg(
+        long,
+        default_value = "zeroboot-zbrt",
+        value_parser = ["rfb-vsock", "forkd-agent", "zeroboot-zbrt"],
+        help = "Rootfs mode: rfb-vsock, forkd-agent, or zeroboot-zbrt"
+    )]
+    pub mode: String,
+    /// Refuse to overwrite an existing output without this flag.
+    #[arg(
+        long,
+        help = "Refuse to overwrite an existing output without this flag"
+    )]
+    pub force: bool,
+    /// Local directory of pure-Python packages to bake into the image.
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory of pure-Python packages baked into the image (offline import path)"
+    )]
+    pub py_site_dir: Option<PathBuf>,
+    /// Local directory of Lua modules to bake into the image.
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory of Lua modules baked into the image (offline require path)"
+    )]
+    pub lua_lib_dir: Option<PathBuf>,
+    /// Kernel image to check and boot-verify the final rootfs against
+    /// (skips the Firecracker verification stage when omitted).
+    #[arg(
+        long,
+        value_name = "KERNEL",
+        help = "Kernel image: validated, then booted with the built rootfs under Firecracker"
+    )]
+    pub kernel: Option<PathBuf>,
+    /// Firecracker binary used for the verification stage.
+    #[arg(long, default_value = "firecracker")]
+    pub firecracker: String,
+    /// Exit non-zero if Firecracker verification prerequisites are missing.
+    #[arg(long, help = "Exit non-zero if verification prerequisites are missing")]
+    pub require_vm: bool,
 }
 
 /// Unified dispatch used by the thin shell wrappers.
@@ -248,6 +368,24 @@ pub struct RunArgs {
     /// Target operation to run.
     #[command(subcommand)]
     pub target: RunTarget,
+}
+
+/// Embedded-skills subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SkillsCommand {
+    /// List embedded skills, or list one skill's files (`skills list NAME`).
+    List {
+        /// Optional skill name, optionally `NAME/PATH` for a deeper layer.
+        path: Option<String>,
+    },
+    /// Print a skill's SKILL.md (or a file under it) as raw markdown.
+    Read {
+        /// Skill name, optionally `NAME/PATH` for a file under the skill.
+        name: String,
+        /// Emit a JSON envelope instead of raw markdown.
+        #[arg(long, help = "Emit a JSON envelope instead of raw markdown")]
+        json: bool,
+    },
 }
 
 /// Targets for the wrapper-driven `rfb-cli run` path.
@@ -447,7 +585,7 @@ pub struct ForkdSnapshotCreateArgs {
     /// Snapshot tag to create.
     #[arg(long)]
     pub tag: String,
-    /// vmlinux kernel path (`FORKD_KERNEL`, default `resx/kernel/vmlinux-5.10.225`).
+    /// vmlinux kernel path (`FORKD_KERNEL`, default `resx/kernel/vmlinux-arcbox-0.0.24`).
     #[arg(long)]
     pub kernel: Option<PathBuf>,
     /// forkd-agent rootfs path (`FORKD_ROOTFS`, default `resx/rootfs/forkd-agent.ext4`).

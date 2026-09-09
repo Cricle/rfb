@@ -1,6 +1,9 @@
 #![cfg(feature = "guest")]
 
-use rfb_runtime::guest_entrypoint::{config, GuestTransport};
+use rfb_runtime::guest_entrypoint::config;
+
+#[cfg(feature = "zeroboot")]
+use rfb_runtime::guest_entrypoint::GuestTransport;
 
 #[test]
 fn public_guest_transport_has_embeddable_modes() {

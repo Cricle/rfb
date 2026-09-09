@@ -18,7 +18,7 @@ forkd controller（沙箱生命周期：快照/创建/销毁）
 
 - **WSL2 或真实 Linux**（x86_64）。不要用 Windows `.exe` 当 Linux 服务；没有 Linux 二进制就先在 WSL 里构建。
 - Rust toolchain（MSRV 1.82+）。
-- 需要 VM 后端时：`/dev/kvm` 可用，且匹配的 Firecracker、kernel、rootfs（仓库已带 `firecracker-v1.16.1-x86_64.tgz` 与 `vmlinux-5.10.225`）。
+- 需要 VM 后端时：`/dev/kvm` 可用，且匹配的 Firecracker、kernel、rootfs（仓库已带 `firecracker-v1.16.1-x86_64.tgz` 与 `vmlinux-arcbox-0.0.24`）。
 - 创建 TAP 网卡需要 root（`ip tuntap`）；若 `cni0` 已占用 `10.42.0.1/24`，先记录现状再临时挪址，结束后恢复。
 
 ## 2. 构建 rfb-cli
@@ -39,7 +39,7 @@ rfb-cli doctor --json                    # 检查宿主能力（kvm/mke2fs/网�
 rfb/resx/
 ├── forkd/        # forkd 官方二进制（controller + guest agent）
 ├── firecracker/  # Firecracker 二进制（sha256sum -c firecracker-v1.16.1-x86_64.tgz.sha256）
-├── kernel/       # vmlinux-5.10.225
+├── kernel/       # vmlinux-arcbox-0.0.24
 ├── rootfs/       # 各协议 rootfs（不混用！）
 └── snapshots/    # 快照输出
 ```
@@ -59,8 +59,25 @@ rfb-cli image build-rootfs target/x86_64-unknown-linux-musl/release/rfb-runtime 
     resx/rootfs/zeroboot-zbrt.ext4 --mode zeroboot-zbrt --force
 
 # 校验 kernel
-rfb-cli image check-kernel resx/kernel/vmlinux-5.10.225
+rfb-cli image check-kernel resx/kernel/vmlinux-arcbox-0.0.24
 ```
+
+**一条命令（all-in-one）**：静态编译（含嵌入解释器 feature）→ 组装 rootfs（自动装
+`/bin/python3`、`/bin/lua` 硬链接与离线扩展包）→ 校验 kernel → Firecracker 真机 boot 验证：
+
+```bash
+rfb-cli image build-all \
+  --root . --target x86_64-unknown-linux-musl \
+  --features cli,rustpython,mlua \
+  resx/rootfs/zeroboot-zbrt.ext4 \
+  --mode zeroboot-zbrt --force \
+  --py-site-dir ~/rfb-sites/py --lua-lib-dir ~/rfb-sites/lua \
+  --kernel resx/kernel/vmlinux-arcbox-0.0.24
+```
+
+- `--features` 决定嵌入解释器：`rustpython` → 装 `/bin/python3`，`mlua` → 装 `/bin/lua`，可任选/全要/都不要（默认 shell）。
+- `--py-site-dir` / `--lua-lib-dir` 把本地**纯 Python / 纯 Lua** 包目录打进镜像（沙箱无网络，`pip` 不可用；Python 无 ssl/multiprocessing/ctypes/sqlite3）。
+- `--kernel` 省略时跳过第 3/4 阶段，只出 rootfs。
 
 `rfb-vsock` / `forkd-agent` / `zeroboot-zbrt` 三种 rootfs **不可互换**。
 
@@ -96,7 +113,7 @@ export FORKD_URL=http://127.0.0.1:8889
 ```bash
 rfb-cli forkd snapshot-create \
   --tag rfb \
-  --kernel resx/kernel/vmlinux-5.10.225 \
+  --kernel resx/kernel/vmlinux-arcbox-0.0.24 \
   --rootfs resx/rootfs/forkd-agent.ext4
 
 # 就绪/可引导以 list 为准（轮询直至 status=ready 且 bootable=true）

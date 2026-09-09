@@ -20,6 +20,13 @@ uuid = { version = "1", features = ["v7"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.7.2", optional = true }
+# Optional embedded guest interpreters (multi-call /init dispatch). Both are
+# statically linked into the musl binary when their feature is enabled; the
+# sandbox has no network, so extension packages are baked into the rootfs.
+mlua = { version = "0.12.1", optional = true, features = ["lua54", "vendored"] }
+rustpython-pylib = { version = "0.5", optional = true, features = ["freeze-stdlib"] }
+rustpython-stdlib = { version = "0.5", optional = true }
+rustpython-vm = { version = "0.5", optional = true, default-features = false, features = ["encodings", "host_env", "importlib", "stdio", "threading", "freeze-stdlib"] }
 # Note: KVM is driven exclusively through the external `firecracker` binary
 # over its HTTP-on-UDS API; this crate deliberately has no in-process KVM
 # ioctl dependencies.
@@ -52,6 +59,10 @@ forkd = ["guest"]
 firecracker = ["core", "dep:anyhow", "dep:serde_json"]
 zeroboot = ["guest"]
 cli = ["guest", "forkd", "firecracker", "zeroboot"]
+# Embedded interpreters: enable either, both, or neither. Default image keeps
+# the shell-only behavior.
+rustpython = ["guest", "dep:rustpython-vm", "dep:rustpython-stdlib", "dep:rustpython-pylib"]
+mlua = ["guest", "dep:mlua"]
 
 [[bin]]
 name = "rfb-runtime"
@@ -85,6 +96,12 @@ required-features = ["guest"]
 [[test]]
 name = "zeroboot_connection"
 required-features = ["zeroboot"]
+[[test]]
+name = "interpreters_python"
+required-features = ["cli", "rustpython"]
+[[test]]
+name = "interpreters_lua"
+required-features = ["cli", "mlua"]
 [[bin]]
 name = "rfb1-workspace-client"
 path = "tests/clients/rfb1_workspace_client.rs"

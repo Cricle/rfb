@@ -337,7 +337,7 @@ fn provenance_binding_roundtrip_verified() {
     // firecracker from the assets the snapshot actually booted, rootfs from
     // the built image, snapshot artifacts from the on-disk snapshot dir.
     let rootfs = common::rootfs("forkd-agent.ext4");
-    let kernel = common::resx("kernel/vmlinux-5.10.225");
+    let kernel = common::resx("kernel/vmlinux-arcbox-0.0.24");
     let home = std::env::var("HOME").unwrap_or_default();
     let snap_dir = PathBuf::from(home)
         .join(".local/share/forkd/snapshots")

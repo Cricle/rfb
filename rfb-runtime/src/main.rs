@@ -5,15 +5,23 @@ use std::io;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    let mode = std::env::args().nth(1);
-    let init_script = std::env::args()
-        .next()
-        .and_then(|arg0| {
-            std::path::Path::new(&arg0)
-                .file_name()
-                .map(|n| n.to_owned())
-        })
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).cloned();
+    let init_script = args
+        .first()
+        .and_then(|arg0| std::path::Path::new(arg0).file_name().map(|n| n.to_owned()))
         .unwrap_or_default();
+    // Multi-call interpreter dispatch: when build-rootfs installs hardlinks
+    // (`/bin/python3`, `/bin/lua`) exec'd through ZBRT, argv[0] is the applet
+    // name. Compiled in only with the `rustpython` / `mlua` features.
+    #[cfg(feature = "rustpython")]
+    if init_script == "python3" {
+        std::process::exit(rfb_runtime::interpreters::python::run(&args[1..]));
+    }
+    #[cfg(feature = "mlua")]
+    if init_script == "lua" {
+        std::process::exit(rfb_runtime::interpreters::lua::run(&args[1..]));
+    }
     let forkd_init_file = std::path::Path::new("/forkd-init.sh").is_file();
     let forkd_agent = mode.as_deref() == Some("forkd-agent")
         || std::env::var("RFB_RUNTIME_MODE").ok().as_deref() == Some("forkd-agent")

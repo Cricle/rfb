@@ -82,13 +82,13 @@ impl SandboxBackendConfig {
             #[cfg(feature = "forkd")]
             "forkd" => Ok(Self::Forkd(crate::forkd::ForkdConfig::from_env())),
             #[cfg(not(feature = "zeroboot"))]
-            "zeroboot" => Err(unavailable(
+            "zeroboot" => Err(unavailable(String::from(
                 "zeroboot backend selected but the zeroboot feature is not compiled in",
-            )),
+            ))),
             #[cfg(not(feature = "forkd"))]
-            "forkd" => Err(unavailable(
+            "forkd" => Err(unavailable(String::from(
                 "forkd backend selected but the forkd feature is not compiled in",
-            )),
+            ))),
             other => Err(unavailable(format!(
                 "unknown {BACKEND_ENV} {other:?} (expected: zeroboot | forkd)"
             ))),

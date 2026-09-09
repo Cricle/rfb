@@ -29,7 +29,7 @@ fn verify_args(bench: bool) -> Vec<String> {
         "verify".to_owned(),
         "--require-vm".to_owned(),
         "--kernel".to_owned(),
-        common::resx("kernel/vmlinux-5.10.225")
+        common::resx("kernel/vmlinux-arcbox-0.0.24")
             .to_string_lossy()
             .into_owned(),
         "--rootfs".to_owned(),

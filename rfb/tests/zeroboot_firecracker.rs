@@ -131,4 +131,61 @@ mod firecracker {
             assert_eq!(value["uds_path"], "/tmp/v.sock");
         }
     }
+
+    // Moved out of `src/zeroboot/firecracker.rs` per the tests-folder gate
+    // (`scripts/check-tests-folder.sh`); the `include! above keeps the
+    // private `parse_response_head seam visible here.
+    mod response_head_tests {
+        use super::*;
+
+        #[test]
+        fn parses_204_without_body() {
+            let (status, len) =
+                parse_response_head("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            assert_eq!(status, 204);
+            assert_eq!(len, 0);
+        }
+
+        #[test]
+        fn parses_status_from_line_not_substring() {
+            // Regression: `Content-Length: 2048` must not read as a 204 status.
+            let (status, len) = parse_response_head(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2048\r\n\r\n",
+            )
+            .unwrap();
+            assert_eq!(status, 500);
+            assert_eq!(len, 2048);
+        }
+
+        #[test]
+        fn parses_200_with_body() {
+            let (status, len) = parse_response_head(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n",
+            )
+            .unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(len, 12);
+        }
+
+        #[test]
+        fn content_length_is_case_insensitive_and_optional() {
+            let (status, len) =
+                parse_response_head("HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                    .unwrap();
+            assert_eq!(status, 204);
+            assert_eq!(len, 0);
+            let (status, len) = parse_response_head("HTTP/1.1 204 No Content\r\n\r\n").unwrap();
+            assert_eq!(status, 204);
+            assert_eq!(len, 0);
+        }
+
+        #[test]
+        fn rejects_malformed_heads() {
+            assert!(parse_response_head("").is_err());
+            assert!(parse_response_head("\r\n\r\n").is_err());
+            assert!(parse_response_head("HTTP/2 204\r\n\r\n").is_err());
+            assert!(parse_response_head("HTTP/1.1 ok\r\n\r\n").is_err());
+        }
+    }
 }

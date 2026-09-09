@@ -5,16 +5,21 @@
 //! CLI is a thin router over these functions so every path gets identical
 //! validation and error codes.
 
+mod all;
 mod artifact;
 mod build;
 mod manifest;
 mod verify;
 
+pub use all::build_all;
 pub use artifact::{
     valid_sha, ArtifactFile, ArtifactManifest, ArtifactMismatch, ArtifactSnapshot, ArtifactTool,
     ArtifactVm,
 };
-pub use build::{build, build_rootfs, image_diagnostics, init, profile_summary};
+pub use build::{
+    build, build_rootfs, image_diagnostics, init, profile_summary, RootfsOptions, LUA_LIB_DIR,
+    PY_SITE_PACKAGES,
+};
 pub use manifest::{
     load, safe_join, sha256, sha256_bytes, validate, ImageManifestWire, StagedFile,
     StagingManifest, FORKD_PROFILE, FORKD_PROTOCOL, FORKD_TRANSPORT,

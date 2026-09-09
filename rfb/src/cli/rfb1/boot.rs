@@ -195,7 +195,7 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
         "/machine-config",
         &json!({
             "vcpu_count": 1,
-            "mem_size_mib": 512,
+            "mem_size_mib": mem_size_mib(),
             "smt": false,
         }),
     )?;
@@ -245,6 +245,17 @@ pub fn boot_firecracker(
         init_path: "/sbin/rfb-runtime",
         vsock_flag: true,
     })
+}
+
+/// Effective guest memory for CLI-driven Firecracker boots (RFB1 acceptance
+/// and ZeroBoot verify). Defaults to 512 MiB; `RFB_FIRECRACKER_MEMORY_MB`
+/// overrides it for capacity evaluation, matching the runtime controller env.
+fn mem_size_mib() -> u32 {
+    std::env::var("RFB_FIRECRACKER_MEMORY_MB")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|mib| *mib > 0)
+        .unwrap_or(512)
 }
 
 fn api_put(socket: &Path, path: &str, body: &Value) -> Result<(), CliError> {

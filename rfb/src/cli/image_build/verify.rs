@@ -91,11 +91,21 @@ pub fn check_kernel(path: &Path) -> Result<Value, CliError> {
 }
 
 /// Build the runtime binary for a target triple and enforce static linkage.
+/// `features` is the comma-separated cargo feature list (default `cli` at the
+/// CLI layer); `rustpython`/`mlua` embed the interpreters.
 /// This replaces `image/build-static.sh` while keeping package/build outputs
 /// explicit and avoiding any package installation.
-pub fn build_static_runtime(root: &Path, target: &str, package: &str) -> Result<Value, CliError> {
+pub fn build_static_runtime(
+    root: &Path,
+    target: &str,
+    package: &str,
+    features: &str,
+) -> Result<Value, CliError> {
     if target.trim().is_empty() || package.trim().is_empty() {
         return Err(validation("target and package must not be empty"));
+    }
+    if features.trim().is_empty() {
+        return Err(validation("features must not be empty"));
     }
     if !tool_available("cargo") {
         return Err(external("cargo is required"));
@@ -131,7 +141,7 @@ pub fn build_static_runtime(root: &Path, target: &str, package: &str) -> Result<
             "-p",
             package,
             "--features",
-            "cli",
+            features.trim(),
         ])
         .current_dir(root)
         .status()
@@ -166,6 +176,7 @@ pub fn build_static_runtime(root: &Path, target: &str, package: &str) -> Result<
         "ok": true,
         "target": target,
         "package": package,
+        "features": features.trim(),
         "binary": binary,
         "linkage": "static",
         "digest": format!("sha256:{digest}"),
