@@ -41,7 +41,11 @@ jobs:
     steps:
       # debian:12 精简镜像连 git 都没有；actions/checkout 虽能回退到 API 下载，
       # 但装上 git 更稳（完整 clone，保留 checkout 语义）。
+      # 显式 shell: bash：debian:12 没有 which 命令，runner 探测 bash 失败会
+      # 回退到 sh（dash），而 dash 不支持 `set -o pipefail`，会立即以 exit 2
+      # 秒退 —— 这正是此前 apt 步骤无日志秒败的根因。
       - name: Install git（debian:12 精简镜像自带工具极少）
+        shell: bash
         run: |
           set -euo pipefail
           # 失败现场要能被公开 API 读到（日志下载需 token）：把诊断与 apt
@@ -95,6 +99,7 @@ jobs:
       # 执行全部内聚在脚本内。容器默认即 root，无需 sudo；跳过与退出码约定
       # 见脚本头部注释。
       - name: Run sdk/e2e/debian-e2e.sh
+        shell: bash
         run: |
           set -euo pipefail
           bash sdk/e2e/debian-e2e.sh
