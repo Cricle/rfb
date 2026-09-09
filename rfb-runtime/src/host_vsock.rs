@@ -35,10 +35,12 @@ pub struct VsockEndpoint {
     pub identity: Option<EndpointIdentity>,
 }
 
-/// Filesystem identity of the host UDS relay (device + inode).
+/// Filesystem identity of the host UDS relay (device + inode + birth time).
 ///
 /// Only populated on Unix where `stat` is available; on other platforms
 /// identity capture always fails with [`VsockEndpointError::Unsupported`].
+/// Birth time matters: ext4 can hand a freshly recreated socket the exact
+/// inode of the deleted one, so (device, inode) alone misses replacements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointIdentity {
     /// Device number of the relay socket.
@@ -47,6 +49,11 @@ pub struct EndpointIdentity {
     /// Inode of the relay socket.
     #[cfg(unix)]
     pub inode: u64,
+    /// Birth time when the filesystem reports it (`None` otherwise — e.g.
+    /// filesystems without `statx` birth-time support fall back to the
+    /// device/inode pair).
+    #[cfg(unix)]
+    pub created: Option<std::time::SystemTime>,
 }
 
 /// Why a vsock endpoint could not be built or is no longer usable.
@@ -1136,6 +1143,7 @@ fn read_identity(path: &std::path::Path) -> Result<EndpointIdentity, VsockEndpoi
     Ok(EndpointIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        created: metadata.created().ok(),
     })
 }
 
