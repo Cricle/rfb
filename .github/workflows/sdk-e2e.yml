@@ -98,11 +98,36 @@ jobs:
       # 依赖安装（apt：python3/maven 等；dotnet：官方安装脚本）与三个套件的
       # 执行全部内聚在脚本内。容器默认即 root，无需 sudo；跳过与退出码约定
       # 见脚本头部注释。
+      # 注意：脚本自身把套件失败折叠为 rc=1，因此 rc=134 这类"进程被信号杀死"
+      # 只可能来自脚本内未受保护的段落（如 ensure_dotnet）。失败时把完整日志
+      # 尾部与各套件日志尾部拆成 ::error:: 注解带出（日志下载需 token）。
       - name: Run sdk/e2e/debian-e2e.sh
         shell: bash
         run: |
-          set -euo pipefail
-          bash sdk/e2e/debian-e2e.sh
+          set -uo pipefail
+          emit_file() {
+            tail -c "$3" "$1" 2>/dev/null \
+              | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
+          }
+          log=/tmp/debian-e2e-full.log
+          set +e
+          bash sdk/e2e/debian-e2e.sh 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::debian-e2e.sh 失败 rc=$rc（完整日志在 job log / artifact，以下为尾部）"
+            emit_file "$log" e2e-full 3000
+            for f in "$PWD"/sdk-e2e-out/*.log "$PWD"/sdk-e2e-out/summary.txt; do
+              [ -f "$f" ] || continue
+              b="e2e-$(basename "$f")"
+              emit_file "$f" "$b" 2000
+            done
+            exit "$rc"
+          fi
+          echo "debian-e2e.sh 全部通过"
 
       # 失败也要留证据：脚本汇总/逐套件日志 + C# trx + Java surefire XML。
       - name: Upload E2E summary and test reports
