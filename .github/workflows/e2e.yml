@@ -195,7 +195,34 @@ jobs:
             sleep 5
           done
           echo "::error::快照 $TAG 300s 内未进入 ready+bootable 状态"
-          curl -sS "$FORKD_URL/v1/snapshots" || true
+          # 失败现场要能被公开 API 读到（日志下载需 token）：把快照列表、
+          # snapshot-create 输出、快照目录与 audit 日志尾部拆成注解带出。
+          emit_diag() {
+            tr '\r\n' '::' < "$1" 2>/dev/null \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
+          }
+          curl -sS "$FORKD_URL/v1/snapshots" > /tmp/snaps.json 2>&1 || true
+          emit_diag /tmp/snaps.json snaps
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          [ -f "$RUN_DIR/snapshot-create.json" ] && \
+            emit_diag "$RUN_DIR/snapshot-create.json" snap-create
+          {
+            echo "== snapshot root =="
+            ls -la "$HOME/.local/share/forkd/snapshots/" 2>&1
+            echo "== tag dir =="
+            ls -la "$HOME/.local/share/forkd/snapshots/$TAG/" 2>&1
+            echo "== snapshot.json =="
+            cat "$HOME/.local/share/forkd/snapshots/$TAG/snapshot.json" 2>&1
+            echo "== controller state.json =="
+            cat "$RUN_DIR/controller/state/state.json" 2>&1
+            echo "== audit tail =="
+            tail -c 2000 "$RUN_DIR/controller/audit.log" 2>&1
+            echo "== forkd proc =="
+            ps aux | grep -E 'firecracker|forkd' | grep -v grep || true
+          } > /tmp/vm-diag.txt 2>&1 || true
+          emit_diag /tmp/vm-diag.txt vm-diag
           exit 1
 
       # 跑真机 E2E：三重门（unix+cli cfg、#[ignore]、RFB_REAL_E2E=1）。

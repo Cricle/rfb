@@ -88,6 +88,11 @@ if [ "${E2E_SKIP_APT:-0}" != "1" ]; then
   $SUDO apt-get update -qq
   $SUDO apt-get install -y -qq --no-install-recommends \
     python3 curl ca-certificates openjdk-17-jdk-headless maven
+  # .NET 运行时强依赖 ICU，缺失即在 dotnet 首次启动时 FailFast/SIGABRT（rc 134）。
+  # ICU 包名随 Debian 版本变化（bookworm=libicu72, trixie=libicu76），按序回退。
+  $SUDO apt-get install -y -qq --no-install-recommends libicu72 \
+    || $SUDO apt-get install -y -qq --no-install-recommends libicu76 \
+    || $SUDO apt-get install -y -qq --no-install-recommends libicu-dev
 else
   log "E2E_SKIP_APT=1：跳过 apt 依赖安装"
 fi
