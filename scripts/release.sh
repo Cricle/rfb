@@ -47,7 +47,18 @@ unset CARGO_REGISTRY_TOKEN
 # Package and publish strictly in dependency order. rfb-sdk/rfb-rig cannot be
 # packaged until rfb-runtime 0.0.1 is resolvable on crates.io, so packaging
 # everything up front breaks first-time publishing of a new crate family.
+# Idempotent: a crate/version already on crates.io is skipped, so re-running
+# a release (after fixing an unrelated channel) never conflicts.
+CRATES_UA="rfb-release-script (contact: qnydhuaji@gmail.com)"
+crate_published() {
+  curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: $CRATES_UA" \
+    "https://crates.io/api/v1/crates/$1/$version" | grep -q 200
+}
 publish_crate() {
+  if crate_published "$1"; then
+    printf '%s %s already on crates.io; skipping\n' "$1" "$version"
+    return 0
+  fi
   cargo package -p "$1" --locked --allow-dirty
   cargo publish -p "$1" --locked
 }
