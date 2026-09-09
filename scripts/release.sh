@@ -44,7 +44,13 @@ fi
 export CARGO_REGISTRIES_CRATES_IO_TOKEN="$CARGO_REGISTRY_TOKEN"
 unset CARGO_REGISTRY_TOKEN
 
-publish_crate() { cargo publish -p "$1" --locked; }
+# Package and publish strictly in dependency order. rfb-sdk/rfb-rig cannot be
+# packaged until rfb-runtime 0.0.1 is resolvable on crates.io, so packaging
+# everything up front breaks first-time publishing of a new crate family.
+publish_crate() {
+  cargo package -p "$1" --locked --allow-dirty
+  cargo publish -p "$1" --locked
+}
 publish_crate rfb-runtime
 printf 'rfb-runtime published; waiting %ss for index propagation\n' "${CRATES_IO_PROPAGATION_SECONDS:-30}"
 sleep "${CRATES_IO_PROPAGATION_SECONDS:-30}"

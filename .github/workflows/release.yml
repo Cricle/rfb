@@ -47,7 +47,7 @@ jobs:
       - name: Publish (gates + package + three crates in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
-          CRATES_IO_PROPAGATION_SECONDS: '30'
+          CRATES_IO_PROPAGATION_SECONDS: '60'
         run: |
           set -uo pipefail
           # 失败现场要能被公开 API 读到（日志下载需 token）：日志尾部拆成注解。
@@ -111,7 +111,21 @@ jobs:
               | awk -v t=release-pypi '{print "::error title="t"-"NR"::"$0}'
             exit "$rc"
           fi
+      # 重跑保护：PyPI 上该版本已存在时跳过发布（twine 对重复文件会报错失败）。
+      - name: Skip publish if version already on PyPI
+        id: pypi_guard
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/rfb-sdk/${VERSION}/json" || true)
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "rfb-sdk ${VERSION} 已在 PyPI 上，跳过重复发布"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish to PyPI
+        if: steps.pypi_guard.outputs.exists != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/python/dist
