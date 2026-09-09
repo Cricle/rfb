@@ -240,6 +240,9 @@ jobs:
       - name: Run real-VM E2E tests
         run: |
           set -euo pipefail
+          # 不依赖 GITHUB_ENV 传递（实测未传播导致 $TAG unbound 秒退）：
+          # TAG 与 step 10 同源，按 run id 确定性重算。
+          TAG="ci-e2e-$GITHUB_RUN_ID"
           export RFB_REAL_E2E=1
           export RFB_E2E_SNAPSHOT_TAG="$TAG"
           export RFB_E2E_ROOTFS_DIR="$PWD/resx/rootfs"
@@ -283,7 +286,7 @@ jobs:
         run: |
           set -euo pipefail
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
-          TAG="${TAG:-}"
+          TAG="${TAG:-ci-e2e-$GITHUB_RUN_ID}"
           if [ -n "$TAG" ] && [ -x target/release/rfb-cli ]; then
             FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4" \
               ./target/release/rfb-cli forkd snapshot-delete \
