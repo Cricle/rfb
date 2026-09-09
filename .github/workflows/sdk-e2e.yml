@@ -44,12 +44,50 @@ jobs:
       - name: Install git（debian:12 精简镜像自带工具极少）
         run: |
           set -euo pipefail
-          # 兜底：若容器内 DNS 仍不可用（resolv.conf 指向宿主回环），改写公共 DNS
-          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
-            printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf
+          # 失败现场要能被公开 API 读到（日志下载需 token）：把诊断与 apt
+          # 输出拆成 ::error:: 注解带出来。
+          emit_diag() {
+            local f="$1" t="$2" data
+            data=$(LC_ALL=C tr '\r\n' '::' < "$f" | LC_ALL=C tr -d '%')
+            local n=${#data} i=0 c=1
+            while [ "$i" -lt "$n" ]; do
+              echo "::error title=$t-$c::${data:i:700}"
+              i=$((i+700)); c=$((c+1))
+            done
+          }
+          diag=/tmp/sdk-e2e-diag.txt
+          {
+            echo "== resolv.conf before =="
+            cat /etc/resolv.conf
+            echo "== getent deb.debian.org =="
+            getent hosts deb.debian.org
+            echo "getent rc=$?"
+          } > "$diag" 2>&1 || true
+          # 无条件改写公共 DNS：条件式改写覆盖不到 getent 成功但 apt 仍失败的
+          # 场景；resolv.conf 在同一 job 容器内跨步骤保留，后续 debian-e2e.sh
+          # 的 apt 同样受益。
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+          ok=0
+          for attempt in 1 2; do
+            if apt-get update -o Acquire::Retries=3 >> "$diag" 2>&1; then
+              ok=1
+              break
+            fi
+            echo "== apt-get update attempt $attempt failed, switch DNS ==" >> "$diag"
+            printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > /etc/resolv.conf
+            sleep 2
+          done
+          if [ "$ok" != 1 ]; then
+            emit_diag "$diag" apt-update
+            echo "::error::apt-get update 重试后仍失败（诊断见注解）"
+            exit 1
           fi
-          apt-get update
-          apt-get install -y git
+          if ! apt-get install -y git >> "$diag" 2>&1; then
+            emit_diag "$diag" apt-install
+            echo "::error::apt-get install git 失败"
+            exit 1
+          fi
+          git --version
 
       - uses: actions/checkout@v4
 

@@ -123,16 +123,18 @@ jobs:
       # forkd controller（官方二进制）：独立 state/audit/pid 目录，snapshot
       # root 指向默认快照目录（provenance 测试从 $HOME/.local/share/forkd/
       # snapshots/<tag> 读取 snapshot.json/memory.bin/vmstate）。
+      # 注意：CLI 必须带 serve 子命令，且参数为 --state <json 文件> / --bind。
       - name: Start forkd-controller
         run: |
           set -euo pipefail
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
           mkdir -p "$RUN_DIR/controller/state" "$HOME/.local/share/forkd/snapshots"
-          resx/forkd/forkd-controller \
-            --state-dir "$RUN_DIR/controller/state" \
+          resx/forkd/forkd-controller serve \
+            --state "$RUN_DIR/controller/state/state.json" \
             --audit-log "$RUN_DIR/controller/audit.log" \
             --snapshot-root "$HOME/.local/share/forkd/snapshots" \
-            --listen 127.0.0.1:8889 &
+            --bind 127.0.0.1:8889 \
+            > "$RUN_DIR/controller/stdout.log" 2>&1 &
           echo $! > "$RUN_DIR/controller/pid"
           for i in $(seq 1 60); do
             if curl -fsS "$FORKD_URL/v1/snapshots" > /dev/null 2>&1; then
@@ -141,7 +143,26 @@ jobs:
             fi
             sleep 1
           done
-          echo "::error::forkd-controller 60s 内未就绪，audit 日志："
+          # 失败现场要能被公开 API 读到（日志下载需 token）：把 controller
+          # stdout 与 audit 日志拆成 ::error:: 注解带出来。
+          emit_diag() {
+            local f="$1" t="$2" data
+            if [ ! -f "$f" ]; then
+              echo "::error title=$t::(文件不存在: $f)"
+              return 0
+            fi
+            data=$(LC_ALL=C tr '\r\n' '::' < "$f" | LC_ALL=C tr -d '%')
+            local n=${#data} i=0 c=1
+            while [ "$i" -lt "$n" ]; do
+              echo "::error title=$t-$c::${data:i:700}"
+              i=$((i+700)); c=$((c+1))
+            done
+          }
+          emit_diag "$RUN_DIR/controller/stdout.log" ctrl-stdout
+          emit_diag "$RUN_DIR/controller/audit.log" ctrl-audit
+          echo "--- controller stdout ---"
+          cat "$RUN_DIR/controller/stdout.log" || true
+          echo "--- controller audit ---"
           cat "$RUN_DIR/controller/audit.log" || true
           exit 1
 
