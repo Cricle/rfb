@@ -245,8 +245,35 @@ jobs:
           export RFB_E2E_ROOTFS_DIR="$PWD/resx/rootfs"
           export FORKD_SNAPSHOT_TAG="$TAG"
           export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          # 失败现场要能被公开 API 读到（日志下载需 token）：把 FAILED 测试、
+          # panic 与日志尾部拆成 ::error:: 注解带出。
+          emit_diag() {
+            tr '\r\n' '::' < "$1" 2>/dev/null \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
+          }
+          log=/tmp/real-e2e.log
+          set +e
           cargo test -p rfb-sdk --features cli --test forkd_real_e2e \
-            -- --ignored --test-threads=1
+            -- --ignored --test-threads=1 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "real-VM E2E tests passed"
+            exit 0
+          fi
+          {
+            echo "== FAILED tests =="
+            grep -E "^test .* FAILED|test result:" "$log" || true
+            echo "== panics =="
+            grep -B2 -A8 "panicked at" "$log" | head -120 || true
+            echo "== tail =="
+            tail -c 2500 "$log"
+          } > /tmp/e2e-diag.txt 2>&1
+          echo "::error::real-VM E2E 失败 rc=$rc（详情见注解）"
+          emit_diag /tmp/e2e-diag.txt e2e-tests
+          exit "$rc"
 
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
       # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
