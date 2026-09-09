@@ -25,17 +25,18 @@ fi
 cargo fmt --all -- --check
 cargo test --workspace --all-features --no-fail-fast
 RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
-# The main crate ships as `rfb-sdk` (crates.io bare name `rfb` is occupied by
-# an unrelated 2022 crate; the lib target keeps the name `rfb`). Publish order
-# follows the dependency chain: rfb-runtime <- rfb-sdk <- rfb-rig.
-for crate in rfb-runtime rfb-sdk rfb-rig; do
-  cargo package -p "$crate" --locked --allow-dirty
-  if [[ "$mode" == dry-run ]]; then
-    cargo publish -p "$crate" --locked --dry-run
-  fi
-done
 
+# Dry-run verification only: package each crate and simulate publishing. The
+# rfb-sdk/rfb-rig dry-runs fail while rfb-runtime@0.0.1 is unpublished (known
+# limitation, documented in the release runbook).
 if [[ "$mode" == dry-run ]]; then
+  # The main crate ships as `rfb-sdk` (crates.io bare name `rfb` is occupied by
+  # an unrelated 2022 crate; the lib target keeps the name `rfb`). Publish order
+  # follows the dependency chain: rfb-runtime <- rfb-sdk <- rfb-rig.
+  for crate in rfb-runtime rfb-sdk rfb-rig; do
+    cargo package -p "$crate" --locked --allow-dirty
+    cargo publish -p "$crate" --locked --dry-run
+  done
   printf 'Release checks passed for workspace version %s\n' "$version"
   exit 0
 fi
