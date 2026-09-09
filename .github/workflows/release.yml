@@ -1,41 +1,53 @@
+# RFB 发布流水线：tag v*.*.* 触发，四条独立渠道并行发布。
+#
+# 渠道与凭据（secrets 名以仓库配置为准）：
+# - crates.io:  rfb-runtime → rfb-sdk → rfb-rig（主 crate 发布名 rfb-sdk——
+#   crates.io 裸名 `rfb` 被无关项目占用，lib 名仍是 rfb；scripts/release.sh
+#   按依赖链发布并等待索引传播）。凭据 CRATES_KEY ->
+#   CARGO_REGISTRIES_CRATES_IO_TOKEN。
+# - PyPI:       sdk/python 打包为 rfb-sdk（PyPI `rfb` 名称同样被占用）。
+#   凭据 PYPI_KEY（PyPI API token）。
+# - Maven:      io.rfb:rfb-sdk -> Maven Central（central-publishing-maven-plugin，
+#   profile central-release）。凭据 MAVEN_KEY：settings.xml 的 <server> 块
+#   （id 必须为 central）；签名需 GPG_PRIVATE_KEY + GPG_PASSPHRASE
+#   （Central 强制要求 GPG 签名）。
+# - NuGet:      Rfb.Sdk -> nuget.org。凭据 NUGET_KEY（API key），
+#   包版本由 tag 推导（v0.0.1 -> 0.0.1）。
+#
+# tag 与 workspace 版本的一致性（v0.0.1 <-> Cargo.toml version 0.0.1）在
+# crates 渠道强制校验；PyPI/Maven 版本各自固定为 0.0.1，与 tag 同步维护。
+
 name: Release
 
 on:
   push:
     tags: ['v*.*.*']
 
-# Replace this explicit placeholder with the repository's actual owner/name before enabling releases.
-env:
-  GITHUB_REPOSITORY: PLACEHOLDER_GITHUB_REPOSITORY
-
 permissions:
   contents: write
 
 jobs:
-  release:
+  crates:
+    name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Validate repository and tag
+      - name: Validate tag matches workspace version
         env:
           TAG: ${{ github.ref_name }}
-          ACTUAL_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REPOSITORY" != "PLACEHOLDER_GITHUB_REPOSITORY" || { echo 'Configure GITHUB_REPOSITORY placeholder before release.' >&2; exit 1; }
-          test "$ACTUAL_REPOSITORY" = "$GITHUB_REPOSITORY"
-          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(x["version"] for x in json.load(sys.stdin)["packages"] if x["name"] == "rfb"))')
-          test "$TAG" = "v$VERSION"
-      - name: Publish crates in dependency order
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(x["version"] for x in json.load(sys.stdin)["packages"] if x["name"] == "rfb-sdk"))')
+          test "$TAG" = "v$VERSION" || { echo "tag $TAG != v$VERSION" >&2; exit 1; }
+      - name: Publish (gates + package + three crates in dependency order)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
           CRATES_IO_PROPAGATION_SECONDS: '30'
         run: bash scripts/release.sh
       - name: Build CLI
-        run: cargo build -p rfb --features cli --release
+        run: cargo build -p rfb-sdk --features cli --release
       - name: Package and checksum
-        id: package
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -43,14 +55,115 @@ jobs:
           mkdir -p dist
           cp target/release/rfb-cli dist/rfb-cli
           (cd dist && sha256sum rfb-cli > SHA256SUMS)
-          echo "artifact=rfb-${TAG}.tar.gz" >> "$GITHUB_OUTPUT"
           tar -C dist -czf "dist/rfb-${TAG}.tar.gz" rfb-cli SHA256SUMS
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          repository: ${{ env.GITHUB_REPOSITORY }}
           files: |
-            dist/${{ steps.package.outputs.artifact }}
+            dist/rfb-${{ github.ref_name }}.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
+
+  pypi:
+    name: Publish rfb-sdk to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build sdist and wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade build
+          python -m build sdk/python
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist
+          password: ${{ secrets.PYPI_KEY }}
+
+  maven:
+    name: Publish rfb-sdk to Maven Central
+    runs-on: ubuntu-latest
+    env:
+      HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure settings.xml from MAVEN_KEY
+        env:
+          MAVEN_KEY: ${{ secrets.MAVEN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MAVEN_KEY:-}" ]; then
+            echo "::error::secret MAVEN_KEY 未配置（Maven Central 的 <server> 凭据块，<id> 必须为 central）"
+            exit 1
+          fi
+          mkdir -p "$HOME/.m2"
+          # 兼容两种形态：整份 settings.xml 原样落盘；裸 <server> 块则包一层
+          if printf '%s' "$MAVEN_KEY" | grep -q '<settings'; then
+            printf '%s\n' "$MAVEN_KEY" > "$HOME/.m2/settings.xml"
+          else
+            {
+              printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+              printf '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">\n'
+              printf '  <servers>\n'
+              printf '%s\n' "$MAVEN_KEY"
+              printf '  </servers>\n'
+              printf '</settings>\n'
+            } > "$HOME/.m2/settings.xml"
+          fi
+      - name: Check GPG key secret
+        run: |
+          set -euo pipefail
+          if [ "$HAS_GPG_KEY" != "true" ]; then
+            echo "::error::secret GPG_PRIVATE_KEY 未配置：Maven Central 强制要求 GPG 签名"
+            exit 1
+          fi
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          KEY_FILE="$RUNNER_TEMP/gpg-private-key.asc"
+          printf '%s' "$GPG_PRIVATE_KEY" > "$KEY_FILE"
+          gpg --batch --import "$KEY_FILE"
+          rm -f "$KEY_FILE"
+      - name: Publish to Maven Central
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          mvn --batch-mode --no-transfer-progress -Pcentral-release deploy \
+            -f sdk/java/pom.xml -Dgpg.passphrase="$GPG_PASSPHRASE"
+
+  nuget:
+    name: Publish Rfb.Sdk to NuGet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Pack
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          dotnet pack sdk/csharp/src/Rfb.Sdk/Rfb.Sdk.csproj -c Release \
+            -o dist/nuget -p:Version="$VERSION"
+      - name: Push to nuget.org
+        env:
+          NUGET_KEY: ${{ secrets.NUGET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_KEY:-}" ]; then
+            echo "::error::secret NUGET_KEY 未配置（nuget.org API key）"
+            exit 1
+          fi
+          dotnet nuget push "dist/nuget/*.nupkg" --api-key "$NUGET_KEY" \
+            --source https://api.nuget.org/v3/index.json --skip-duplicate

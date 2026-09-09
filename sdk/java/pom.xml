@@ -15,11 +15,22 @@
 
   <groupId>io.rfb</groupId>
   <artifactId>rfb-sdk</artifactId>
-  <version>1.0.0</version>
+  <version>0.0.1</version>
   <packaging>jar</packaging>
 
   <name>rfb-sdk</name>
   <description>RFB Java SDK: unified RfbClient facade over forkd controller (HTTP/JSON), forkd guest (TCP NDJSON) and ZBRT v1 (binary frames) — mirror port of the Rust reference implementation</description>
+
+  <!-- Release target: GitHub Packages (maven.pkg.github.com/Cricle/rfb).
+       Auth comes from the `github` server entry in settings.xml provisioned by
+       .github/workflows/release.yml (GITHUB_TOKEN, packages:write). -->
+  <distributionManagement>
+    <repository>
+      <id>github</id>
+      <name>GitHub Packages</name>
+      <url>https://maven.pkg.github.com/Cricle/rfb</url>
+    </repository>
+  </distributionManagement>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -54,4 +65,74 @@
       </plugins>
     </pluginManagement>
   </build>
+
+  <!--
+    发布 profile（仅 CI 的 tag 发布使用：mvn -Pcentral-release deploy）。
+    Maven Central 硬性要求：sources jar、javadoc jar、GPG 签名、经
+    central-publishing-maven-plugin 上传（凭据取 settings.xml 中 id=central
+    的 <server>，由 release.yml 从 secret MAVEN_KEY 生成）。
+  -->
+  <profiles>
+    <profile>
+      <id>central-release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.6.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.6.3</version>
+            <configuration>
+              <doclint>none</doclint>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.4</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

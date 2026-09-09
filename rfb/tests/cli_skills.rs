@@ -16,6 +16,10 @@ fn skills_list_advertises_registered_skills() {
         entries.iter().any(|skill| skill["name"] == "rfb-build-all"),
         "rfb-build-all must be listed: {value}"
     );
+    assert!(
+        entries.iter().any(|skill| skill["name"] == "rfb-release"),
+        "rfb-release must be listed: {value}"
+    );
     let build_all = entries
         .iter()
         .find(|skill| skill["name"] == "rfb-build-all")

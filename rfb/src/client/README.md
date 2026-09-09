@@ -19,7 +19,7 @@
 
 ```bash
 # 仓库根（rfb workspace）
-cargo build -p rfb --features forkd,zeroboot
+cargo build -p rfb-sdk --features forkd,zeroboot
 ```
 
 依赖 crate 内已有实现，未新增依赖：controller 复用 `rfb::controller::ForkdClient`，NDJSON 复用 `rfb::forkd_guest::ForkdGuestClient/ForkdGuestStream`，ZBRT 帧编解码复用 `rfb::protocol`（`rfb-runtime::zeroboot_protocol` 的 re-export）。MSRV 1.82，edition 2021，tokio 异步。
@@ -76,7 +76,7 @@ async fn main() -> Result<(), rfb::client::RfbError> {
 
 ```bash
 # 全部客户端测试（黄金向量 + 门面，需 feature）
-cargo test -p rfb --features forkd,zeroboot --lib --test client_codec --test client_facade
+cargo test -p rfb-sdk --features forkd,zeroboot --lib --test client_codec --test client_facade
 
 # 仓库完整门禁（默认 feature，默认并行）
 cargo fmt --all -- --check

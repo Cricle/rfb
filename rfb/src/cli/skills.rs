@@ -21,23 +21,39 @@ struct Skill {
     files: &'static [(&'static str, &'static str)],
 }
 
-static SKILLS: &[Skill] = &[Skill {
-    name: "rfb-build-all",
-    description: "rfb 沙箱镜像一键构建与真机验收：image build-all 全链路（musl 静态编译 → rootfs 组装含解释器/离线扩展包注入 → 内核校验 → Firecracker verify）→ 真机解释器 E2E → 全门禁。当用户要构建 rfb 沙箱镜像、验收 rfb-runtime 改动、或验证 guest 内 python3/lua 解释器功能时使用。",
-    version: "1.0.0",
-    cli_help: "rfb-cli image build-all --help; rfb-cli zeroboot verify --help",
-    files: &[(
-        "SKILL.md",
-        include_str!("../../skills/rfb-build-all/SKILL.md"),
-    )],
-}];
+static SKILLS: &[Skill] = &[
+    Skill {
+        name: "rfb-build-all",
+        description: "rfb 沙箱镜像一键构建与真机验收：image build-all 全链路（musl 静态编译 → rootfs 组装含解释器/离线扩展包注入 → 内核校验 → Firecracker verify）→ 真机解释器 E2E → 全门禁。当用户要构建 rfb 沙箱镜像、验收 rfb-runtime 改动、或验证 guest 内 python3/lua 解释器功能时使用。",
+        version: "1.0.0",
+        cli_help: "rfb-cli image build-all --help; rfb-cli zeroboot verify --help",
+        files: &[(
+            "SKILL.md",
+            include_str!("../../skills/rfb-build-all/SKILL.md"),
+        )],
+    },
+    Skill {
+        name: "rfb-release",
+        description: "rfb 发布验证闭环：打 tag（如 v0.0.1）触发 Release workflow 的 crates.io/PyPI/Maven Central/NuGet 四渠道发布 → 监控 CI run → 失败拉日志定位 → 修复重试直到全绿。当用户要打 tag 发版、验证发布链路、或排查 Release 失败时使用。",
+        version: "1.0.0",
+        cli_help: "git tag v0.0.1 && git push origin v0.0.1; GitHub API: /repos/Cricle/rfb/actions/runs",
+        files: &[(
+            "SKILL.md",
+            include_str!("../../skills/rfb-release/SKILL.md"),
+        )],
+    },
+];
 
 /// Resolved content of one file under a skill.
 #[derive(Debug)]
 pub struct SkillContent {
+    /// Skill registry name (e.g. `rfb-build-all`).
     pub name: &'static str,
+    /// Skill registry version.
     pub version: &'static str,
+    /// File path within the skill (`SKILL.md` by default).
     pub path: &'static str,
+    /// Raw embedded markdown content.
     pub content: &'static str,
 }
 

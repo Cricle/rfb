@@ -11,7 +11,7 @@ case "${1:-}" in
   *) printf 'usage: %s [--check|--dry-run]\n' "$0" >&2; exit 2 ;;
 esac
 
-version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == "rfb"))')
+version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == "rfb-sdk"))')
 tag=$(git describe --tags --exact-match 2>/dev/null || true)
 if [[ "$mode" == publish && -z "$tag" ]]; then
   printf 'formal release requires an exact version tag\n' >&2
@@ -25,7 +25,10 @@ fi
 cargo fmt --all -- --check
 cargo test --workspace --all-features --no-fail-fast
 RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
-for crate in rfb-runtime rfb rfb-rig; do
+# The main crate ships as `rfb-sdk` (crates.io bare name `rfb` is occupied by
+# an unrelated 2022 crate; the lib target keeps the name `rfb`). Publish order
+# follows the dependency chain: rfb-runtime <- rfb-sdk <- rfb-rig.
+for crate in rfb-runtime rfb-sdk rfb-rig; do
   cargo package -p "$crate" --locked --allow-dirty
   if [[ "$mode" == dry-run ]]; then
     cargo publish -p "$crate" --locked --dry-run
@@ -43,8 +46,10 @@ unset CARGO_REGISTRY_TOKEN
 
 publish_crate() { cargo publish -p "$1" --locked; }
 publish_crate rfb-runtime
+printf 'rfb-runtime published; waiting %ss for index propagation\n' "${CRATES_IO_PROPAGATION_SECONDS:-30}"
 sleep "${CRATES_IO_PROPAGATION_SECONDS:-30}"
-publish_crate rfb
+publish_crate rfb-sdk
+printf 'rfb-sdk published; waiting %ss for index propagation\n' "${CRATES_IO_PROPAGATION_SECONDS:-30}"
 sleep "${CRATES_IO_PROPAGATION_SECONDS:-30}"
 publish_crate rfb-rig
 printf 'Published workspace version %s\n' "$version"

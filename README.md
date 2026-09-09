@@ -38,7 +38,7 @@ Linux 才提供 `tokio-vsock`、KVM ioctl 与 Firecracker 控制器；Windows �
 cargo add rfb
 cargo test -p rfb
 cargo test -p rfb-runtime --no-default-features --features core
-cargo build -p rfb --features cli
+cargo build -p rfb-sdk --features cli
 ```
 
 `rfb-cli doctor --json` 可检查宿主能力；`image build-rootfs`、`rfb1 acceptance` 等命令的路径和运行时输入必须显式传入。协议 RFB1（framed vsock）、forkd（TCP/NDJSON）和 ZBRT（ZeroBoot binary frame）及其镜像不可互换，缺少能力时必须 fail closed。

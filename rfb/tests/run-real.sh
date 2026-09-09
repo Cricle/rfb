@@ -115,8 +115,8 @@ fi
 # → forkd-agent rootfs。RFB_E2E_SKIP_BUILD=1 可跳过（产物已存在时）。
 mkdir -p "$ROOTFS_DIR"
 if [ "${RFB_E2E_SKIP_BUILD:-0}" != "1" ]; then
-  log "cargo build -p rfb --features cli"
-  (cd "$WORKSPACE" && cargo build -p rfb --features cli)
+  log "cargo build -p rfb-sdk --features cli"
+  (cd "$WORKSPACE" && cargo build -p rfb-sdk --features cli)
   log "rfb-cli image build-static（musl 静态 rfb-runtime）"
   "$CLI_BIN" image build-static \
     --root "$WORKSPACE" --target x86_64-unknown-linux-musl --package rfb-runtime
@@ -209,6 +209,6 @@ export FORKD_BIN="$FORKD_BIN_DEFAULT"
 export FORKD_KERNEL="$KERNEL_BIN"
 export FORKD_ROOTFS="$ROOTFS_IMG"
 export FORKD_TAP="$TAP_DEV"
-cargo test -p rfb --features cli --test forkd_real_e2e -- --ignored --test-threads=1
+cargo test -p rfb-sdk --features cli --test forkd_real_e2e -- --ignored --test-threads=1
 
 log "PASS：全部真机 E2E 测试通过（REAL_KVM_E2E 证据）"

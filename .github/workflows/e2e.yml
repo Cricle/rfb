@@ -30,7 +30,7 @@ jobs:
       FORKD_URL: http://127.0.0.1:8889
       FORKD_TAP: forkd-tap0
       FORKD_BIN: ${{ github.workspace }}/resx/forkd/forkd
-      FORKD_KERNEL: ${{ github.workspace }}/resx/kernel/vmlinux-5.10.225
+      FORKD_KERNEL: ${{ github.workspace }}/resx/kernel/vmlinux-arcbox-0.0.24
     steps:
       - uses: actions/checkout@v4
 
@@ -101,13 +101,13 @@ jobs:
       - name: Build rfb-cli and forkd-agent rootfs
         run: |
           set -euo pipefail
-          cargo build -p rfb --features cli --release
+          cargo build -p rfb-sdk --features cli --release
           ./target/release/rfb-cli image build-static \
             --root . --target x86_64-unknown-linux-musl --package rfb-runtime
           ./target/release/rfb-cli image build-rootfs \
             target/x86_64-unknown-linux-musl/release/rfb-runtime \
             resx/rootfs/forkd-agent.ext4 --mode forkd-agent --force
-          ./target/release/rfb-cli image check-kernel resx/kernel/vmlinux-5.10.225
+          ./target/release/rfb-cli image check-kernel resx/kernel/vmlinux-arcbox-0.0.24
 
       # 临时 TAP：preflight 的 forkd_tap 检查要求 forkd-tap0 存在且 UP，
       # 地址段 10.42.0.1/24 与 real-machine-runbook.md 一致（全新 runner 无
@@ -191,7 +191,7 @@ jobs:
           export RFB_E2E_ROOTFS_DIR="$PWD/resx/rootfs"
           export FORKD_SNAPSHOT_TAG="$TAG"
           export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
-          cargo test -p rfb --features cli --test forkd_real_e2e \
+          cargo test -p rfb-sdk --features cli --test forkd_real_e2e \
             -- --ignored --test-threads=1
 
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。

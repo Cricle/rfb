@@ -1,5 +1,5 @@
 //! Unified SDK facade for RFB — the reference implementation behind the single
-//! public client type [`RfbClient`](facade::RfbClient).
+//! public client type [`RfbClient`].
 //!
 //! The three protocol implementations (forkd controller HTTP, forkd guest
 //! NDJSON, ZBRT v1 binary frames) are internal adapters that reuse the crate's

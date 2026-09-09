@@ -23,7 +23,7 @@ description: rfb 沙箱镜像一键构建与真机验收 runbook（本文件内�
 ### 1. 重建 rfb-cli（源码有改动时）
 
 ```bash
-wsl -d Debian -- bash -c "source \$HOME/.cargo/env && cd /mnt/c/workplace/mm/monitor/rfb && CARGO_TARGET_DIR=/home/huaji/rfb-target cargo build -p rfb --features cli 2>&1 | tail -3 && echo CLI_REBUILT"
+wsl -d Debian -- bash -c "source \$HOME/.cargo/env && cd /mnt/c/workplace/mm/monitor/rfb && CARGO_TARGET_DIR=/home/huaji/rfb-target cargo build -p rfb-sdk --features cli 2>&1 | tail -3 && echo CLI_REBUILT"
 ```
 
 ### 2. build-all（后台跑，musl release + lto 需 1-7 分钟）
@@ -48,7 +48,7 @@ wsl -d Debian -- bash -c "cd /mnt/c/workplace/mm/monitor/rfb && /home/huaji/rfb-
 ### 4. 真机解释器 E2E（三重门控：linux+cli cfg / #[ignore] / RFB_REAL_E2E=1）
 
 ```bash
-wsl -d Debian -- bash -c "source \$HOME/.cargo/env && cd /mnt/c/workplace/mm/monitor/rfb && CARGO_TARGET_DIR=/home/huaji/rfb-target RFB_REAL_E2E=1 RFB_E2E_ROOTFS_DIR=/tmp/rfb-build cargo test -p rfb --features cli --test zeroboot_interpreters -- --ignored --test-threads=1 2>&1 | tail -8"
+wsl -d Debian -- bash -c "source \$HOME/.cargo/env && cd /mnt/c/workplace/mm/monitor/rfb && CARGO_TARGET_DIR=/home/huaji/rfb-target RFB_REAL_E2E=1 RFB_E2E_ROOTFS_DIR=/tmp/rfb-build cargo test -p rfb-sdk --features cli --test zeroboot_interpreters -- --ignored --test-threads=1 2>&1 | tail -8"
 ```
 
 覆盖：python3 -c / stdin / site 包 import / lua require / 语法错 exit 1 / 缺文件 exit 1 / usage exit 2 / deadline kill。features 不含 rustpython 或 mlua 时镜像内无对应解释器，跳过并说明。

@@ -26,7 +26,7 @@ MSRV 为 Rust 1.82，edition 2021。`core` 可在常见 Rust 平台编译；vsoc
 CLI 位于 `rfb`：
 
 ```bash
-cargo build -p rfb --features cli
+cargo build -p rfb-sdk --features cli
 rfb-cli doctor --json
 rfb-cli image build-static --target x86_64-unknown-linux-musl --package rfb-runtime
 rfb-cli image build-rootfs /abs/path/to/rfb-runtime --mode forkd-agent /abs/out/rootfs.ext4

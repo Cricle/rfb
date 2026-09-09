@@ -6,10 +6,10 @@
 //! handshake the connection carries guest AF_VSOCK stream bytes.
 //!
 //! Every driver (zeroboot provider, RFB1 CLI, `host_vsock`) must parse the
-//! reply through [`parse_relay_response`] so the acceptance rules cannot
-//! drift. Async callers may use [`perform_relay_handshake`], which applies a
-//! single absolute deadline to every I/O step (a peer that drips bytes slowly
-//! cannot stretch the handshake past the deadline).
+//! reply through `parse_relay_response` so the acceptance rules cannot drift.
+//! Async callers may use `perform_relay_handshake`, which applies a single
+//! absolute deadline to every I/O step (a peer that drips bytes slowly cannot
+//! stretch the handshake past the deadline).
 
 use std::time::Instant;
 

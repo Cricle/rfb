@@ -39,9 +39,11 @@ fn help_and_version_are_stable_binary_contracts() {
 
     let output = run(&["--version"]);
     assert!(output.status.success());
+    // The version string tracks the package version so it survives version
+    // bumps without test churn.
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "rfb-cli 0.1.0"
+        format!("rfb-cli {}", env!("CARGO_PKG_VERSION"))
     );
 }
 

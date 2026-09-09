@@ -215,13 +215,13 @@ fn rejects_unknown_kind() {
 #[test]
 fn rejects_truncated_header() {
     let bytes = good_frame_bytes();
-    assert!(Frame::decode(&mut bytes[..20].as_ref()).is_err());
+    assert!(Frame::decode(&mut &bytes[..20]).is_err());
 }
 
 #[test]
 fn rejects_truncated_payload() {
     let bytes = good_frame_bytes();
-    assert!(Frame::decode(&mut bytes[..40].as_ref()).is_err());
+    assert!(Frame::decode(&mut &bytes[..40]).is_err());
 }
 
 #[test]

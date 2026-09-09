@@ -1,10 +1,17 @@
 [package]
-name = "rfb"
-version = "0.1.0"
+# Published as `rfb-sdk`: crates.io bare name `rfb` is occupied by an unrelated
+# 2022 crate. The lib target keeps the name `rfb` so all `use rfb::` code and
+# the `rfb-cli` binary are unchanged.
+name = "rfb-sdk"
+version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/PLACEHOLDER_ORG/rfb"
+repository = "https://github.com/Cricle/rfb"
 description = "RFB sandbox contracts and integrations"
+
+[lib]
+name = "rfb"
+path = "src/lib.rs"
 
 [features]
 default = []
@@ -28,7 +35,7 @@ anyhow = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
-rfb-runtime = { path = "../rfb-runtime", version = "0.1.0", optional = true, default-features = false, features = ["core"] }
+rfb-runtime = { path = "../rfb-runtime", version = "0.0.1", optional = true, default-features = false, features = ["core"] }
 tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]

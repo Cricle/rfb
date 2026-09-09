@@ -9,6 +9,10 @@
 pub mod cleanup;
 pub mod commands;
 pub mod dispatch;
+// `error.rs` opens with plain `//` comments because it is also `include!`d
+// into a test that cannot carry inner doc comments; allow the missing module
+// docs here.
+#[allow(missing_docs)]
 pub mod error;
 pub mod forkd;
 pub mod host;

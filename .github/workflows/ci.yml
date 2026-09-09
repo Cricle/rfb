@@ -1,8 +1,10 @@
 name: CI
 
+# 触发约定：main 推送由 e2e.yml 负责跑真机 E2E；本工作流只跑其余分支
+# 的推送与所有 PR 的"简单测试"（fmt/clippy/test/doc，全部 --all-features）。
 on:
   push:
-    branches: [main]
+    branches-ignore: [main]
   pull_request:
 
 permissions:
@@ -17,6 +19,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # all-features 会启用 rustpython（libffi-sys）等系统链接依赖
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
       - name: Check test layout and framework boundary
         run: |
           bash scripts/check-tests-folder.sh

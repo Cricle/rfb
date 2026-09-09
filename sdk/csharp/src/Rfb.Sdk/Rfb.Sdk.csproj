@@ -9,6 +9,14 @@
     <AssemblyName>Rfb.Sdk</AssemblyName>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- NuGet 包元数据；CI 发布时用 tag 覆盖 Version（-p:Version=...） -->
+    <PackageId>Rfb.Sdk</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Cricle</Authors>
+    <Description>RFB unified SDK (C#): RfbClient facade over forkd controller, forkd guest and ZBRT v1 — mirror port of the Rust reference implementation</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Cricle/rfb</RepositoryUrl>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>

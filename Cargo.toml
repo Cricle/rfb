@@ -3,7 +3,7 @@ members = ["rfb", "rfb-rig", "rfb-runtime", "ben"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 # Replace before publishing this workspace.

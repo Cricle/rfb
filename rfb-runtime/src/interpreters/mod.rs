@@ -1,5 +1,5 @@
 //! Optional embedded guest interpreters, dispatched multi-call style from
-//! `/init` by `argv[0]` basename (`python3` → [`python`], `lua` → [`lua`]).
+//! `/init` by `argv[0]` basename (`python3` → `python`, `lua` → `lua`).
 //!
 //! `image build-rootfs` installs `/bin/python3` and `/bin/lua` as hardlinks to
 //! the runtime binary when the corresponding cargo feature was compiled in, so
