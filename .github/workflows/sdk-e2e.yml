@@ -32,6 +32,9 @@ jobs:
     timeout-minutes: 60
     container:
       image: debian:12   # 与本地 WSL 验证环境（rfb-e2e-debian，Debian 12 bookworm）同源
+      # GH Actions 宿主的 systemd-resolved（127.0.0.53）在容器内不可达，
+      # apt 域名解析会失败；显式指公共 DNS。
+      options: --dns 8.8.8.8
     env:
       # 把脚本日志/汇总指到工作区内固定路径，供最后的 artifact 步骤上传
       E2E_OUT_DIR: ${{ github.workspace }}/sdk-e2e-out
@@ -41,8 +44,12 @@ jobs:
       - name: Install git（debian:12 精简镜像自带工具极少）
         run: |
           set -euo pipefail
-          apt-get update -qq
-          apt-get install -y -qq git
+          # 兜底：若容器内 DNS 仍不可用（resolv.conf 指向宿主回环），改写公共 DNS
+          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
+            printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf
+          fi
+          apt-get update
+          apt-get install -y git
 
       - uses: actions/checkout@v4
 
