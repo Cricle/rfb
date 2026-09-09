@@ -179,18 +179,22 @@ jobs:
           ./target/release/rfb-cli forkd snapshot-create \
             --tag "$TAG" --tap forkd-tap0 --json \
             | tee "$RUN_DIR/snapshot-create.json"
+          # 就绪判定脚本必须顶格落盘：python3 -c 内嵌代码会带上 YAML 块缩进，
+          # IndentationError 会让每次轮询静默失败（快照早已就绪却永远等不到）。
+          cat > /tmp/snap-ready.py <<'PY'
+          import json, sys
+
+          tag = sys.argv[1]
+          snaps = json.load(sys.stdin)
+          ok = any(s.get("tag") == tag
+                   and str(s.get("status", "")).lower() == "ready"
+                   and s.get("bootable") is True for s in snaps)
+          sys.exit(0 if ok else 1)
+          PY
           # daemon 异步收编快照（周期性扫描 snapshot-root，实测约 300s 才置
           # ready+bootable），等待窗给足 900s；就绪即提前退出。
           for i in $(seq 1 180); do
-            if curl -fsS "$FORKD_URL/v1/snapshots" | python3 -c '
-              import json, sys
-              tag = sys.argv[1]
-              snaps = json.load(sys.stdin)
-              ok = any(s.get("tag") == tag
-                       and str(s.get("status", "")).lower() == "ready"
-                       and s.get("bootable") is True for s in snaps)
-              sys.exit(0 if ok else 1)
-            ' "$TAG"; then
+            if curl -fsS "$FORKD_URL/v1/snapshots" | python3 /tmp/snap-ready.py "$TAG"; then
               echo "snapshot $TAG ready+bootable"
               exit 0
             fi
