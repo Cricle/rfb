@@ -38,6 +38,9 @@ impl WorkspaceGuestExecutor {
                 Ok(())
             });
         }
+        // The child can create, modify, or delete workspace files, so the
+        // cached workspace size cannot survive an exec.
+        self.invalidate_workspace_size();
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             // ZBRT V1 execute contract (acceptance-matrix): a command the
@@ -53,17 +56,31 @@ impl WorkspaceGuestExecutor {
                 }));
             }
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Some(input) = value.get("stdin").and_then(Value::as_str) {
-                stdin
-                    .write_all(input.as_bytes())
-                    .map_err(|e| e.to_string())?;
-            }
-            drop(stdin);
-        }
         let pid = child.id();
-        let stdout = child.stdout.take().ok_or("stdout pipe unavailable")?;
-        let stderr = child.stderr.take().ok_or("stderr pipe unavailable")?;
+        let stdout = match child.stdout.take() {
+            Some(pipe) => pipe,
+            // Last setup failures before the guard below exists; make sure a
+            // successfully spawned child never leaks on them.
+            None => {
+                terminate_and_reap(&mut child, pid);
+                return Err("stdout pipe unavailable".into());
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(pipe) => pipe,
+            None => {
+                terminate_and_reap(&mut child, pid);
+                return Err("stderr pipe unavailable".into());
+            }
+        };
+        // From here on every error path (validation, cancel, deadline, reader
+        // failure) must terminate and reap the spawned child; the guard does
+        // so on drop and is disarmed on the success path.
+        let mut guard = ChildGuard {
+            child,
+            pid,
+            armed: true,
+        };
         let capture_limit = self.limits.max_event_bytes;
         let sink = self.event_sink.clone();
         let stdout_sink = sink.clone();
@@ -75,8 +92,9 @@ impl WorkspaceGuestExecutor {
         // recv_timeout below only bounds cancel/deadline checks, which are
         // latency-insensitive.
         let (tx, rx) = std::sync::mpsc::channel::<(u8, std::io::Result<Vec<u8>>)>();
-        // Reader completion arrives through the channel; the handles are
-        // detached (they end at pipe EOF, including the kill-on-cancel path).
+        // Unbounded channel is safe by construction: each reader sends exactly
+        // once (two sends total), so the queue cannot grow and senders never
+        // block.
         let stderr_tx = tx.clone();
         std::thread::spawn(move || {
             let result = read_stream(stdout, 0, capture_limit, stdout_sink);
@@ -86,6 +104,39 @@ impl WorkspaceGuestExecutor {
             let result = read_stream(stderr, 1, capture_limit, stderr_sink);
             let _ = stderr_tx.send((1, result));
         });
+        // Readers must drain stdout/stderr BEFORE stdin is written: a child
+        // that fills its output pipe (~64 KiB) before consuming stdin would
+        // otherwise block a synchronous write here forever, while the allowed
+        // stdin size reaches ~16 MiB.
+        let stdin = guard.child.stdin.take();
+        // stdin arrives either as a string or as a JSON byte array (ZBRT wire
+        // stdin is arbitrary bytes and must not pass through UTF-8 lossy
+        // conversion).
+        let input_bytes: Option<Vec<u8>> = match value.get("stdin") {
+            Some(Value::String(text)) => Some(text.clone().into_bytes()),
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .and_then(|n| u8::try_from(n).ok())
+                            .ok_or("stdin must be bytes in 0..=255".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+            Some(_) => return Err("stdin must be a string or byte array".into()),
+            None => None,
+        };
+        if let (Some(mut stdin), Some(input)) = (stdin, input_bytes) {
+            // Dedicated writer thread: a blocking pipe write cannot stall the
+            // cancel/deadline loop below. Write errors (e.g. broken pipe after
+            // the child exited early) are non-fatal — stop writing silently;
+            // the exit code already reflects the child.
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        // No input: the taken handle dropped above, closing the pipe as EOF.
         let timeout = value
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -110,20 +161,20 @@ impl WorkspaceGuestExecutor {
                 Ok((stream, result)) => {
                     reader_results[stream as usize] = Some(result);
                     if reader_results.iter().all(Option::is_some) {
-                        break child.wait().map_err(|e| e.to_string())?;
+                        break guard.child.wait().map_err(|e| e.to_string())?;
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if cancel.load(Ordering::SeqCst) {
-                        terminate_and_reap(&mut child, pid);
-                        // Do not block on the reader threads: on Linux the killed
-                        // process group closes the pipes so they drain immediately; on
-                        // Windows a surviving descendant may hold the pipe open. The
-                        // threads end when this process exits.
+                        // The guard kills the process group and reaps on the
+                        // way out. Do not block on the reader threads: on Linux
+                        // the killed process group closes the pipes so they
+                        // drain immediately; on Windows a surviving descendant
+                        // may hold the pipe open. The threads end when this
+                        // process exits.
                         return Err("request cancelled".into());
                     }
                     if std::time::Instant::now() >= deadline {
-                        terminate_and_reap(&mut child, pid);
                         return Err("command timed out".into());
                     }
                 }
@@ -132,6 +183,9 @@ impl WorkspaceGuestExecutor {
                 }
             }
         };
+        // Success: the child has been waited on, so the error-path guard is
+        // no longer needed.
+        guard.disarm();
         let stdout = reader_results[0]
             .take()
             .ok_or("stdout reader failed")?
@@ -193,6 +247,30 @@ fn bounded(bytes: &[u8], max: usize) -> String {
         text.truncate(end);
     }
     text
+}
+
+/// Owns a spawned child for the duration of `exec` and guarantees it is
+/// terminated and reaped when the function exits through any error path after
+/// spawn (validation failure, cancel, deadline, reader failure). Disarmed on
+/// the success path once the child has been waited on.
+struct ChildGuard {
+    child: std::process::Child,
+    pid: u32,
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            terminate_and_reap(&mut self.child, self.pid);
+        }
+    }
 }
 
 /// Terminate a child and reap it, bounded so a stuck kill cannot block the

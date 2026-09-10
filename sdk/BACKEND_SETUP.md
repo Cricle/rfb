@@ -106,7 +106,20 @@ export FORKD_URL=http://127.0.0.1:8889
 # export FORKD_TOKEN=<token>          # 仅当 controller 配置了认证
 ```
 
-## 5. 创建快照并等就绪
+## 5. 环境变量
+
+SDK 与 `rfb-cli` 实际读取的环境变量一览（以代码为准）：
+
+| 变量 | 覆盖什么 | 谁读取 |
+|---|---|---|
+| `FORKD_URL` | forkd controller 地址（默认 `http://127.0.0.1:8889`） | 四语言 SDK 的 `RfbClient` 缺省构造；`rfb-cli forkd *` 各子命令 |
+| `FORKD_KERNEL` | snapshot 创建用的 vmlinux 内核路径（默认 `resx/kernel/vmlinux-arcbox-0.0.24`） | `rfb-cli forkd snapshot-create`（`--kernel` 未传时） |
+| `FORKD_ROOTFS` | snapshot 创建用的 forkd-agent rootfs 路径（默认 `resx/rootfs/forkd-agent.ext4`；boot 前复制为快照私有副本） | `rfb-cli forkd snapshot-create`（`--rootfs` 未传时） |
+| `FORKD_BIN` | 委托的官方 forkd 二进制路径（默认 `resx/forkd/forkd`，再退到 PATH） | `rfb-cli forkd snapshot-create / snapshot-info / snapshot-delete` 等 |
+| `RFB_RUNTIME_BIN` | 预编译静态 rfb-runtime 二进制的注入点（部署流水线按平台注入外部制品的约定名；仓库内代码不读它，构建时该路径作为 `rfb-cli image build-rootfs` 的位置参数传入） | 仓库文档约定的制品注入方 / 部署流水线 |
+| `RFB_AGENT_WORKSPACE` | forkd agent 的 guest 工作区根（默认 `/workspace` tmpfs） | rfb-runtime agent（`rfb-runtime/src/agent/transport.rs` 的 `workspace_root()`）——供宿主侧契约测试在无法创建 `/workspace` 时重定向 |
+
+## 6. 创建快照并等就绪
 
 `snapshot-create` 是 `rfb-cli` 薄封装：kernel/rootfs/forkd 二进制从 `resx/` 或环境变量（`FORKD_KERNEL` / `FORKD_ROOTFS` / `FORKD_TAP` / `FORKD_BIN`）解析校验后委托官方 `forkd`。rootfs 会被复制为快照私有副本再 boot（原件保持 pristine）。
 
@@ -122,7 +135,7 @@ rfb-cli forkd preflight --tag rfb          # 只读预检
 rfb-cli forkd acceptance --tag rfb --require-vm   # 完整验收（可选但推荐）
 ```
 
-## 6. 从 SDK 连接
+## 7. 从 SDK 连接
 
 四语言同一套流程：建沙箱 → exec → 文件读写 → 删除。
 
@@ -169,7 +182,7 @@ sbx.delete().await?;
 
 **transport="zbrt"**：把上面的 rootfs 换成 `zeroboot-zbrt.ext4` 建快照，创建/连接沙箱时传 `transport="zbrt"`（Rust 用 `GuestTransport::Zbrt`），其余代码完全不变。
 
-## 7. 故障排查
+## 8. 故障排查
 
 | 现象 | 处理 |
 |---|---|
@@ -183,7 +196,7 @@ sbx.delete().await?;
 
 退出码表：0 成功 / 2 用法错 / 3 校验错 / 4 I/O 错 / 5 外部工具错 / 12 缺 VM 或前置。
 
-## 8. 清理与安全
+## 9. 清理与安全
 
 ```bash
 kill "$(cat /tmp/rfb-live/controller/pid)"

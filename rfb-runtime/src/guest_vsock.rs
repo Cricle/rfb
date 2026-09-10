@@ -33,7 +33,7 @@ pub mod dispatcher {
         shared: Arc<Mutex<RuntimeService>>,
     ) -> io::Result<()>
     where
-        R: tokio::io::AsyncRead + Unpin,
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin,
     {
         super::connection::serve(reader, writer, codec, shared).await

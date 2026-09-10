@@ -13,9 +13,21 @@ use crate::resources::RuntimeLimits;
 use crate::session::{ControlMessage, RuntimeMessage, SessionEvent, SessionRequest};
 use identity::{request_id, validate_identity};
 use response::response_completes_turn;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Completed turns retained for duplicate detection and replay. Beyond this
+/// bound the oldest results are evicted so a long-lived daemon's bookkeeping
+/// stays bounded; evicted keys move to a bounded tombstone queue so a late
+/// replay fails explicitly instead of silently re-executing the turn.
+const COMPLETED_LIMIT: usize = 256;
+
+/// Cancelled turns retained for duplicate-cancel detection and replay, bounded
+/// like [`COMPLETED_LIMIT`]. An entry evicted from here degrades gracefully:
+/// a late cancel answers "request is not active" and a late completion falls
+/// back to the worker's own terminal result.
+const CANCELLED_LIMIT: usize = 256;
 
 /// Guest runtime state machine: identity, sequencing, lifecycle, and protocol
 /// safety for RFB1 control messages.
@@ -23,8 +35,18 @@ pub struct RuntimeService {
     sequence: u64,
     protocol_ready: bool,
     completed_requests: HashMap<(String, String), Vec<RuntimeMessage>>,
+    /// Insertion order of `completed_requests` keys, for oldest-first eviction
+    /// past [`COMPLETED_LIMIT`].
+    completed_order: VecDeque<(String, String)>,
+    /// Bounded tombstones for completed turns whose result was evicted: a
+    /// late replay gets an explicit "no longer available" error instead of a
+    /// silent re-execution.
+    evicted_requests: VecDeque<(String, String)>,
     active_sessions: HashMap<String, String>,
     cancelled_sessions: HashMap<(String, String), Vec<RuntimeMessage>>,
+    /// Insertion order of `cancelled_sessions` keys, for oldest-first eviction
+    /// past [`CANCELLED_LIMIT`].
+    cancelled_order: VecDeque<(String, String)>,
     shutdown: bool,
     limits: RuntimeLimits,
     /// `None` while an in-flight turn has taken the executor out to run it on
@@ -40,6 +62,48 @@ impl RuntimeService {
             .as_mut()
             .map(|boxed| boxed.as_mut())
             .expect("executor is present outside an in-flight turn")
+    }
+
+    /// Record a completed turn's responses, evicting the oldest entry past
+    /// [`COMPLETED_LIMIT`]. Evicted keys move to the bounded tombstone queue
+    /// (`evicted_requests`) so late replays can be rejected explicitly.
+    fn record_completed(&mut self, key: (String, String), responses: Vec<RuntimeMessage>) {
+        if !self.completed_requests.contains_key(&key) {
+            self.completed_order.push_back(key.clone());
+        }
+        self.completed_requests.insert(key, responses);
+        while self.completed_order.len() > COMPLETED_LIMIT {
+            if let Some(oldest) = self.completed_order.pop_front() {
+                self.completed_requests.remove(&oldest);
+                self.evicted_requests.push_back(oldest);
+            }
+            while self.evicted_requests.len() > COMPLETED_LIMIT {
+                self.evicted_requests.pop_front();
+            }
+        }
+    }
+
+    /// Record a cancelled turn's terminal responses, evicting the oldest
+    /// entry past [`CANCELLED_LIMIT`] (no tombstone: a late cancel for an
+    /// evicted request already fails with "request is not active").
+    fn record_cancelled(&mut self, key: (String, String), responses: Vec<RuntimeMessage>) {
+        if !self.cancelled_sessions.contains_key(&key) {
+            self.cancelled_order.push_back(key.clone());
+        }
+        self.cancelled_sessions.insert(key, responses);
+        while self.cancelled_order.len() > CANCELLED_LIMIT {
+            if let Some(oldest) = self.cancelled_order.pop_front() {
+                self.cancelled_sessions.remove(&oldest);
+            }
+        }
+    }
+
+    /// Explicit rejection for a request whose completed result was evicted.
+    fn evicted_replay_error(request_id: &str) -> RuntimeMessage {
+        RuntimeMessage::Error {
+            request_id: request_id.to_string(),
+            message: "request completed earlier; result no longer available".into(),
+        }
     }
 
     /// Handle one control message and return the responses to send back.
@@ -164,7 +228,10 @@ impl RuntimeService {
                 };
                 self.active_sessions.clear();
                 self.completed_requests.clear();
+                self.completed_order.clear();
+                self.evicted_requests.clear();
                 self.cancelled_sessions.clear();
+                self.cancelled_order.clear();
                 self.shutdown = true;
                 match result {
                     Ok(()) => vec![RuntimeMessage::ShutdownAck],
@@ -208,6 +275,9 @@ impl RuntimeService {
                 message: "request already completed".into(),
             });
         }
+        if self.evicted_requests.contains(&key) {
+            return Err(Self::evicted_replay_error(&turn.request_id));
+        }
         if let Some(active) = self.active_sessions.get(&turn.session_id) {
             return Err(RuntimeMessage::Error {
                 request_id: turn.request_id.clone(),
@@ -225,7 +295,9 @@ impl RuntimeService {
             None => {
                 return Err(RuntimeMessage::Error {
                     request_id: turn.request_id.clone(),
-                    message: "session already has an active request".into(),
+                    message: "runtime executor is unavailable: a previous turn was lost and \
+                              could not be restored; restart the runtime"
+                        .into(),
                 })
             }
         };
@@ -268,8 +340,26 @@ impl RuntimeService {
         if let Some(flag) = &self.turn_cancel {
             flag.store(true, Ordering::SeqCst);
         }
-        self.cancelled_sessions.insert(key, Vec::new());
+        self.record_cancelled(key, Vec::new());
         Vec::new()
+    }
+
+    /// Clear the in-flight turn when its worker died without delivering a
+    /// result (panic): the executor cannot be restored, so subsequent turn
+    /// claims fail with an actionable restart message instead of a phantom
+    /// "session already has an active request".
+    pub fn abandon_active_turn(&mut self) -> Vec<RuntimeMessage> {
+        let abandoned: Vec<RuntimeMessage> = self
+            .active_sessions
+            .iter()
+            .map(|(session_id, request_id)| RuntimeMessage::Error {
+                request_id: request_id.clone(),
+                message: format!("turn worker died without a result (session {session_id})"),
+            })
+            .collect();
+        self.active_sessions.clear();
+        self.turn_cancel = None;
+        abandoned
     }
 
     /// Restore the executor and produce the terminal responses for a turn that
@@ -319,9 +409,9 @@ impl RuntimeService {
             self.active_sessions.remove(&session_id);
         }
         if cancelled {
-            self.cancelled_sessions.insert(key, responses.clone());
+            self.record_cancelled(key, responses.clone());
         } else if !failed && finished {
-            self.completed_requests.insert(key, responses.clone());
+            self.record_completed(key, responses.clone());
         }
         responses
     }
@@ -333,6 +423,9 @@ impl RuntimeService {
         let key = (request.session_id.clone(), request.request_id.clone());
         if let Some(previous) = self.completed_requests.get(&key) {
             return previous.clone();
+        }
+        if self.evicted_requests.contains(&key) {
+            return vec![Self::evicted_replay_error(&request.request_id)];
         }
         if let Some(active) = self.active_sessions.get(&request.session_id) {
             return vec![RuntimeMessage::Error {
@@ -371,7 +464,7 @@ impl RuntimeService {
             self.active_sessions.remove(&session_id);
         }
         if !failed && finished {
-            self.completed_requests.insert(key, responses.clone());
+            self.record_completed(key, responses.clone());
         }
         responses
     }
@@ -412,7 +505,7 @@ impl RuntimeService {
             kind: "turn.cancelled".into(),
             payload: Vec::new(),
         })];
-        self.cancelled_sessions.insert(key, responses.clone());
+        self.record_cancelled(key, responses.clone());
         responses
     }
 

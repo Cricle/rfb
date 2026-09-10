@@ -34,7 +34,7 @@ pub fn run(cli: crate::cli::commands::Cli) -> Result<(), CliError> {
             render_output(cli.json, value, "cleanup".to_owned());
             Ok(())
         }
-        CommandLine::Skills { command } => skills(command),
+        CommandLine::Skills { command } => skills(cli.json, command),
         CommandLine::Run(args) => run_target(cli.json, args.target),
         CommandLine::Bench { command } => bench(cli.json, command),
         #[cfg(unix)]
@@ -121,7 +121,7 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
             Ok(())
         }
         ImageCommand::CheckKernel(args) => {
-            let value = image_build::check_kernel(&args.manifest)?;
+            let value = image_build::check_kernel(&args.kernel)?;
             render_output(json_out, value, "kernel valid".to_owned());
             Ok(())
         }
@@ -320,9 +320,10 @@ fn web(json_out: bool, command: WebCommand) -> Result<(), CliError> {
     }
 }
 
-/// Embedded agent-readable skills: `list` advertises, `read` prints raw
-/// markdown (or a JSON envelope with `--json`).
-fn skills(command: SkillsCommand) -> Result<(), CliError> {
+/// Embedded agent-readable skills: `list` advertises (always a JSON
+/// envelope), `read` prints raw markdown or a JSON envelope when the global
+/// `--json` or the subcommand-local `--json` is set.
+fn skills(json_out: bool, command: SkillsCommand) -> Result<(), CliError> {
     match command {
         SkillsCommand::List { path } => {
             let value = crate::cli::skills::list(path.as_deref());
@@ -333,7 +334,7 @@ fn skills(command: SkillsCommand) -> Result<(), CliError> {
         }
         SkillsCommand::Read { name, json } => {
             let content = crate::cli::skills::read(&name)?;
-            if json {
+            if json || json_out {
                 println!("{}", crate::cli::skills::content_json(&content)?);
             } else {
                 println!("{}", content.content);

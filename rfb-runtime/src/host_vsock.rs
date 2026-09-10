@@ -137,6 +137,11 @@ pub enum VsockClientError {
     /// An operation exceeded the configured timeout.
     #[error("vsock operation timed out")]
     Timeout,
+    /// The session's byte stream is no longer frame-aligned because a
+    /// timed-out operation dropped a partially-read frame; the session must
+    /// be recreated.
+    #[error("session stream is out of sync after a timed-out operation: {0}")]
+    Desync(String),
     /// The guest returned an RPC-level error.
     #[error("guest RPC failed: {0}")]
     Remote(String),
@@ -275,6 +280,10 @@ impl VsockClient {
 pub struct HostSession {
     client: VsockClient,
     next_sequence: u64,
+    /// Set when a timed-out operation dropped a partially-read frame: the
+    /// byte stream can no longer be frame-aligned, so every further operation
+    /// fails closed instead of decoding garbage.
+    poisoned: bool,
 }
 
 /// Shareable handle for a negotiated host session. Operations are serialized
@@ -311,6 +320,7 @@ impl SharedHostSession {
         SharedHostSession(std::sync::Arc::new(tokio::sync::Mutex::new(HostSession {
             client,
             next_sequence: 3,
+            poisoned: false,
         })))
     }
 }
@@ -651,8 +661,18 @@ impl HostClient {
         Ok(HostSession {
             client,
             next_sequence: 3,
+            poisoned: false,
         })
     }
+}
+
+#[cfg(unix)]
+const POISON_MESSAGE: &str = "a previous operation timed out mid-frame; recreate the session";
+
+#[cfg(unix)]
+fn is_stream_timeout(error: &VsockClientError) -> bool {
+    matches!(error, VsockClientError::Io(io_error) if io_error.kind() == std::io::ErrorKind::TimedOut)
+        || matches!(error, VsockClientError::Timeout)
 }
 
 #[cfg(unix)]
@@ -670,12 +690,34 @@ impl HostSession {
         message: &ControlMessage,
         sequence: u64,
     ) -> Result<(), VsockClientError> {
-        self.client.send_control(message, sequence).await
+        if self.poisoned {
+            return Err(VsockClientError::Desync(POISON_MESSAGE.into()));
+        }
+        if let Err(error) = self.client.send_control(message, sequence).await {
+            if is_stream_timeout(&error) {
+                // A write timeout can also leave the peer mid-frame, so the
+                // stream is no longer trustworthy.
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Receive one response, bounded by the configured session timeout.
     pub async fn recv(&mut self) -> Result<(Frame, RuntimeMessage), VsockClientError> {
-        self.client.recv().await
+        if self.poisoned {
+            return Err(VsockClientError::Desync(POISON_MESSAGE.into()));
+        }
+        match self.client.recv().await {
+            Err(error) if is_stream_timeout(&error) => {
+                // The timeout dropped a possibly partially-read frame; the
+                // stream can no longer be frame-aligned.
+                self.poisoned = true;
+                Err(error)
+            }
+            other => other,
+        }
     }
 
     /// Request orderly shutdown and validate its acknowledgement.

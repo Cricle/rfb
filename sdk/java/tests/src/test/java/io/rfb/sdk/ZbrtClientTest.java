@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -129,5 +130,27 @@ class ZbrtClientTest {
         assertThrows(ValidationError.class, () -> sandbox.eval("   "), "blank code");
         assertThrows(ValidationError.class, () -> sandbox.eval("1", null, 0.0), "timeout_s=0");
         assertEquals(0, frames.get(), "validation failures must not touch the wire");
+    }
+
+    @Test
+    void streamZbrtRejectsPtyEnvAndEmptyArgvSendsNoFrames() throws Exception {
+        // Fail-closed parity with the Rust/C#/Python baselines: pty and env
+        // are ZBRT-unsupported options that must raise ValidationError before
+        // any frame is sent (not be silently ignored), and empty argv is
+        // rejected on every transport.
+        AtomicInteger frames = new AtomicInteger(0);
+        server = new FakeZbrtServer(io -> {
+            frames.incrementAndGet();
+            ZbrtFrame exec = io.read();
+            io.write(FakeZbrtServer.exitFrame(exec.requestId(), 0));
+        });
+        Sandbox sandbox = zbrtSandbox();
+        assertThrows(ValidationError.class,
+                () -> sandbox.stream(List.of("cat"), null, true, null), "pty over zbrt");
+        assertThrows(ValidationError.class,
+                () -> sandbox.stream(List.of("cat"), null, null, Map.of("K", "V")), "env over zbrt");
+        assertThrows(ValidationError.class,
+                () -> sandbox.stream(List.of(), null, null, null), "empty argv over zbrt");
+        assertEquals(0, frames.get(), "rejections must not touch the wire");
     }
 }

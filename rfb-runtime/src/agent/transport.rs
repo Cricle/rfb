@@ -40,11 +40,16 @@ pub fn guest_path(value: Option<&Value>, _directory: bool) -> io::Result<PathBuf
         ));
     }
     let workspace = workspace_root();
-    let rel = raw
-        .strip_prefix(workspace)
-        .map(|s| s.trim_start_matches('/'))
-        .unwrap_or(raw);
-    if raw.starts_with('/') && !raw.starts_with(workspace) {
+    // Only an exact root match or a segment boundary ("/workspace/...") counts
+    // as inside the workspace: "/workspace2/x" must alias into the workspace.
+    let stripped = raw.strip_prefix(workspace);
+    let inside = matches!(stripped, Some(rest) if rest.is_empty() || rest.starts_with('/'));
+    let rel = if inside {
+        stripped.unwrap().trim_start_matches('/')
+    } else {
+        raw
+    };
+    if raw.starts_with('/') && !inside {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid guest path",

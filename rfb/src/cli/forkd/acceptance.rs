@@ -1,7 +1,7 @@
 //! Full forkd acceptance gate: create a sandbox, exercise ping/stream/exec and
 //! the structured filesystem RPCs, validate negative paths, then destroy.
 
-use crate::cli::error::{external, validation, CliError};
+use crate::cli::error::{external, no_vm, validation, CliError};
 use crate::cli::forkd::preflight::snapshot_ready;
 use crate::cli::forkd::sandbox::{
     create_sandbox, destroy_sandbox, guest_call, ping_sandbox, wait_for_guest_ready,
@@ -27,16 +27,24 @@ pub async fn acceptance(
         ));
     }
     // Preflight is part of the gate: without a bootable snapshot the gate is a
-    // hard BLOCKED when `require_vm` is set.
+    // hard BLOCKED when `require_vm` is set. Missing VM prerequisites carry the
+    // documented exit-12 contract (`no_vm`), not the validation exit code.
     let client = ForkdClient::new(url.to_owned(), None, GUEST_READY_DEADLINE)
         .map_err(|error| validation(error.to_string()))?;
-    let snapshots = client
-        .list_snapshots()
-        .await
-        .map_err(|error| validation(format!("forkd unavailable: {error}")))?;
+    let snapshots = match client.list_snapshots().await {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            let message = format!("forkd unavailable: {error}");
+            return Err(if require_vm {
+                no_vm(message)
+            } else {
+                validation(message)
+            });
+        }
+    };
     if !snapshot_ready(&snapshots, tag) {
         if require_vm {
-            return Err(validation(format!(
+            return Err(no_vm(format!(
                 "bootable ready snapshot '{tag}' is unavailable"
             )));
         }

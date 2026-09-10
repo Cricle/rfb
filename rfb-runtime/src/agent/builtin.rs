@@ -20,14 +20,17 @@ pub enum Builtin {
     NetProbe,
 }
 
-/// Return a builtin only for an exact command basename. This deliberately does
-/// not interpret a command line or consult PATH; all other commands are spawned.
+/// Return a builtin for a bare command name (no PATH is consulted) or an
+/// absolute path whose basename matches. A relative path like `tools/echo` is
+/// a workspace file the caller addressed explicitly, so it is spawned instead
+/// of being shadowed by the builtin.
 ///
 /// ```ignore
 /// use rfb_runtime::agent::builtin::{builtin, Builtin};
 /// let request = serde_json::json!({"args": ["/bin/echo", "hello"]});
 /// assert!(matches!(builtin(&request), Some(Builtin::Echo)));
 /// assert!(builtin(&serde_json::json!({"args": ["echoish"]})).is_none());
+/// assert!(builtin(&serde_json::json!({"args": ["tools/echo"]})).is_none());
 /// ```
 pub fn builtin(request: &Value) -> Option<Builtin> {
     let program = request
@@ -35,6 +38,9 @@ pub fn builtin(request: &Value) -> Option<Builtin> {
         .and_then(Value::as_array)
         .and_then(|args| args.first())
         .and_then(Value::as_str)?;
+    if program.contains('/') && !program.starts_with('/') {
+        return None;
+    }
     match program.rsplit('/').next()? {
         "echo" => Some(Builtin::Echo),
         "true" => Some(Builtin::True),

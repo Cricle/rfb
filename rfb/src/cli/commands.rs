@@ -96,7 +96,7 @@ pub enum ImageCommand {
     /// Build a rootfs ext4 directly from a runtime binary (env setup path).
     BuildRootfs(BuildRootfsArgs),
     /// Validate a kernel ELF and print its digest (check-kernel.sh).
-    CheckKernel(ImagePath),
+    CheckKernel(KernelPath),
     /// Build a static runtime binary for a target triple (build-static.sh).
     BuildStatic(BuildStaticArgs),
     /// All-in-one: build the static runtime, assemble the rootfs, and (with
@@ -151,6 +151,15 @@ pub struct ImagePath {
     /// Path to the image manifest JSON.
     #[arg(value_name = "MANIFEST", help = "Path to the image manifest JSON")]
     pub manifest: PathBuf,
+}
+
+/// A single kernel image path argument (used by `image check-kernel`, which
+/// validates a kernel ELF, not a manifest).
+#[derive(clap::Args, Debug)]
+pub struct KernelPath {
+    /// Path to the kernel image to validate.
+    #[arg(value_name = "KERNEL", help = "Path to the kernel image (vmlinux ELF)")]
+    pub kernel: PathBuf,
 }
 
 /// Arguments for `rfb-cli image init`.

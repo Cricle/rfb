@@ -76,6 +76,12 @@ class GuestNdjsonTests(unittest.TestCase):
             validate_fs_path("a\\b")  # backslash is rejected everywhere
         with self.assertRaises(ValidationError):
             validate_fs_path("x" * 4097)
+        # /workspace prefix must end at a segment boundary: /workspacefoo is
+        # NOT inside the workspace (mirror of the Rust agent/transport.rs fix).
+        validate_fs_path("/workspace")
+        validate_fs_path("/workspace/sub")
+        with self.assertRaises(ValidationError):
+            validate_fs_path("/workspacefoo")
         self.assertEqual(self.server.connections, connections_before)
 
     def test_connection_refused_is_transport_error(self):

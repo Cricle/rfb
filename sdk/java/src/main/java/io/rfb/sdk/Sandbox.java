@@ -340,14 +340,25 @@ public final class Sandbox {
     }
 
     /**
-     * Open an interactive stream. {@code cwd} is an opaque guest path; env is
-     * only applied over the NDJSON transport (ZBRT v1 has no env channel).
+     * Open an interactive stream. {@code cwd} is an opaque guest path. Empty
+     * argv is rejected, and over ZBRT {@code pty}/{@code env} fail closed with
+     * {@link ValidationError} before any frame is sent (ZBRT v1 has neither
+     * channel) — mirroring the Rust/C#/Python baselines.
      */
     public GuestStream stream(List<String> args, String cwd, Boolean pty, Map<String, String> env) {
+        if (args == null || args.isEmpty()) {
+            throw new ValidationError("args must not be empty");
+        }
         if (cwd != null) {
             Validation.filePath(cwd);
         }
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
+            if (Boolean.TRUE.equals(pty)) {
+                throw new ValidationError("pty is not supported over the ZBRT transport");
+            }
+            if (env != null && !env.isEmpty()) {
+                throw new ValidationError("env is not supported over the ZBRT transport");
+            }
             ZbrtConnection conn = openZbrt();
             try {
                 return GuestStream.overZbrt(conn, conn.openStreamSession(args, cwd, new byte[0], 0));

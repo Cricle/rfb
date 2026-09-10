@@ -2,7 +2,7 @@
 //! worker thread, and stream responses back while keeping Cancel/Shutdown
 //! servable from other connections.
 
-use crate::codec::{read_frame, write_frame, FrameCodec, MessageType};
+use crate::codec::{read_frame, write_frame, Frame, FrameCodec, MessageType};
 use crate::runtime_service::{GuestEvent, GuestExecutor, RuntimeService};
 use crate::session::{ControlMessage, RuntimeMessage};
 use std::io;
@@ -27,29 +27,70 @@ pub(crate) async fn serve<R, W>(
     shared: Arc<Mutex<RuntimeService>>,
 ) -> io::Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut reader = tokio::io::BufReader::new(reader_stream);
     let mut writer = tokio::io::BufWriter::new(writer_stream);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<TurnResult>(4);
     let mut worker_active = false;
+
+    // Frame reading lives in a dedicated task: read_frame is not
+    // cancellation-safe, so the select! below must never drop it mid-frame —
+    // a dropped read loses partially buffered bytes and desyncs the stream
+    // for the rest of the connection. Receiving from the channel IS
+    // cancellation-safe.
+    let codec = Arc::new(codec);
+    let (frame_tx, mut frame_rx) =
+        tokio::sync::mpsc::channel::<io::Result<(Frame, ControlMessage)>>(8);
+    let read_codec = Arc::clone(&codec);
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(reader_stream);
+        loop {
+            match read_frame::<_, ControlMessage>(&mut reader, &read_codec).await {
+                Ok(value) => {
+                    if frame_tx.send(Ok(value)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = frame_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
         tokio::select! {
             biased;
             result = result_rx.recv(), if worker_active => {
-                let Some((sequence, session_id, request_id, result, executor)) = result else {
+                match result {
+                    Some((sequence, session_id, request_id, result, executor)) => {
+                        worker_active = false;
+                        let responses = {
+                            let mut runtime = shared.lock().await;
+                            runtime.complete_turn(session_id, request_id, result, executor)
+                        };
+                        write_responses(&mut writer, &codec, sequence, &responses).await?;
+                    }
+                    // The worker died without delivering a result (panic):
+                    // reclaim the in-flight turn bookkeeping so the runtime
+                    // keeps answering instead of reporting a phantom active
+                    // turn forever.
+                    None => {
+                        worker_active = false;
+                        let responses = {
+                            let mut runtime = shared.lock().await;
+                            runtime.abandon_active_turn()
+                        };
+                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                    }
+                }
+            }
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else {
                     break;
                 };
-                worker_active = false;
-                let responses = {
-                    let mut runtime = shared.lock().await;
-                    runtime.complete_turn(session_id, request_id, result, executor)
-                };
-                write_responses(&mut writer, &codec, sequence, &responses).await?;
-            }
-            frame = read_frame::<_, ControlMessage>(&mut reader, &codec) => {
                 let (frame, request) = match frame {
                     Ok(value) => value,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -111,6 +152,26 @@ where
                 }
             }
         }
+    }
+    // If the connection ends while a turn is in flight (the client vanished),
+    // a detached task keeps the result channel alive so the worker's delivery
+    // succeeds and the executor is returned to the shared service exactly
+    // once. A worker that died without delivering is abandoned explicitly so
+    // the runtime keeps answering instead of wedging on a phantom turn.
+    if worker_active {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            match result_rx.recv().await {
+                Some((_, session_id, request_id, result, executor)) => {
+                    let mut runtime = shared.lock().await;
+                    runtime.complete_turn(session_id, request_id, result, executor);
+                }
+                None => {
+                    let mut runtime = shared.lock().await;
+                    runtime.abandon_active_turn();
+                }
+            }
+        });
     }
     Ok(())
 }

@@ -189,6 +189,19 @@ class RfbClientFacadeTest {
     }
 
     @Test
+    void streamRejectsEmptyArgvOnNdjsonBeforeConnecting() {
+        // Empty argv fails closed on the NDJSON transport too — the address is
+        // unreachable on purpose: validation must reject before any connect.
+        RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
+        SandboxInfo info = new SandboxInfo();
+        info.id = "sb-1";
+        info.guestAddr = "127.0.0.1:1";
+        Sandbox sandbox = Sandbox.attach(client, info, RfbClient.TRANSPORT_NDJSON);
+        assertThrows(ValidationError.class,
+                () -> sandbox.stream(List.of(), null, null, null));
+    }
+
+    @Test
     void connectSandboxAttachesDirectlyWithoutReresolution() throws Exception {
         // unreachable controller: if connect(Sandbox) re-resolved via
         // listSandboxes it would raise; direct attach must return as-is

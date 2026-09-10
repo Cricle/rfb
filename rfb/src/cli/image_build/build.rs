@@ -386,6 +386,10 @@ pub fn build_rootfs(
         .parent()
         .map(|parent| parent.join("rfb-busybox"));
     if let Some(busybox_src) = busybox_src.filter(|path| path.is_file()) {
+        // Clear any pre-created /bin/sh first — debugfs write fails closed on
+        // an existing inode (same pattern as the applet writes below).
+        let _ = run_debugfs(&image_path, "unlink /bin/sh", false);
+        let _ = run_debugfs(&image_path, "rm /bin/sh", false);
         run_debugfs(
             &image_path,
             &format!(
@@ -395,9 +399,14 @@ pub fn build_rootfs(
             false,
         )?;
         run_debugfs(&image_path, "set_inode_field /bin/sh mode 0100755", false)?;
+        // Hardlinked multi-call entry points (same inode, zero extra image
+        // bytes): mcp_bash distillation pipelines lean on these log-processing
+        // applets (grep/awk/sed/sort/…), so hardlink them alongside the
+        // coreutils set.
         for applet in [
             "bash", "ls", "pwd", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ps", "whoami", "id",
-            "head", "tail", "wc", "grep", "find", "sleep", "env",
+            "head", "tail", "wc", "grep", "find", "sleep", "env", "awk", "sed", "sort", "uniq",
+            "cut", "tr", "xargs",
         ] {
             run_debugfs(&image_path, &format!("ln /bin/sh /bin/{applet}"), false)?;
         }
@@ -585,14 +594,6 @@ pub fn build_rootfs(
             .parent()
             .map(|parent| parent.join("rfb-mini-tools"))
             .ok_or_else(|| external("runtime binary has no parent directory"))?;
-        // A static busybox installed next to the runtime binary becomes
-        // /bin/sh, so shell-style command strings (`pwd && ls`) execute in
-        // the guest. Optional: images without it only run the mini-tools.
-        let busybox = runtime_bin
-            .parent()
-            .map(|parent| parent.join("rfb-busybox"))
-            .expect("runtime binary parent");
-        let busybox = busybox.is_file().then_some(busybox);
         if !mini_tools.is_file() {
             return Err(external(format!(
                 "rfb-mini-tools is missing next to the runtime binary ({}); build it with the same cargo invocation",
@@ -602,32 +603,9 @@ pub fn build_rootfs(
         if run_debugfs(&image_path, "stat /bin", false).is_err() {
             run_debugfs(&image_path, "mkdir /bin", false)?;
         }
-        if let Some(busybox) = &busybox {
-            // mke2fs may pre-create /bin/sh (e.g. larger images); clear it
-            // before writing the runtime-provided busybox.
-            if run_debugfs(&image_path, "stat /bin/sh", false).is_ok() {
-                let _ = run_debugfs(&image_path, "unlink /bin/sh", false);
-                let _ = run_debugfs(&image_path, "rm /bin/sh", false);
-            }
-            run_debugfs(
-                &image_path,
-                &format!(
-                    "write {} /bin/sh",
-                    debugfs_quote(&busybox.to_string_lossy())
-                ),
-                false,
-            )?;
-            run_debugfs(&image_path, "set_inode_field /bin/sh mode 0100755", false)?;
-            // Hardlink the busybox multi-call entry points (same inode, zero
-            // extra image bytes): shell strings like `pwd && ls -la` then
-            // resolve their applets through /bin/sh's built-in PATH lookup.
-            for applet in [
-                "bash", "ls", "pwd", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ps", "whoami",
-                "id", "head", "tail", "wc", "grep", "find", "sleep", "env",
-            ] {
-                run_debugfs(&image_path, &format!("ln /bin/sh /bin/{applet}"), false)?;
-            }
-        }
+        // The busybox /bin/sh install happens once in the mode-common path
+        // above; it is NOT repeated here — a second write hits the existing
+        // inode and debugfs fails the whole build.
         for applet in ["echo", "true", "false", "netprobe"] {
             let target = format!("/bin/{applet}");
             // Clear any pre-created applet before writing the mini-tools binary.

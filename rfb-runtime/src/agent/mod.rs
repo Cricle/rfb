@@ -81,12 +81,47 @@ async fn handle_connection(stream: TcpStream) -> io::Result<()> {
     let mut line = Vec::new();
     loop {
         line.clear();
-        let n = reader.read_until(b'\n', &mut line).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        if line.len() > MAX_LINE || !line.ends_with(b"\n") {
-            write_json(&mut writer, json!({"error":"line too large"})).await?;
+        // Bounded line read: read_until would buffer the entire stream before
+        // the size check could run, so a newline-free stream grows `line`
+        // without bound. Scan with fill_buf instead, stop storing once the
+        // cap is hit, and close the connection on overflow.
+        let mut overflow = false;
+        let complete = loop {
+            let available = match reader.fill_buf().await {
+                Ok(buf) => buf,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                break !line.is_empty();
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    let take = pos + 1;
+                    if line.len() + take > MAX_LINE {
+                        overflow = true;
+                    } else {
+                        line.extend_from_slice(&available[..take]);
+                    }
+                    reader.consume(take);
+                    break true;
+                }
+                None => {
+                    if line.len() + available.len() > MAX_LINE {
+                        overflow = true;
+                    }
+                    if !overflow {
+                        line.extend_from_slice(available);
+                    }
+                    let take = available.len();
+                    reader.consume(take);
+                }
+            }
+        };
+        if !complete || overflow {
+            if complete || overflow {
+                write_json(&mut writer, json!({"error":"line too large"})).await?;
+            }
             return Ok(());
         }
         while matches!(line.last(), Some(b'\n' | b'\r')) {

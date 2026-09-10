@@ -254,6 +254,25 @@ class FacadeNdjsonTests(FacadeMixin, unittest.TestCase):
         self.assertEqual(result.exit_code, -1)
         self.assertEqual(result.stdout, b"hello\n")
 
+    def test_legacy_event_keys(self):
+        # Older guests emit out/err instead of stdout/stderr/output; the
+        # client must map them exactly like the current keys (C#/Java parity).
+        self.guest.legacy_event_keys = True
+        sandbox = self._sandbox()
+        result = sandbox.exec(["echo", "hi"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, b"hello\n")
+        self.assertEqual(result.stderr, b"")
+        evaled = sandbox.eval("print(42)")
+        self.assertEqual(evaled.stdout, b"eval out\n")
+        stream = sandbox.stream(["cat"])
+        stream.next_event()  # started
+        stream.send_input("abc\n")
+        stdout = stream.next_event()
+        self.assertEqual(stdout.kind, StreamEventKind.STDOUT)
+        self.assertEqual(stdout.data, b"abc\n")
+        stream.stop()
+
     def test_oversize_line_is_decode_error(self):
         self.guest.oversize_response = True
         sandbox = self._sandbox()

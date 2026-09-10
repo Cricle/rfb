@@ -95,13 +95,11 @@ impl WorkspaceGuestExecutor {
             .get("max_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(self.limits.max_event_bytes as u64) as usize;
-        let data = self.filesystem_read(&crate::session::FileReadRequest {
-            request_id: "fs".into(),
-            path: path.into(),
-            max_bytes: max,
-        })?;
-        let total = data.len();
-        Ok(json!({"data": data, "truncated": false, "total_bytes": total}))
+        let offset = a.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let (data, truncated, total) = self.filesystem_read_offset(path, max, offset)?;
+        // total_bytes is the whole-file size, so hosts can detect truncation
+        // as `offset + data.len() < total_bytes`.
+        Ok(json!({"data": data, "truncated": truncated, "total_bytes": total}))
     }
 
     fn write(&self, value: &Value) -> Result<Value, String> {
@@ -115,8 +113,14 @@ impl WorkspaceGuestExecutor {
             .and_then(Value::as_array)
             .ok_or("data is required")?
             .iter()
-            .map(|v| v.as_u64().ok_or("data must be bytes").map(|n| n as u8))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|v| {
+                let n = v.as_u64().ok_or("data must be bytes in 0..=255")?;
+                if n > 255 {
+                    return Err("data must be bytes in 0..=255".into());
+                }
+                Ok(n as u8)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let n = data.len();
         self.filesystem_write(&crate::session::FileWriteRequest {
             request_id: "fs".into(),

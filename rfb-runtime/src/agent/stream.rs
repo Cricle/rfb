@@ -93,7 +93,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // descendants that inherited the pipes.
                 let _ = child.wait().await;
                 drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                write_json(writer, json!({"exit_code":null,"timed_out":true,"err":"process timeout","error":"process timeout"})).await?;
+                // `done` is the host's terminal marker for a null exit_code;
+                // without it a null exit_code frame fails to decode on the
+                // host. No `err` key here: the host would deliver it as
+                // stderr output instead of a terminal frame.
+                write_json(writer, json!({"exit_code":null,"timed_out":true,"done":true,"error":"process timeout"})).await?;
                 return Ok(());
             }
             status=child.wait()=>{
@@ -119,7 +123,7 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     terminate(&mut child).await;
                     let _ = child.wait().await;
                     drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                    write_json(writer, json!({"exit_code":null,"timed_out":false,"error":"stream input EOF"})).await?;
+                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true,"error":"stream input EOF"})).await?;
                     return Ok(());
                 }
                 if input.len()>MAX_LINE { terminate(&mut child).await; return Ok(()); }
@@ -128,7 +132,10 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     terminate(&mut child).await;
                     let _ = child.wait().await;
                     drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                    write_json(writer, json!({"exit_code":null,"timed_out":false})).await?;
+                    // `done` lets the host decode this null-exit_code terminal
+                    // frame instead of failing with "invalid guest stream
+                    // event".
+                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                     return Ok(());
                 } else if let Some(text)=v.get("in").and_then(Value::as_str) {
                     stdin.write_all(text.as_bytes()).await?;

@@ -91,6 +91,12 @@ struct RequestEntry {
     terminated: bool,
 }
 
+/// How many terminated request entries are retained for idempotent-cancel
+/// replay detection. Beyond this bound the oldest terminated entries are
+/// evicted; a cancel for an evicted request degrades to the normal
+/// acknowledge path (documented in `handle_cancel`).
+const TERMINATED_RETENTION: usize = 64;
+
 /// Serve one already-accepted ZBRT connection with its own [`RuntimeService`]
 /// (workspace executor). Generic over the stream so tests can use in-memory
 /// transports and the vsock listener can hand real split stream halves.
@@ -118,6 +124,10 @@ where
     let mut worker_active = false;
     let mut active_id: Option<[u8; 16]> = None;
     let mut requests: HashMap<[u8; 16], RequestEntry> = HashMap::new();
+    // Insertion order of terminated entries, for oldest-first eviction past
+    // TERMINATED_RETENTION so the bookkeeping stays bounded per connection.
+    let mut terminated_order: std::collections::VecDeque<[u8; 16]> =
+        std::collections::VecDeque::new();
 
     let io_result = loop {
         tokio::select! {
@@ -143,6 +153,12 @@ where
                         }
                         if let Some(entry) = requests.get_mut(&request_id) {
                             entry.terminated = true;
+                            terminated_order.push_back(request_id);
+                            while terminated_order.len() > TERMINATED_RETENTION {
+                                if let Some(oldest) = terminated_order.pop_front() {
+                                    requests.remove(&oldest);
+                                }
+                            }
                         }
                     }
                     None => break Ok(()),
@@ -509,11 +525,13 @@ fn normalize_workspace_path(path: &str) -> String {
 /// `Execute` mapped to the shell-free workspace executor, including stdin and
 /// the exact millisecond deadline.
 fn execute_to_turn(request_id: [u8; 16], exec: Execute) -> SessionRequest {
+    // stdin travels as a JSON byte array: the wire payload is arbitrary
+    // bytes, and a lossy UTF-8 conversion would corrupt binary input.
     let mut prompt = serde_json::json!({
         "op": "exec",
         "args": exec.argv,
         "cwd": normalize_workspace_path(&exec.cwd.unwrap_or_else(|| ".".to_string())),
-        "stdin": String::from_utf8_lossy(&exec.stdin),
+        "stdin": exec.stdin.iter().map(|b| serde_json::Value::from(*b)).collect::<Vec<_>>(),
     });
     if exec.timeout_ms > 0 {
         prompt["timeout_ms"] = serde_json::json!(exec.timeout_ms);

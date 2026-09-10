@@ -4,8 +4,12 @@
 use super::transport::{guest_path, limit, pattern, MAX_BYTES, MAX_CODE, MAX_RESULTS};
 use crate::agent::process_exec::execute;
 use serde_json::{json, Value};
-use std::io;
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// Files larger than this are skipped by `grep` instead of being scanned, so
+/// the walk's memory stays bounded regardless of workspace contents.
+const GREP_SCAN_CAP: u64 = 16 * 1024 * 1024;
 
 pub async fn structured(request: &Value) -> io::Result<Value> {
     match request.get("action").and_then(Value::as_str).unwrap_or("") {
@@ -48,12 +52,15 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
             let path = guest_path(request.get("path"), false)?;
             let max = limit(request.get("max_bytes"), MAX_BYTES, MAX_BYTES)?;
             let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0);
-            let data = std::fs::read(path)?;
-            let start = (offset as usize).min(data.len());
-            let end = (start + max).min(data.len());
-            Ok(
-                json!({"data":data[start..end].to_vec(),"truncated":end<data.len(),"total_bytes":data.len()}),
-            )
+            // Bounded read: only `max` bytes starting at `offset` are
+            // materialized, never the whole file.
+            let mut file = std::fs::File::open(&path)?;
+            let total = file.metadata()?.len();
+            file.seek(SeekFrom::Start(offset))?;
+            let mut data = Vec::new();
+            file.take(max as u64).read_to_end(&mut data)?;
+            let truncated = offset + (data.len() as u64) < total;
+            Ok(json!({"data":data,"truncated":truncated,"total_bytes":total}))
         }
         "write" => {
             let path = guest_path(request.get("path"), false)?;
@@ -199,30 +206,44 @@ fn grep_walk(
             if out.len() <= max {
                 grep_walk(root, &p, pat, max, bytes, out)?;
             }
-        } else if let Ok(data) = std::fs::read(&p) {
-            // Search the raw bytes, not only valid UTF-8 text. Split on LF so
-            // binary files and invalid UTF-8 still produce useful line hits;
-            // lossy conversion is only used for the textual wire field.
-            let needle = pat.as_bytes();
-            let path = p
-                .strip_prefix(root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let mut consumed = 0usize;
-            for (line_no, line) in (1usize..).zip(data.split(|b| *b == b'\n')) {
-                if line.windows(needle.len()).any(|w| w == needle) {
-                    let text = String::from_utf8_lossy(line);
-                    let item = json!({"path":path,"line":line_no,"text":text});
-                    let item_bytes = serde_json::to_vec(&item).unwrap_or_default().len();
-                    if consumed + item_bytes > bytes && !out.is_empty() {
-                        return Ok(());
-                    }
-                    consumed += item_bytes;
-                    out.push(item);
-                    if out.len() >= max || consumed >= bytes {
-                        return Ok(());
-                    }
+            continue;
+        }
+        // Bound the per-file cost: skip oversized files outright and stream
+        // the rest line-by-line so a large file never materializes in memory.
+        if std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > GREP_SCAN_CAP {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&p) else {
+            continue;
+        };
+        let mut reader = io::BufReader::with_capacity(64 * 1024, file);
+        let needle = pat.as_bytes();
+        let path = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut consumed = 0usize;
+        let mut line_no = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => line_no += 1,
+                Err(_) => break,
+            }
+            if line.windows(needle.len()).any(|w| w == needle) {
+                let text = String::from_utf8_lossy(&line);
+                let item = json!({"path":path,"line":line_no,"text":text});
+                let item_bytes = serde_json::to_vec(&item).unwrap_or_default().len();
+                if consumed + item_bytes > bytes && !out.is_empty() {
+                    return Ok(());
+                }
+                consumed += item_bytes;
+                out.push(item);
+                if out.len() >= max || consumed >= bytes {
+                    return Ok(());
                 }
             }
         }

@@ -9,6 +9,28 @@
 use crate::cli::error::{io, validation, CliError};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter disambiguating concurrent temp copy names within one
+/// process (the pid and wall-clock nanos cover cross-process and same-nanos
+/// collisions).
+static COPY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique temp sibling of `target` (same directory, so the later rename stays
+/// on one filesystem and is atomic). The leading dot keeps half-written temps
+/// out of directory listings that expect only `rootfs.ext4`.
+fn temp_copy_target(target: &Path) -> PathBuf {
+    let seq = COPY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rootfs.ext4".to_owned());
+    target.with_file_name(format!(".{name}.tmp-{}-{seq}-{nanos}", std::process::id()))
+}
 
 /// Compute the forkd snapshots data directory from environment values.
 ///
@@ -50,6 +72,11 @@ pub(crate) fn forkd_snapshots_root() -> Option<PathBuf> {
 /// Copy `rootfs` to `target` (creating the parent directory first) and return
 /// the copy path. This gives `forkd snapshot` a private, writable rootfs so its
 /// rw boot never mutates the artifact original.
+///
+/// The bytes are written to a unique temp file in the target's directory and
+/// then renamed into place: two concurrent snapshot creates for the same tag
+/// cannot tear each other's copy, and a failed copy never leaves a truncated
+/// rootfs at the target path.
 fn copy_rootfs_to(rootfs: &Path, target: &Path) -> Result<PathBuf, CliError> {
     let parent = target.parent().ok_or_else(|| {
         validation(format!(
@@ -59,13 +86,23 @@ fn copy_rootfs_to(rootfs: &Path, target: &Path) -> Result<PathBuf, CliError> {
     })?;
     fs::create_dir_all(parent)
         .map_err(|error| io(format!("create_dir_all {}: {error}", parent.display())))?;
-    fs::copy(rootfs, target).map_err(|error| {
-        io(format!(
+    let temp = temp_copy_target(target);
+    if let Err(error) = fs::copy(rootfs, &temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(io(format!(
             "copy rootfs {} -> {}: {error}",
             rootfs.display(),
+            temp.display()
+        )));
+    }
+    if let Err(error) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(io(format!(
+            "rename rootfs copy {} -> {}: {error}",
+            temp.display(),
             target.display()
-        ))
-    })?;
+        )));
+    }
     Ok(target.to_path_buf())
 }
 

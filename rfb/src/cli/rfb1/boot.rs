@@ -115,6 +115,31 @@ pub struct BootOptions<'a> {
     pub vsock_flag: bool,
 }
 
+/// Owns the spawned Firecracker child until the boot sequence succeeds. Any
+/// post-spawn failure (API socket wait, VM configuration, InstanceStart) drops
+/// the guard, which kills and reaps the child instead of leaking the VM.
+struct BootChildGuard(Option<Child>);
+
+impl BootChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Consume the guard on the success path, handing the child back.
+    fn take(mut self) -> Child {
+        self.0.take().expect("child is present until boot succeeds")
+    }
+}
+
+impl Drop for BootChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Start a Firecracker VM with the given kernel/rootfs and vsock relay, and wait
 /// for the UDS to appear.
 pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError> {
@@ -152,6 +177,9 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
         .stderr(Stdio::from(log_file))
         .spawn()
         .map_err(|error| external(format!("failed to start firecracker: {error}")))?;
+    // From here until boot completes, every failure path must tear the VM
+    // down; the guard kills and reaps the child on drop.
+    let child = BootChildGuard::new(child);
 
     // Wait for the API socket (matching the script's 50 * 100ms polling).
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -221,7 +249,7 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Ok(child)
+    Ok(child.take())
 }
 
 /// Boot a Firecracker VM for the RFB1 runtime (init=/sbin/rfb-runtime vsock).

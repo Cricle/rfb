@@ -5,7 +5,7 @@ import time
 from typing import Any, Optional
 
 from ._forkd import DEFAULT_BASE_URL, DEFAULT_TIMEOUT_S, _ForkdController
-from ._guest import _GuestNdjsonClient, _as_bytes
+from ._guest import _GuestNdjsonClient, _as_bytes, _first_of
 from ._zbrt import (
     FS_OP_FIND,
     FS_OP_GREP,
@@ -259,8 +259,9 @@ class Sandbox:
         exit_code = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else -1
         return ExecResult(
             exit_code=exit_code,
-            stdout=_as_bytes(value.get("stdout")),
-            stderr=_as_bytes(value.get("stderr")),
+            # Legacy guests emit out/err instead of stdout/stderr; accept both.
+            stdout=_as_bytes(_first_of(value, "stdout", "out")),
+            stderr=_as_bytes(_first_of(value, "stderr", "err")),
             timed_out=bool(value.get("timed_out", False)),
         )
 
@@ -276,7 +277,8 @@ class Sandbox:
         status = value.get("status")
         return ExecResult(
             exit_code=int(status) if status is not None else 0,
-            stdout=_as_bytes(value.get("output")),
+            # Legacy guests emit out instead of output; accept both.
+            stdout=_as_bytes(_first_of(value, "output", "out")),
             stderr=b"",
             timed_out=bool(value.get("timed_out", False)),
         )

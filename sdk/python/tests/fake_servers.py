@@ -298,6 +298,7 @@ class FakeNdjsonGuestServer:
         self.oversize_response = False  # respond with a >1 MiB line
         self.ping_response = {"pong": True}  # scriptable ping terminal line
         self.exec_null_exit_code = False  # send "exit_code": null on the exec terminal line
+        self.legacy_event_keys = False  # emit legacy out/err keys (older agent)
         self.received = []
         self.stream_inputs = []
         self.stop_requested = False
@@ -359,13 +360,15 @@ class FakeNdjsonGuestServer:
                     # line carrying exit_code/stdout/stderr (the guest puts
                     # the exec result fields on the terminal line).
                     send({"progress": "starting"})
+                    stdout_key = "out" if outer.legacy_event_keys else "stdout"
+                    stderr_key = "err" if outer.legacy_event_keys else "stderr"
                     if outer.exec_null_exit_code:
                         send(
                             {
                                 "exit_code": None,
                                 "timed_out": outer.exec_timed_out,
-                                "stdout": list(outer.exec_stdout),
-                                "stderr": list(outer.exec_stderr),
+                                stdout_key: list(outer.exec_stdout),
+                                stderr_key: list(outer.exec_stderr),
                             }
                         )
                     else:
@@ -373,14 +376,14 @@ class FakeNdjsonGuestServer:
                             {
                                 "exit_code": outer.exec_exit,
                                 "timed_out": outer.exec_timed_out,
-                                "stdout": list(outer.exec_stdout),
-                                "stderr": list(outer.exec_stderr),
+                                stdout_key: list(outer.exec_stdout),
+                                stderr_key: list(outer.exec_stderr),
                             }
                         )
                 elif action == "eval":
                     send(
                         {
-                            "output": list(outer.eval_output),
+                            "out" if outer.legacy_event_keys else "output": list(outer.eval_output),
                             "status": outer.eval_status,
                             "timed_out": False,
                         }
@@ -410,7 +413,8 @@ class FakeNdjsonGuestServer:
                         session_value = json.loads(session_line.decode("utf-8"))
                         outer.stream_inputs.append(session_value)
                         if "in" in session_value:
-                            send({"stdout": list(session_value["in"].encode("utf-8"))})
+                            key = "out" if outer.legacy_event_keys else "stdout"
+                            send({key: list(session_value["in"].encode("utf-8"))})
                         elif session_value.get("action") == "stop":
                             outer.stop_requested = True
                             send({"exit_code": 130})

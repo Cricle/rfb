@@ -11,7 +11,7 @@ use crate::runtime_service::GuestEvent;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Serial, shell-free workspace executor with a cancellable active child.
 pub struct WorkspaceGuestExecutor {
@@ -24,6 +24,11 @@ pub struct WorkspaceGuestExecutor {
     /// instead of only reporting them in the aggregated result; RFB1 turns
     /// leave this `None` and keep the buffered event contract unchanged.
     event_sink: Option<Arc<dyn Fn(GuestEvent) + Send + Sync>>,
+    /// Cached total workspace size in bytes; `None` forces a fresh recursive
+    /// walk. Writes patch it by delta and `exec` invalidates it (its child can
+    /// mutate the workspace arbitrarily), so the size limit never costs a full
+    /// O(workspace) walk per write.
+    workspace_size_cache: Mutex<Option<u64>>,
 }
 
 impl WorkspaceGuestExecutor {
@@ -38,6 +43,7 @@ impl WorkspaceGuestExecutor {
             active: None,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             event_sink: None,
+            workspace_size_cache: Mutex::new(None),
         })
     }
 

@@ -49,6 +49,20 @@ fn read_exact(stream: &mut UnixStream, n: usize) -> Result<Vec<u8>, CliError> {
     Ok(data)
 }
 
+/// Read one response payload after validating its wire-declared length. The
+/// length field is attacker-controlled, so it is capped at the protocol's
+/// `MAX_PAYLOAD` before allocation; anything larger fails closed instead of
+/// materializing up to a 4 GiB buffer.
+fn read_payload(stream: &mut UnixStream, len: usize) -> Result<Vec<u8>, CliError> {
+    if len > crate::protocol::MAX_PAYLOAD {
+        return Err(validation(format!(
+            "ZBRT payload length {len} exceeds MAX_PAYLOAD {}",
+            crate::protocol::MAX_PAYLOAD
+        )));
+    }
+    read_exact(stream, len)
+}
+
 /// Decode a ZBRT response frame header + payload, validating magic/version and
 /// echoing the request_id back (proving no cross-talk between connections).
 fn decode_response(
@@ -139,7 +153,7 @@ fn exchange(
     loop {
         let header = read_exact(&mut stream, crate::protocol::HEADER_LEN)?;
         let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let payload = read_exact(&mut stream, len)?;
+        let payload = read_payload(&mut stream, len)?;
         let (kind, payload) = decode_response(&header, payload, request_id)?;
         match kind {
             Kind::Output => {
@@ -441,7 +455,7 @@ pub fn verify(
             .map_err(|error| external(format!("write malformed frame: {error}")))?;
         let header = read_exact(&mut stream, crate::protocol::HEADER_LEN)?;
         let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let payload = read_exact(&mut stream, len)?;
+        let payload = read_payload(&mut stream, len)?;
         if header[5] != Kind::Error as u8 {
             return Err(validation("malformed: expected Error frame"));
         }

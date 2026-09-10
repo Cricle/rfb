@@ -26,7 +26,9 @@ def _invalid_path(path: str, file_path: bool) -> bool:
         or "\\" in path
         or any(segment == ".." for segment in path.split("/"))
         or (
-            path.startswith("/") and not file_path and not path.startswith("/workspace")
+            path.startswith("/")
+            and not file_path
+            and not (path == "/workspace" or path.startswith("/workspace/"))
         )
         or (file_path and len(path) >= 2 and path[1] == ":")
     )

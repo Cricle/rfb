@@ -132,7 +132,7 @@ mvn test
 - 四语言（rust/python/csharp/java）公共类型与方法一一对应；Rust 是基准实现，本 SDK 是镜像移植，语义差异仅限语言习惯（Java 小驼峰、同步阻塞、unchecked 异常）。
 - 公共类型集合严格限定为 UNIFIED_API.md §1 全集（上表）：曾经导出的 `CreateSandboxRequest` / `CreateOptions` / `Transport` 均为死代码或不在全集内，已删除；传输选择沿用既有惯例以字符串 `"ndjson"` / `"zbrt"` 表示（`connect` / `createSandbox` 同）。
 - `createSandbox(...)` 支持末位可选 `transport` 参数（重载提供，默认 NDJSON），决定返回的 `Sandbox` 门面使用的 guest 传输；`connect(sandbox)` 直接附着传入的 `Sandbox` 对象（保留其传输），仅 `connect(String id)` 走 listSandboxes 重解析。
-- `exec(args, cwd, timeoutS, stdin)`：`args` 不得为空、`cwd` 需为合法 guest 路径（两传输均在发送前本地校验，fail closed）；NDJSON 传输的 wire 契约没有 exec stdin 通道，非空 stdin 抛 `ValidationError`（与 Rust 基准一致）；默认 cwd 解析为 guest 根（NDJSON 发送 `/workspace`，ZBRT 省略 cwd 字段）——forkd guest 会拒绝 `"/"`。NDJSON 响应缺 `exit_code` 时回退 `-1`（与 Rust 一致）。
+- `exec(args, cwd, timeoutS, stdin)`：`args` 不得为空、`cwd` 需为合法 guest 路径（两传输均在发送前本地校验，fail closed）；NDJSON 传输的 wire 契约没有 exec stdin 通道，非空 stdin 静默丢弃（与 Rust 基准一致；stdin 仅 ZBRT 送达）；默认 cwd 解析为 guest 根（NDJSON 发送 `/workspace`，ZBRT 省略 cwd 字段）——forkd guest 会拒绝 `"/"`。NDJSON 响应缺 `exit_code` 时回退 `-1`（与 Rust 一致）。
 - `eval`：两种传输均支持。ZBRT v1 无 eval opcode，统一约定（`sdk/shared/README.md`）编码为一轮 `Execute`：`argv=["eval", code]`、stdin 为空、`timeout_ms` = 整秒数 ×1000（未指定时为 0）；eval 的 `output` 统一映射为 `ExecResult.stdout`（NDJSON 下 stderr 恒为空、缺 status 回退 0）。一致性黄金向量见 `sdk/shared/conformance/eval_zbrt_vectors.json`（测试：`ZbrtClientTest::evalZbrtMatchesSharedVector`）。
 - `waitSnapshot` 轮询间隔 100ms；`status=failed` 立即抛 `RemoteError`；超时抛 `TransportError`（UNIFIED_API.md §7：超时属于传输类错误）。
 - ZBRT fs 帧 data JSON 按 PROTOCOL.md §3.3 恒带全部键：read 为 `{"offset":..,"max_bytes":..}`（缺省为 null）、write 为 `{"data":[..],"append":..,"mode":..}`（缺省 mode 为 null）。
@@ -144,6 +144,6 @@ mvn test
 
 - 开发机无 JDK/Maven：代码经逐文件静态审查保证可编译性，但未实际编译运行；`testsRun = not run`。
 - ZBRT `Result`（kind 13，保留帧）未实现 legacy 兼容解析（Rust 基准可解析旧版单帧 Result）；收到时抛 `DecodeError`。
-- ZBRT 传输的 `stream` 忽略 `env`（ZBRT v1 无环境变量通道）。
+- ZBRT 传输的 `stream` fail closed：`pty=true` 或非空 `env` 在发送任何帧前抛 `ValidationError`（与 Rust/C#/Python 基线一致，不再忽略；ZBRT v1 无这两个通道）；空 `args` 在两种传输下同样拒绝。
 - NDJSON 传输单响应行上限 1 MiB、结构化工具响应 50 KiB / 1000 条上限，超出抛错（与 Rust 客户端一致）。
 - 每次 guest/ZBRT 操作新建 TCP 连接（NDJSON 协议本身如此；ZBRT 为简化连接状态管理），流会话除外（单连接存活至终结）。

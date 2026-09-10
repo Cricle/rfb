@@ -49,7 +49,7 @@ internal static class GuestValidation
         if (path.Length == 0
             || Utf8Len(path) > MaxPathBytes
             || ContainsNul(path)
-            || (path.StartsWith('/') && !path.StartsWith("/workspace"))
+            || (path.StartsWith('/') && !IsWorkspacePath(path))
             || path.Contains('\\')
             || HasDotDotSegment(path))
         {
@@ -57,6 +57,11 @@ internal static class GuestValidation
                 "invalid guest path: must be a non-empty, relative, non-escaping guest path");
         }
     }
+
+    /// <summary>Absolute fs paths are only allowed under the /workspace root (segment boundary enforced).</summary>
+    private static bool IsWorkspacePath(string path) =>
+        path.Equals("/workspace", StringComparison.Ordinal)
+        || path.StartsWith("/workspace/", StringComparison.Ordinal);
 
     /// <summary>File paths (read/write and eval/stream cwd): guest-absolute or relative, no host form.</summary>
     public static void FilePath(string path)

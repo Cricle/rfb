@@ -47,6 +47,18 @@ def _as_bytes(value) -> bytes:
     raise DecodeError("expected a byte array or string")
 
 
+def _first_of(value: dict, current: str, legacy: str):
+    """Prefer the current response key; fall back to the legacy agent key.
+
+    Older forkd guests emit ``out`` / ``err`` where current guests emit
+    ``stdout`` / ``stderr`` (and legacy eval output under ``out``); both are
+    accepted so old guests keep working.
+    """
+    if value.get(current) is not None:
+        return value[current]
+    return value.get(legacy)
+
+
 class _GuestNdjsonClient:
     """One-shot NDJSON request client (fresh TCP connection per request)."""
 
@@ -200,10 +212,16 @@ class _NdjsonStream:
                     StreamEventKind.EXIT,
                     code=int(code) if isinstance(code, int) else None,
                 )
-            if "stdout" in value:
-                return StreamEvent(StreamEventKind.STDOUT, _as_bytes(value["stdout"]))
-            if "stderr" in value:
-                return StreamEvent(StreamEventKind.STDERR, _as_bytes(value["stderr"]))
+            if "stdout" in value or "out" in value:
+                return StreamEvent(
+                    StreamEventKind.STDOUT,
+                    _as_bytes(_first_of(value, "stdout", "out")),
+                )
+            if "stderr" in value or "err" in value:
+                return StreamEvent(
+                    StreamEventKind.STDERR,
+                    _as_bytes(_first_of(value, "stderr", "err")),
+                )
             if value.get("event") == "started" or value.get("started") is True:
                 return StreamEvent(StreamEventKind.STARTED)
             # Other non-terminal lines are ignored.
