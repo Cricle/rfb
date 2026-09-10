@@ -161,7 +161,27 @@ impl WorkspaceGuestExecutor {
                 Ok((stream, result)) => {
                     reader_results[stream as usize] = Some(result);
                     if reader_results.iter().all(Option::is_some) {
-                        break guard.child.wait().map_err(|e| e.to_string())?;
+                        // Both pipes hit EOF but the child may still be alive
+                        // (it closed its own stdout/stderr). Use try_wait with
+                        // a bounded loop so cancel/deadline remain reachable.
+                        for _ in 0..50 {
+                            match guard.child.try_wait() {
+                                Ok(Some(status)) => break status,
+                                Ok(None) => {}
+                                Err(e) => break Err(e.to_string()),
+                            }
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err("request cancelled".into());
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                return Err("command timed out".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        break guard
+                            .child
+                            .wait()
+                            .map_err(|e| e.to_string());
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {

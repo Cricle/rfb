@@ -199,18 +199,31 @@ impl WorkspaceGuestExecutor {
         let mut truncated = false;
         let mut scanned = 0usize;
         let mut stack = vec![root.clone()];
+        let mut visited = std::collections::HashSet::new();
         'outer: while let Some(current) = stack.pop() {
-            if !current.is_file() {
-                let entries = match fs::read_dir(&current) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                };
-                for entry in entries {
-                    let entry = match entry {
-                        Ok(entry) => entry,
+            // Use symlink_metadata to detect symlinks without following them,
+            // preventing symlink-cycle hangs.
+            let meta = match fs::symlink_metadata(&current) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let ft = meta.file_type();
+            if !ft.is_file() {
+                if visited.insert(current.clone()) {
+                    let entries = match fs::read_dir(&current) {
+                        Ok(entries) => entries,
                         Err(_) => continue,
                     };
-                    stack.push(entry.path());
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(_) => continue,
+                        };
+                        stack.push(entry.path());
+                    }
                 }
                 continue;
             }
@@ -270,6 +283,10 @@ fn walk(
     for e in fs::read_dir(root).map_err(|e| e.to_string())? {
         let e = e.map_err(|e| e.to_string())?;
         let p = e.path();
+        // Skip symlinks to prevent cycle hangs
+        if e.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         if e.file_name().to_string_lossy().contains(pattern) {
             out.push(
                 p.strip_prefix(base)
