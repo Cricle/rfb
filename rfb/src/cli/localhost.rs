@@ -1,10 +1,10 @@
 use crate::cli::error::{validation, CliError};
 
 /// Validate that a base URL is an HTTP(S) loopback target
-/// (`127.0.0.1`, `localhost`, or `::1`) and return it trimmed.
+/// (`127.0.0.1` or `localhost`) and return it trimmed.
 ///
-/// Parses with `Url` to defeat userinfo tricks like
-/// `http://127.0.0.1:8889@attacker.com/`.
+/// Parses with `Url` so userinfo tricks like
+/// `http://127.0.0.1:8889@attacker.com/` resolve to their real host.
 pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
     let trimmed = base_url.trim().trim_end_matches('/').to_owned();
     let parsed: url::Url = url::Url::parse(&trimmed).map_err(|e| {
@@ -12,8 +12,13 @@ pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
             "URL must use http:// or https://: {base_url} ({e})"
         ))
     })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(validation(format!(
+            "URL must use http:// or https://: {base_url}"
+        )));
+    }
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" && host != "::1" {
+    if host != "127.0.0.1" && host != "localhost" {
         return Err(validation(format!(
             "URL must target localhost only: {base_url}"
         )));
