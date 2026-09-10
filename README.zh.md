@@ -81,6 +81,10 @@ rfb-cli doctor --json   # 宿主能力报告
 - **真机 E2E**——push 到 `main`：在 KVM runner 上启动真实 Firecracker/forkd 栈，从 forkd-agent rootfs 创建快照，跑全部 `#[ignore]` 门控的真机测试。
 - **Release**——推送 `v主.次.补丁` tag：按 `rfb-runtime` → `rfb-sdk` → `rfb-rig` 顺序发布到 crates.io，`rfb-sdk` 发布到 PyPI、`io.rfb:rfb-sdk` 发布到 Maven Central（GPG 签名）、`Rfb.Sdk` 发布到 NuGet，并把 `rfb-cli` 二进制与 SHA256SUMS 附件挂到 GitHub Release。发布幂等：重跑时已发布的产物自动跳过。
 
+## 发布与 CI
+
+完整发布流水线、一次性配置与失败速查见 [docs/RELEASE.md](docs/RELEASE.md)。
+
 ## 许可证
 
 MIT — 见 [LICENSE-MIT](LICENSE-MIT)。

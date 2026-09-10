@@ -81,6 +81,10 @@ This repository keeps `resx/firecracker/firecracker-v1.16.1-x86_64.tgz` as the o
 - **Real-VM E2E** — pushes to `main`: boots the real Firecracker/forkd stack on a KVM runner, creates a snapshot from the forkd-agent rootfs, and runs the full `#[ignore]`-gated real-VM test suite.
 - **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-rig` to crates.io, `rfb-sdk` to PyPI, `io.rfb:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
 
+## Release & CI
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the full release pipeline, one-time setup and a failure quick-reference.
+
 ## License
 
 MIT — see [LICENSE-MIT](LICENSE-MIT).

@@ -1,6 +1,6 @@
 ---
 name: rfb-release
-version: 1.0.0
+version: 1.1.0
 description: rfb 发布验证闭环：打 tag v0.0.1 触发 Release（crates.io/PyPI/Maven Central/NuGet 四渠道）→ 监控 CI run → 失败拉日志定位 → 修复重试直到全绿。当用户要验证发布链路、打 tag 发版、或排查 Release workflow 失败时使用。
 ---
 
@@ -22,13 +22,19 @@ description: rfb 发布验证闭环：打 tag v0.0.1 触发 Release（crates.io/
    - `CRATES_KEY`：crates.io token。发布链 rfb-runtime → rfb-sdk → rfb-rig
      （主 crate 发布名 `rfb-sdk`——crates.io 裸名 `rfb` 被无关项目占用，
      lib 名仍是 `rfb`，代码引用与 `rfb-cli` 二进制不变）。
-   - `PYPI_KEY`：PyPI API token（包名 `rfb-sdk`）。
+   - `PYPI_KEY`：PyPI API token（包名 `rfb-sdk` + `rfb-cli`；token 范围需覆盖
+     两个项目，否则新项目上传 403）。
    - `MAVEN_KEY`：Maven Central 的 settings.xml `<server>` 块，`<id>` 必须为
-     `central`（central-publishing-maven-plugin 的 publishingServerId）。
+     `central`（workflow 会把任何 server id 归一为 central）。groupId 为
+     **io.github.cricle**（namespace 已在 Central portal 验证）。
    - `GPG_PRIVATE_KEY` + `GPG_PASSPHRASE`：Maven Central 强制 GPG 签名。
    - `NUGET_KEY`：nuget.org API key（包名 `Rfb.Sdk`）。
 4. **crates.io / PyPI / nuget.org 的首次发布不可撤销**：版本号一旦发布成功就
    永久占用，重试只能递增版本或换 tag。修 CI 时先用 dry-run（见"步骤 0"）。
+5. **幂等重跑**：四渠道都有"已发布即跳过"守卫（crates 查 API / PyPI 查 JSON /
+   NuGet 查 flat-container / Maven 查 repo1 POM），重打同一 tag 重跑安全。
+6. **完整手册**：渠道/前置/失败速查表见 `docs/RELEASE.md`（人读版）。
+7. **Maven namespace**：`io.github.cricle` 已验证；验证是一次性 portal 操作。
 
 ## 流程
 
