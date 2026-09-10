@@ -12,11 +12,8 @@
 *.json text eol=lf
 *.xml text eol=lf
 *.txt text eol=lf
-*.patch text eol=lf
 *.lockb binary
 *.tgz binary
 *.gz binary
 *.ext4 binary
 *.png binary
-*.jpg binary
-*.ico binary
