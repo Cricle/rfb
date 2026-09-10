@@ -33,13 +33,13 @@ static SKILLS: &[Skill] = &[
         )],
     },
     Skill {
-        name: "rfb-release",
+        name: "rfb-cli-usage",
         description: "rfb 发布验证闭环：打 tag（如 v0.0.1）触发 Release workflow 的 crates.io/PyPI/Maven Central/NuGet 四渠道发布 → 监控 CI run → 失败拉日志定位 → 修复重试直到全绿。当用户要打 tag 发版、验证发布链路、或排查 Release 失败时使用。",
         version: "1.0.0",
         cli_help: "git tag v0.0.1 && git push origin v0.0.1; GitHub API: /repos/Cricle/rfb/actions/runs",
         files: &[(
             "SKILL.md",
-            include_str!("../../skills/rfb-release/SKILL.md"),
+            include_str!("../../skills/rfb-cli-usage/SKILL.md"),
         )],
     },
 ];
