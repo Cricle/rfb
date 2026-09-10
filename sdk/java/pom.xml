@@ -21,6 +21,31 @@
   <name>rfb-sdk</name>
   <description>RFB Java SDK: unified RfbClient facade over forkd controller (HTTP/JSON), forkd guest (TCP NDJSON) and ZBRT v1 (binary frames) — mirror port of the Rust reference implementation</description>
 
+  <!-- Maven Central hard requirements: project URL, license, SCM, developers. -->
+  <url>https://github.com/Cricle/rfb</url>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://github.com/Cricle/rfb/blob/main/LICENSE-MIT</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <scm>
+    <url>https://github.com/Cricle/rfb</url>
+    <connection>scm:git:git://github.com/Cricle/rfb.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/Cricle/rfb.git</developerConnection>
+  </scm>
+
+  <developers>
+    <developer>
+      <id>Cricle</id>
+      <name>Cricle</name>
+      <email>qnydhuaji@gmail.com</email>
+    </developer>
+  </developers>
+
   <!-- Release target: GitHub Packages (maven.pkg.github.com/Cricle/rfb).
        Auth comes from the `github` server entry in settings.xml provisioned by
        .github/workflows/release.yml (GITHUB_TOKEN, packages:write). -->
