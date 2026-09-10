@@ -22,7 +22,12 @@ rfb-rig = "0.0.1"
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
 
-CLI: `cargo install rfb-sdk --features cli` (binary: `rfb-cli`). Published crates contain Rust sources and crate resources only — no Firecracker binary, Linux kernel, ext4 images, snapshots, or forkd service. Those must be provisioned explicitly by the deployment system.
+CLI: `cargo install rfb-sdk --features cli` (binary: `rfb-cli`). The prebuilt **linux-x64** `rfb-cli` binary is also distributed through the package registries:
+
+```bash
+pip install rfb-cli          # PyPI wheel bundling the binary
+dotnet add package Rfb.Cli   # NuGet (binary in tools/, copied to output)
+``` Published crates contain Rust sources and crate resources only — no Firecracker binary, Linux kernel, ext4 images, snapshots, or forkd service. Those must be provisioned explicitly by the deployment system.
 
 ## Crates
 

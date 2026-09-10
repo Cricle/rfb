@@ -83,9 +83,18 @@ jobs:
             dist/rfb-${{ github.ref_name }}.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
+      # CLI 二进制供 pypi / nuget job 打包（rfb-cli / Rfb.Cli）。
+      - name: Upload CLI binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfb-cli-linux-x64
+          path: dist/rfb-cli
+          if-no-files-found: error
+          retention-days: 1
 
   pypi:
-    name: Publish rfb-sdk to PyPI
+    name: Publish rfb-sdk + rfb-cli to PyPI
+    needs: crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +121,7 @@ jobs:
             exit "$rc"
           fi
       # 重跑保护：PyPI 上该版本已存在时跳过发布（twine 对重复文件会报错失败）。
-      - name: Skip publish if version already on PyPI
+      - name: Skip publish if version already on PyPI (rfb-sdk)
         id: pypi_guard
         run: |
           set -euo pipefail
@@ -124,11 +133,47 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Publish to PyPI
+      - name: Publish rfb-sdk to PyPI
         if: steps.pypi_guard.outputs.exists != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/python/dist
+          password: ${{ secrets.PYPI_KEY }}
+
+      # rfb-cli：二进制 wheel（仅 linux-x64，无任何 Python 包装代码）。
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rfb-cli-linux-x64
+          path: dist-cli/raw
+      - name: Build rfb-cli wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade build wheel
+          mkdir -p sdk/python-cli/rfb_cli/_bin dist-cli
+          cp dist-cli/raw/rfb-cli sdk/python-cli/rfb_cli/_bin/rfb-cli
+          chmod +x sdk/python-cli/rfb_cli/_bin/rfb-cli
+          python -m build --wheel sdk/python-cli
+          wheel_file=$(ls sdk/python-cli/dist/*.whl)
+          python -m wheel tags --platform-tag manylinux_2_39_x86_64 "$wheel_file"
+          mv sdk/python-cli/dist/*.whl dist-cli/
+      - name: Skip publish if version already on PyPI (rfb-cli)
+        id: pypi_cli_guard
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/rfb-cli/${VERSION}/json" || true)
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "rfb-cli ${VERSION} 已在 PyPI 上，跳过重复发布"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish rfb-cli to PyPI
+        if: steps.pypi_cli_guard.outputs.exists != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-cli
           password: ${{ secrets.PYPI_KEY }}
 
   maven:
@@ -224,18 +269,29 @@ jobs:
           fi
 
   nuget:
-    name: Publish Rfb.Sdk to NuGet
+    name: Publish Rfb.Sdk + Rfb.Cli to NuGet
+    needs: crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rfb-cli-linux-x64
+          path: rfb-cli-bin
       - name: Pack
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p sdk/csharp/Rfb.Cli/tools
+          cp rfb-cli-bin/rfb-cli sdk/csharp/Rfb.Cli/tools/rfb-cli
+          chmod +x sdk/csharp/Rfb.Cli/tools/rfb-cli
           dotnet pack sdk/csharp/src/Rfb.Sdk/Rfb.Sdk.csproj -c Release \
+            -o dist/nuget -p:Version="$VERSION"
+          dotnet pack sdk/csharp/Rfb.Cli/Rfb.Cli.csproj -c Release \
             -o dist/nuget -p:Version="$VERSION"
       - name: Push to nuget.org
         env:

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NuGet distribution of the prebuilt rfb-cli native binary (linux-x64).
+    The binary is injected into tools/ at release build time by
+    .github/workflows/release.yml (from the run's rfb-cli-linux-x64
+    artifact); it is not stored in git. This package intentionally contains
+    only the binary — no managed code, no wrapper targets.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Rfb.Cli</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Cricle</Authors>
+    <Description>RFB CLI (rfb-cli) native binary for linux-x64. Binary-only package.</Description>
+    <PackageProjectUrl>https://github.com/Cricle/rfb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Cricle/rfb</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="tools/**" Pack="true" PackagePath="tools/">
+      <PackageCopyToOutput>true</PackageCopyToOutput>
+    </None>
+  </ItemGroup>
+
+</Project>

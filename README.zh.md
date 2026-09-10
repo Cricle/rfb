@@ -22,7 +22,12 @@ rfb-rig = "0.0.1"
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
 
-CLI：`cargo install rfb-sdk --features cli`（二进制名 `rfb-cli`）。crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Linux kernel、ext4 镜像、快照或 forkd 服务；这些必须由部署系统显式提供。
+CLI：`cargo install rfb-sdk --features cli`（二进制名 `rfb-cli`）。预编译的 **linux-x64** `rfb-cli` 二进制也通过包管理器分发：
+
+```bash
+pip install rfb-cli          # PyPI wheel 内置二进制
+dotnet add package Rfb.Cli   # NuGet（二进制位于 tools/，复制到输出目录）
+```crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Linux kernel、ext4 镜像、快照或 forkd 服务；这些必须由部署系统显式提供。
 
 ## crate 职责
 
