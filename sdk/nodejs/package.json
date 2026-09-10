@@ -1,0 +1,46 @@
+{
+  "name": "rfb-sdk",
+  "version": "0.0.1",
+  "description": "RFB Node.js/TypeScript SDK: unified RfbClient facade over the forkd controller (HTTP/JSON) and the forkd guest (TCP NDJSON + ZBRT v1 binary frames) — mirror port of the Rust reference implementation",
+  "type": "module",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "rfb",
+    "sandbox",
+    "forkd",
+    "firecracker"
+  ],
+  "author": "Cricle <qnydhuaji@gmail.com>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cricle/rfb"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
