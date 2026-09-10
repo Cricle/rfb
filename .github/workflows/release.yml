@@ -168,15 +168,17 @@ jobs:
           # 容错归一：central-publishing-maven-plugin 硬编码要求 server id 为
           # central（"server is null" 皆因 id 不符）。把第一个 server 的 id
           # 强制改写为 central，用户 secret 里写错 id 也不再卡发布。
+          # heredoc 内容保持与块缩进一致（YAML 剥离后顶格），否则整个
+          # workflow 文件解析失败、Release run 变成 0 个 job。
           python3 - "$HOME/.m2/settings.xml" <<'PY'
-import re, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-s = p.read_text(encoding="utf-8")
-s2, n = re.subn(r"(<server>\s*<id>)[^<]*(</id>)", r"\1central\2", s, count=1)
-if n == 0:
-    s2 = s.replace("<servers>", "<servers>\n    <server><id>central</id></server>", 1)
-p.write_text(s2, encoding="utf-8")
-PY
+          import re, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+          s2, n = re.subn(r"(<server>\s*<id>)[^<]*(</id>)", r"\1central\2", s, count=1)
+          if n == 0:
+              s2 = s.replace("<servers>", "<servers>\n    <server><id>central</id></server>", 1)
+          p.write_text(s2, encoding="utf-8")
+          PY
           # 诊断（不含密码）：列出归一后的 server id。
           echo "settings.xml server ids (after normalize):"
           grep -o '<id>[^<]*</id>' "$HOME/.m2/settings.xml" || echo "(none found)"
