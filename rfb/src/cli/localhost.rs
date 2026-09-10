@@ -8,12 +8,11 @@ use crate::cli::error::{validation, CliError};
 pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
     let trimmed = base_url.trim().trim_end_matches('/').to_owned();
     let parsed: url::Url = url::Url::parse(&trimmed).map_err(|e| {
-        validation(format!("URL must use http:// or https://: {base_url} ({e})"))
+        validation(format!(
+            "URL must use http:// or https://: {base_url} ({e})"
+        ))
     })?;
-    let host = parsed
-        .host_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     if host != "127.0.0.1" && host != "localhost" && host != "[::1]" && host != "::1" {
         return Err(validation(format!(
             "URL must target localhost only: {base_url}"
