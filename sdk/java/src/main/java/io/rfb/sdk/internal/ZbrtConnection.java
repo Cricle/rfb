@@ -12,6 +12,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -24,7 +26,8 @@ import java.util.List;
 public final class ZbrtConnection implements AutoCloseable {
     /** ZBRT V1 wire capability vocabulary (single source of truth in the Rust crate). */
     public static final List<String> V1_CAPABILITIES =
-            List.of("execute", "stream", "deadline", "health", "cancel", "filesystem");
+            Collections.unmodifiableList(Arrays.asList(
+                    "execute", "stream", "deadline", "health", "cancel", "filesystem"));
 
     /** Shared per-process source: SecureRandom.nextBytes is thread-safe. */
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -87,9 +90,9 @@ public final class ZbrtConnection implements AutoCloseable {
             if (frame.kind() == ZbrtFrame.KIND_OUTPUT) {
                 ZbrtCodec.Output output = ZbrtCodec.decodeOutput(frame.payload());
                 if (output.stream() == 0) {
-                    stdoutBuf.writeBytes(output.data());
+                    stdoutBuf.write(output.data(), 0, output.data().length);
                 } else {
-                    stderrBuf.writeBytes(output.data());
+                    stderrBuf.write(output.data(), 0, output.data().length);
                 }
             } else if (frame.kind() == ZbrtFrame.KIND_EXIT) {
                 ZbrtCodec.Exit exit = ZbrtCodec.decodeExit(frame.payload());
@@ -189,13 +192,92 @@ public final class ZbrtConnection implements AutoCloseable {
     }
 
     /** One ZbrtStreamSession event: stream 0=stdout 1=stderr, or code != null → Exit. */
-    public record Event(int stream, byte[] data, Integer code) {
+    public static final class Event {
+        private final int stream;
+        private final byte[] data;
+        private final Integer code;
+
+        public Event(int stream, byte[] data, Integer code) {
+            this.stream = stream;
+            this.data = data;
+            this.code = code;
+        }
+
+        public int stream() { return stream; }
+        public byte[] data() { return data; }
+        public Integer code() { return code; }
+
         public boolean isExit() {
             return code != null;
         }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Event)) return false;
+            Event other = (Event) o;
+            return stream == other.stream
+                    && java.util.Arrays.equals(data, other.data)
+                    && java.util.Objects.equals(code, other.code);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(stream, java.util.Arrays.hashCode(data), code);
+        }
+
+        @Override
+        public String toString() {
+            return "Event[stream=" + stream + ", data=" + java.util.Arrays.toString(data)
+                    + ", code=" + code + "]";
+        }
     }
 
-    public record Exec(int code, byte[] stdout, byte[] stderr, Long signal, boolean timedOut) {
+    public static final class Exec {
+        private final int code;
+        private final byte[] stdout;
+        private final byte[] stderr;
+        private final Long signal;
+        private final boolean timedOut;
+
+        public Exec(int code, byte[] stdout, byte[] stderr, Long signal, boolean timedOut) {
+            this.code = code;
+            this.stdout = stdout;
+            this.stderr = stderr;
+            this.signal = signal;
+            this.timedOut = timedOut;
+        }
+
+        public int code() { return code; }
+        public byte[] stdout() { return stdout; }
+        public byte[] stderr() { return stderr; }
+        public Long signal() { return signal; }
+        public boolean timedOut() { return timedOut; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Exec)) return false;
+            Exec other = (Exec) o;
+            return code == other.code
+                    && timedOut == other.timedOut
+                    && java.util.Arrays.equals(stdout, other.stdout)
+                    && java.util.Arrays.equals(stderr, other.stderr)
+                    && java.util.Objects.equals(signal, other.signal);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(code, java.util.Arrays.hashCode(stdout),
+                    java.util.Arrays.hashCode(stderr), signal, timedOut);
+        }
+
+        @Override
+        public String toString() {
+            return "Exec[code=" + code + ", stdout=" + java.util.Arrays.toString(stdout)
+                    + ", stderr=" + java.util.Arrays.toString(stderr)
+                    + ", signal=" + signal + ", timedOut=" + timedOut + "]";
+        }
     }
 
     // ---- plumbing --------------------------------------------------------

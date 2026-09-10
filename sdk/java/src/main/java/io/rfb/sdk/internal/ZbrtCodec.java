@@ -77,12 +77,12 @@ public final class ZbrtCodec {
     static void putText(ByteArrayOutputStream out, String s) {
         byte[] b = s.getBytes(StandardCharsets.UTF_8);
         putU32(out, b.length);
-        out.writeBytes(b);
+        out.write(b, 0, b.length);
     }
 
     static void putPrefixed(ByteArrayOutputStream out, byte[] b) {
         putU32(out, b.length);
-        out.writeBytes(b);
+        out.write(b, 0, b.length);
     }
 
     /** Optional text: presence flag 0/1, then the length-prefixed UTF-8 text when present. */
@@ -241,7 +241,7 @@ public final class ZbrtCodec {
                 throw new DecodeError("cancel target must be 16 bytes");
             }
             out.write(1);
-            out.writeBytes(target16);
+            out.write(target16, 0, target16.length);
         } else {
             out.write(0);
         }
@@ -310,6 +310,8 @@ public final class ZbrtCodec {
     }
 
     // ---- value holders -----------------------------------------------------
+    // Java-8 compatible value holders: originally records, converted so the
+    // artifact targets Java 8. Accessor names match the record components.
 
     /** HelloAck value: server name + negotiated capabilities. */
     public static final class HelloAck {
@@ -322,24 +324,236 @@ public final class ZbrtCodec {
         }
     }
 
-    public record Output(int stream, byte[] data) {
+    public static final class Output {
+        private final int stream;
+        private final byte[] data;
+
+        public Output(int stream, byte[] data) {
+            this.stream = stream;
+            this.data = data;
+        }
+
+        public int stream() { return stream; }
+        public byte[] data() { return data; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Output)) return false;
+            Output other = (Output) o;
+            return stream == other.stream && java.util.Arrays.equals(data, other.data);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(stream, java.util.Arrays.hashCode(data));
+        }
+
+        @Override
+        public String toString() {
+            return "Output[stream=" + stream + ", data=" + java.util.Arrays.toString(data) + "]";
+        }
     }
 
-    public record Execute(java.util.List<String> argv, String cwd, byte[] stdin, long timeoutMs) {
+    public static final class Execute {
+        private final java.util.List<String> argv;
+        private final String cwd;
+        private final byte[] stdin;
+        private final long timeoutMs;
+
+        public Execute(java.util.List<String> argv, String cwd, byte[] stdin, long timeoutMs) {
+            this.argv = argv;
+            this.cwd = cwd;
+            this.stdin = stdin;
+            this.timeoutMs = timeoutMs;
+        }
+
+        public java.util.List<String> argv() { return argv; }
+        public String cwd() { return cwd; }
+        public byte[] stdin() { return stdin; }
+        public long timeoutMs() { return timeoutMs; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Execute)) return false;
+            Execute other = (Execute) o;
+            return timeoutMs == other.timeoutMs
+                    && java.util.Objects.equals(argv, other.argv)
+                    && java.util.Objects.equals(cwd, other.cwd)
+                    && java.util.Arrays.equals(stdin, other.stdin);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(argv, cwd, java.util.Arrays.hashCode(stdin), timeoutMs);
+        }
+
+        @Override
+        public String toString() {
+            return "Execute[argv=" + argv + ", cwd=" + cwd + ", stdin="
+                    + java.util.Arrays.toString(stdin) + ", timeoutMs=" + timeoutMs + "]";
+        }
     }
 
-    public record Exit(int code, Long signal) {
+    public static final class Exit {
+        private final int code;
+        private final Long signal;
+
+        public Exit(int code, Long signal) {
+            this.code = code;
+            this.signal = signal;
+        }
+
+        public int code() { return code; }
+        public Long signal() { return signal; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Exit)) return false;
+            Exit other = (Exit) o;
+            return code == other.code && java.util.Objects.equals(signal, other.signal);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(code, signal);
+        }
+
+        @Override
+        public String toString() {
+            return "Exit[code=" + code + ", signal=" + signal + "]";
+        }
     }
 
-    public record Cancel(String reason, byte[] target) {
+    public static final class Cancel {
+        private final String reason;
+        private final byte[] target;
+
+        public Cancel(String reason, byte[] target) {
+            this.reason = reason;
+            this.target = target;
+        }
+
+        public String reason() { return reason; }
+        public byte[] target() { return target; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Cancel)) return false;
+            Cancel other = (Cancel) o;
+            return java.util.Objects.equals(reason, other.reason)
+                    && java.util.Arrays.equals(target, other.target);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(reason, java.util.Arrays.hashCode(target));
+        }
+
+        @Override
+        public String toString() {
+            return "Cancel[reason=" + reason + ", target=" + java.util.Arrays.toString(target) + "]";
+        }
     }
 
-    public record Fs(int op, String path, byte[] data) {
+    public static final class Fs {
+        private final int op;
+        private final String path;
+        private final byte[] data;
+
+        public Fs(int op, String path, byte[] data) {
+            this.op = op;
+            this.path = path;
+            this.data = data;
+        }
+
+        public int op() { return op; }
+        public String path() { return path; }
+        public byte[] data() { return data; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Fs)) return false;
+            Fs other = (Fs) o;
+            return op == other.op
+                    && java.util.Objects.equals(path, other.path)
+                    && java.util.Arrays.equals(data, other.data);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(op, path, java.util.Arrays.hashCode(data));
+        }
+
+        @Override
+        public String toString() {
+            return "Fs[op=" + op + ", path=" + path + ", data=" + java.util.Arrays.toString(data) + "]";
+        }
     }
 
-    public record Health(boolean healthy, String message) {
+    public static final class Health {
+        private final boolean healthy;
+        private final String message;
+
+        public Health(boolean healthy, String message) {
+            this.healthy = healthy;
+            this.message = message;
+        }
+
+        public boolean healthy() { return healthy; }
+        public String message() { return message; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Health)) return false;
+            Health other = (Health) o;
+            return healthy == other.healthy && java.util.Objects.equals(message, other.message);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(healthy, message);
+        }
+
+        @Override
+        public String toString() {
+            return "Health[healthy=" + healthy + ", message=" + message + "]";
+        }
     }
 
-    public record ZbrtErrorPayload(long code, String message) {
+    public static final class ZbrtErrorPayload {
+        private final long code;
+        private final String message;
+
+        public ZbrtErrorPayload(long code, String message) {
+            this.code = code;
+            this.message = message;
+        }
+
+        public long code() { return code; }
+        public String message() { return message; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ZbrtErrorPayload)) return false;
+            ZbrtErrorPayload other = (ZbrtErrorPayload) o;
+            return code == other.code && java.util.Objects.equals(message, other.message);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(code, message);
+        }
+
+        @Override
+        public String toString() {
+            return "ZbrtErrorPayload[code=" + code + ", message=" + message + "]";
+        }
     }
 }

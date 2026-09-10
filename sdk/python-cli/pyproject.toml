@@ -7,7 +7,7 @@ name = "rfb-cli"
 version = "0.0.1"
 description = "RFB CLI (rfb-cli) — prebuilt native binary for linux-x64"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Cricle", email = "qnydhuaji@gmail.com" }]
 urls = { Homepage = "https://github.com/Cricle/rfb" }

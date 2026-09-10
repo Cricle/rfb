@@ -6,14 +6,18 @@ import io.rfb.sdk.TransportError;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
+import java.util.Objects;
 
 /**
  * ZBRT v1 wire frame (PROTOCOL.md §3.1, mirroring
  * {@code rfb-runtime/src/zeroboot_protocol.rs}). Header: magic "ZBRT",
  * version 1, kind, flags (u16 BE, must be 0), request_id (16 bytes),
- * payload_len (u32 BE, &le; 16 MiB). INTERNAL.
+ * payload_len (u32 BE, &le; 16 MiB). Java-8 compatible value holder
+ * (originally a record); accessor names match the record components.
+ * INTERNAL.
  */
-public record ZbrtFrame(int kind, int flags, byte[] requestId, byte[] payload) {
+public final class ZbrtFrame {
     public static final int HEADER_LEN = 28;
     public static final int MAX_PAYLOAD = 16 * 1024 * 1024;
     static final byte[] MAGIC = {'Z', 'B', 'R', 'T'};
@@ -32,11 +36,20 @@ public record ZbrtFrame(int kind, int flags, byte[] requestId, byte[] payload) {
     public static final int KIND_HEALTH_ACK = 11;
     public static final int KIND_ERROR = 12;
 
-    public ZbrtFrame {
+    private final int kind;
+    private final int flags;
+    private final byte[] requestId;
+    private final byte[] payload;
+
+    public ZbrtFrame(int kind, int flags, byte[] requestId, byte[] payload) {
         if (requestId == null || requestId.length != 16) {
             throw new IllegalArgumentException("request_id must be 16 bytes");
         }
         checkKind(kind);
+        this.kind = kind;
+        this.flags = flags;
+        this.requestId = requestId;
+        this.payload = payload;
     }
 
     private static int checkKind(int kind) {
@@ -44,6 +57,22 @@ public record ZbrtFrame(int kind, int flags, byte[] requestId, byte[] payload) {
             throw new DecodeError("unknown frame kind: " + kind);
         }
         return kind;
+    }
+
+    public int kind() {
+        return kind;
+    }
+
+    public int flags() {
+        return flags;
+    }
+
+    public byte[] requestId() {
+        return requestId;
+    }
+
+    public byte[] payload() {
+        return payload;
     }
 
     public byte[] encode() {
@@ -144,5 +173,28 @@ public record ZbrtFrame(int kind, int flags, byte[] requestId, byte[] payload) {
             off += r;
         }
         return out;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ZbrtFrame)) return false;
+        ZbrtFrame other = (ZbrtFrame) o;
+        return kind == other.kind
+                && flags == other.flags
+                && Arrays.equals(requestId, other.requestId)
+                && Arrays.equals(payload, other.payload);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(kind, flags, Arrays.hashCode(requestId), Arrays.hashCode(payload));
+    }
+
+    @Override
+    public String toString() {
+        return "ZbrtFrame[kind=" + kind + ", flags=" + flags
+                + ", requestId=" + Arrays.toString(requestId)
+                + ", payload=" + Arrays.toString(payload) + "]";
     }
 }

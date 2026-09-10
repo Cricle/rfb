@@ -1,7 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- Multi-target: netstandard2.0/2.1 for broad ecosystem compatibility,
+         net8.0 for the in-box System.Text.Json / modern API surface. -->
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -18,6 +20,12 @@
     <RepositoryUrl>https://github.com/Cricle/rfb</RepositoryUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
+
+  <!-- System.Text.Json ships in-box only for net8.0; older targets get the
+       NuGet package (supports netstandard2.0/2.1). -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Rfb.Sdk.Tests" />

@@ -7,25 +7,27 @@ import io.rfb.sdk.Snapshot;
 import io.rfb.sdk.TransportError;
 import io.rfb.sdk.ValidationError;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.URL;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * forkd controller HTTP/JSON transport (PROTOCOL.md §1). INTERNAL — the public
- * surface is {@code io.rfb.sdk.RfbClient}.
+ * forkd controller HTTP/JSON transport (PROTOCOL.md §1). Built on
+ * {@code HttpURLConnection} so the artifact supports Java 8. INTERNAL — the
+ * public surface is {@code io.rfb.sdk.RfbClient}.
  */
 public final class ControllerHttp {
     public static final String DEFAULT_URL = "http://127.0.0.1:8889";
 
-    private final HttpClient http;
     private final String baseUrl;
     private final String token;
     private final Duration timeout;
@@ -35,7 +37,6 @@ public final class ControllerHttp {
             throw new ValidationError("forkd timeout must be positive");
         }
         parseBaseUrl(baseUrl);
-        this.http = HttpClient.newBuilder().connectTimeout(timeout).build();
         this.baseUrl = baseUrl.replaceAll("/+$", "");
         this.token = token == null || token.trim().isEmpty() ? null : token;
         this.timeout = timeout;
@@ -74,14 +75,12 @@ public final class ControllerHttp {
      * back to legacy {@code /v1/snapshots/{tag}}; both 404 → null.
      */
     public Snapshot snapshotInfo(String tag) {
-        HttpResponse<String> preferred = send(
-                request("GET", "/v1/snapshots/" + urlSegment(tag) + "/info").GET().build());
-        if (preferred.statusCode() != 404) {
+        HttpResult preferred = send("GET", "/v1/snapshots/" + urlSegment(tag) + "/info", null, null);
+        if (preferred.statusCode != 404) {
             return Json.convert(expectOk(preferred), Snapshot.class);
         }
-        HttpResponse<String> legacy = send(
-                request("GET", "/v1/snapshots/" + urlSegment(tag)).GET().build());
-        if (legacy.statusCode() == 404) {
+        HttpResult legacy = send("GET", "/v1/snapshots/" + urlSegment(tag), null, null);
+        if (legacy.statusCode == 404) {
             return null;
         }
         return Json.convert(expectOk(legacy), Snapshot.class);
@@ -98,12 +97,9 @@ public final class ControllerHttp {
                 .put("prewarm", prewarm)
                 .put("live_fork", liveFork)
                 .put("hugepages", hugepages);
-        HttpResponse<String> resp = send(request("POST", "/v1/sandboxes")
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(Json.write(body)))
-                .build());
+        HttpResult resp = send("POST", "/v1/sandboxes", Json.write(body), "application/json");
         SandboxInfo[] arr = Json.convert(expectOk(resp), SandboxInfo[].class);
-        return new ArrayList<>(List.of(arr));
+        return new ArrayList<>(Arrays.asList(arr));
     }
 
     public List<SandboxInfo> listSandboxes() {
@@ -113,59 +109,86 @@ public final class ControllerHttp {
     /** Ping a sandbox; returns the controller's arbitrary JSON response value. */
     public JsonNode pingSandbox(String sandboxId) {
         Validation.sandboxId(sandboxId);
-        HttpResponse<String> resp = send(request("POST", "/v1/sandboxes/" + urlSegment(sandboxId) + "/ping")
-                .POST(HttpRequest.BodyPublishers.noBody())
-                .build());
+        HttpResult resp = send("POST", "/v1/sandboxes/" + urlSegment(sandboxId) + "/ping", null, null);
         return Json.parse(expectOk(resp).getBytes(StandardCharsets.UTF_8));
     }
 
     /** Delete a sandbox; both 2xx and 404 are success. */
     public void deleteSandbox(String sandboxId) {
         Validation.sandboxId(sandboxId);
-        HttpResponse<String> resp = send(request("DELETE", "/v1/sandboxes/" + urlSegment(sandboxId))
-                .DELETE()
-                .build());
-        int status = resp.statusCode();
+        HttpResult resp = send("DELETE", "/v1/sandboxes/" + urlSegment(sandboxId), null, null);
+        int status = resp.statusCode;
         if (status == 404 || (status >= 200 && status <= 299)) {
             return;
         }
-        throw httpError(status, resp.body());
+        throw httpError(status, resp.body);
     }
 
     // ---- plumbing --------------------------------------------------------
 
     /** GET an endpoint returning a JSON array of {@code type} elements. */
     private <T> List<T> getArray(String path, Class<T[]> type) {
-        T[] arr = Json.convert(expectOk(send(request("GET", path).GET().build())), type);
-        return new ArrayList<>(List.of(arr));
+        T[] arr = Json.convert(expectOk(send("GET", path, null, null)), type);
+        return new ArrayList<>(Arrays.asList(arr));
     }
 
-    private HttpRequest.Builder request(String method, String pathAndQuery) {
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(baseUrl + pathAndQuery))
-                .timeout(timeout);
-        if (token != null) {
-            b.header("Authorization", "Bearer " + token);
-        }
-        return b;
-    }
-
-    private HttpResponse<String> send(HttpRequest req) {
+    private HttpResult send(String method, String pathAndQuery, byte[] body, String contentType) {
+        HttpURLConnection conn = null;
         try {
-            return http.send(req, HttpResponse.BodyHandlers.ofString());
+            URL url = new URL(baseUrl + pathAndQuery);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout((int) timeout.toMillis());
+            conn.setReadTimeout((int) timeout.toMillis());
+            conn.setRequestMethod(method);
+            if (token != null) {
+                conn.setRequestProperty("Authorization", "Bearer " + token);
+            }
+            if (body != null) {
+                conn.setDoOutput(true);
+                if (contentType != null) {
+                    conn.setRequestProperty("Content-Type", contentType);
+                }
+            }
+            if (body != null) {
+                java.io.OutputStream out = conn.getOutputStream();
+                try {
+                    out.write(body);
+                } finally {
+                    out.close();
+                }
+            }
+            int status = conn.getResponseCode();
+            InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            return new HttpResult(status, readAll(stream));
         } catch (IOException e) {
             throw new TransportError("forkd request failed: " + e.getMessage(), e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new TransportError("forkd request interrupted", e);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
     }
 
-    private String expectOk(HttpResponse<String> resp) {
-        int status = resp.statusCode();
-        if (status < 200 || status > 299) {
-            throw httpError(status, resp.body());
+    private static String readAll(InputStream in) throws IOException {
+        if (in == null) {
+            return "";
         }
-        return resp.body();
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] chunk = new byte[8192];
+        int n;
+        while ((n = in.read(chunk)) > 0) {
+            buffer.write(chunk, 0, n);
+        }
+        in.close();
+        return new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    private String expectOk(HttpResult resp) {
+        int status = resp.statusCode;
+        if (status < 200 || status > 299) {
+            throw httpError(status, resp.body);
+        }
+        return resp.body;
     }
 
     private HttpStatusError httpError(int status, String body) {
@@ -189,6 +212,21 @@ public final class ControllerHttp {
     }
 
     private static String urlSegment(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+        try {
+            return URLEncoder.encode(value, "UTF-8").replace("+", "%20");
+        } catch (java.io.UnsupportedEncodingException e) {
+            throw new TransportError("UTF-8 encoding missing", e);
+        }
+    }
+
+    /** Minimal response value holder (replaces java.net.http.HttpResponse). */
+    private static final class HttpResult {
+        final int statusCode;
+        final String body;
+
+        HttpResult(int statusCode, String body) {
+            this.statusCode = statusCode;
+            this.body = body;
+        }
     }
 }

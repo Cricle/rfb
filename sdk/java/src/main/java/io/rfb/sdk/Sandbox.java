@@ -11,6 +11,7 @@ import io.rfb.sdk.internal.ZbrtConnection;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -186,7 +187,7 @@ public final class Sandbox {
                     : 0;
             try (ZbrtConnection conn = openZbrt()) {
                 ZbrtConnection.Exec exec = conn.execute(
-                        List.of("eval", code), cwd, new byte[0], timeoutMs);
+                        Arrays.asList("eval", code), cwd, new byte[0], timeoutMs);
                 return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
             }
         }

@@ -73,14 +73,17 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/release/rfb-cli dist/rfb-cli
+          cp dist/rfb-cli dist/rfb-cli-linux-x64
           (cd dist && sha256sum rfb-cli > SHA256SUMS)
           tar -C dist -czf "dist/rfb-${TAG}.tar.gz" rfb-cli SHA256SUMS
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
+          sha256sum "dist/rfb-cli-linux-x64" >> dist/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/rfb-${{ github.ref_name }}.tar.gz
+            dist/rfb-cli-linux-x64
             dist/SHA256SUMS
           generate_release_notes: true
       # CLI 二进制供 pypi / nuget job 打包（rfb-cli / Rfb.Cli）。
