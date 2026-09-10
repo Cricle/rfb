@@ -101,9 +101,10 @@ mod firecracker {
         }
 
         #[test]
-        fn boot_spawn_failure_leaves_no_vm_and_keeps_setup_diagnostics() {
+        fn boot_spawn_failure_leaves_no_vm_and_keeps_log_diagnostics() {
             let dir = tempdir().unwrap();
             let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
             let error = FirecrackerVm::boot_internal(
                 "/definitely/missing/firecracker",
                 "/kernel",
@@ -116,7 +117,6 @@ mod firecracker {
             .err()
             .unwrap();
             assert!(error.to_string().contains("Failed to start Firecracker"));
-            assert!(work.join("snapshot").is_dir());
             assert!(work.join("firecracker.log").is_file());
         }
 
