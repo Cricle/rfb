@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: io.rfb.sdk.ZbrtConnectionTest
 -------------------------------------------------------------------------------
-Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.402 s -- in io.rfb.sdk.ZbrtConnectionTest
+Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.395 s -- in io.rfb.sdk.ZbrtConnectionTest

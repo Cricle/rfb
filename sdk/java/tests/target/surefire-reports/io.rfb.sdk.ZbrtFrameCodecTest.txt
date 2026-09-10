@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: io.rfb.sdk.ZbrtFrameCodecTest
 -------------------------------------------------------------------------------
-Tests run: 20, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.049 s -- in io.rfb.sdk.ZbrtFrameCodecTest
+Tests run: 20, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.050 s -- in io.rfb.sdk.ZbrtFrameCodecTest

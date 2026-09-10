@@ -5,12 +5,12 @@
   <modelVersion>4.0.0</modelVersion>
 
   <!--
-    独立测试模块：Maven 3 要求 parent 必须是 packaging=pom，而 io.rfb:rfb-sdk
+    独立测试模块：Maven 3 要求 parent 必须是 packaging=pom，而 io.github.cricle:rfb-sdk
     本体是 jar，因此这里不继承主 POM，改为直接依赖已安装（mvn install）的
-    io.rfb:rfb-sdk jar。
+    io.github.cricle:rfb-sdk jar。
   -->
 
-  <groupId>io.rfb</groupId>
+  <groupId>io.github.cricle</groupId>
   <artifactId>rfb-sdk-tests</artifactId>
   <version>0.0.1</version>
   <packaging>jar</packaging>
@@ -28,7 +28,7 @@
 
   <dependencies>
     <dependency>
-      <groupId>io.rfb</groupId>
+      <groupId>io.github.cricle</groupId>
       <artifactId>rfb-sdk</artifactId>
       <version>0.0.1</version>
     </dependency>

@@ -3,9 +3,9 @@
   RFB Java SDK — 主 POM（parent + 主 jar 构建）。
 
   主代码位于本目录 src/main/java/io/rfb/sdk（公共门面 io.rfb.sdk 与内部协议实现
-  io.rfb.sdk.internal），本 POM 的主构建产物即 io.rfb:rfb-sdk jar。Maven 3 要求
+  io.rfb.sdk.internal），本 POM 的主构建产物即 io.github.cricle:rfb-sdk jar。Maven 3 要求
   aggregator 必须是 packaging=pom，而本 POM 需要产出 rfb-sdk jar，因此不能声明
-  <modules>；tests 模块（io.rfb:rfb-sdk-tests）独立构建并依赖 io.rfb:rfb-sdk，
+  <modules>；tests 模块（io.github.cricle:rfb-sdk-tests）独立构建并依赖 io.github.cricle:rfb-sdk，
   需先在本目录 mvn install 再以 -f tests/pom.xml 运行测试。
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -13,7 +13,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>io.rfb</groupId>
+  <groupId>io.github.cricle</groupId>
   <artifactId>rfb-sdk</artifactId>
   <version>0.0.1</version>
   <packaging>jar</packaging>

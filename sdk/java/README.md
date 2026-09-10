@@ -29,11 +29,11 @@ RfbError + TransportError / HttpStatusError / DecodeError / RemoteError / Valida
 
 ```bash
 cd sdk/java
-mvn -q compile            # 主代码 io.rfb:rfb-sdk（src/main/java）
+mvn -q compile            # 主代码 io.github.cricle:rfb-sdk（src/main/java）
 mvn -q test               # 测试（tests/ 模块，JUnit 5，全部进程内 fake）
 ```
 
-`pom.xml` 为 parent/aggregator（`io.rfb:rfb-sdk-parent`），主代码源目录在其 `<build>` 中声明；`tests/pom.xml`（`io.rfb:rfb-sdk-tests`）以 `io.rfb:rfb-sdk` 依赖引用主代码。如需单独产出主 jar：把根 pom 的 `packaging` 改为 `jar` 并去掉 `<modules>`。
+`pom.xml` 为 parent/aggregator（`io.github.cricle:rfb-sdk-parent`），主代码源目录在其 `<build>` 中声明；`tests/pom.xml`（`io.github.cricle:rfb-sdk-tests`）以 `io.github.cricle:rfb-sdk` 依赖引用主代码。如需单独产出主 jar：把根 pom 的 `packaging` 改为 `jar` 并去掉 `<modules>`。
 
 ## 快速上手
 

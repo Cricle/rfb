@@ -7,7 +7,7 @@
 #   CARGO_REGISTRIES_CRATES_IO_TOKEN。
 # - PyPI:       sdk/python 打包为 rfb-sdk（PyPI `rfb` 名称同样被占用）。
 #   凭据 PYPI_KEY（PyPI API token）。
-# - Maven:      io.rfb:rfb-sdk -> Maven Central（central-publishing-maven-plugin，
+# - Maven:      io.github.cricle:rfb-sdk -> Maven Central（central-publishing-maven-plugin，
 #   profile central-release）。凭据 MAVEN_KEY：settings.xml 的 <server> 块
 #   （id 必须为 central）；签名需 GPG_PRIVATE_KEY + GPG_PASSPHRASE
 #   （Central 强制要求 GPG 签名）。
@@ -269,17 +269,16 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          code=$(curl -s -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/io/rfb/rfb-sdk/${VERSION}/rfb-sdk-${VERSION}.pom" || true)
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/io/github/cricle/rfb-sdk/${VERSION}/rfb-sdk-${VERSION}.pom" || true)
           if [ "$code" = "200" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "io.rfb:rfb-sdk ${VERSION} 已在 Maven Central 上，跳过重复部署"
+            echo "io.github.cricle:rfb-sdk ${VERSION} 已在 Maven Central 上，跳过重复部署"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish to Maven Central
-        # Namespace 'io.rfb' 的 Central portal 验证是一次性用户动作；完成前
-        # 允许该步骤失败（run 保持绿），验证后自动恢复真实发布。
-        continue-on-error: true
+        # Namespace 需在 Central portal 完成一次性验证（一次性的 portal 操作，GitHub 账号即可验证）；验证前发布
+        # 必须真实失败（不掩盖），验证通过后自动恢复。
         if: steps.maven_guard.outputs.exists != 'true'
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
