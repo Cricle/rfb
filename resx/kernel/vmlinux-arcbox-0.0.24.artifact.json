@@ -8,7 +8,7 @@
   "entrypoint": "/sbin/rfb-runtime",
   "guest_port": 5000,
   "kernel": {
-    "path": "resx/kernel/vmlinux-arcbox-0.0.24",
+    "path": "/mnt/c/workplace/mm/monitor/rfb/resx/kernel/vmlinux-arcbox-0.0.24",
     "sha256": "819ce6ffcfdd1ceaf683bae260f28f6983102bd85deb0775b2aadb4b853ad7fa"
   },
   "vm": {

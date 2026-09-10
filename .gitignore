@@ -488,3 +488,6 @@ sdk/java/target/
 # Java test build output
 sdk/java/tests/target/
 sdk/java/tests/target/
+
+# Node.js build output
+sdk/nodejs/dist/

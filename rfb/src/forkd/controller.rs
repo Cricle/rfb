@@ -122,7 +122,6 @@ pub struct CreateSandboxRequest<'a> {
     pub hugepages: bool,
 }
 
-#[allow(dead_code)]
 impl ForkdClient {
     pub fn validate_sandbox_id(id: &str) -> Result<(), ForkdClientError> {
         if id.is_empty()

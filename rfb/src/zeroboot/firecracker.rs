@@ -125,7 +125,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-#[allow(dead_code)]
 pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
@@ -166,7 +165,6 @@ struct MachineConfig {
 }
 
 #[derive(Serialize)]
-#[allow(dead_code)]
 struct SnapshotCreate {
     snapshot_type: String,
     snapshot_path: String,
@@ -178,7 +176,6 @@ struct VmAction {
     action_type: String,
 }
 
-#[allow(dead_code)]
 impl FirecrackerVm {
     pub fn boot(
         kernel_path: &str,
@@ -403,7 +400,6 @@ impl FirecrackerVm {
     }
 }
 
-#[allow(dead_code)]
 impl FirecrackerVm {
     pub fn vsock_uds_path(&self) -> Option<&str> {
         self.vsock_uds_path.as_deref()
@@ -452,7 +448,6 @@ impl Drop for FirecrackerVm {
 
 /// Boot a Firecracker VM, wait for it to be ready, then snapshot it.
 /// Returns the paths to the snapshot files.
-#[allow(dead_code)]
 pub fn create_template_snapshot(
     kernel_path: &str,
     rootfs_path: &str,
