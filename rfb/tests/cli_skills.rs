@@ -17,8 +17,8 @@ fn skills_list_advertises_registered_skills() {
         "rfb-build-all must be listed: {value}"
     );
     assert!(
-        entries.iter().any(|skill| skill["name"] == "rfb-release"),
-        "rfb-release must be listed: {value}"
+        entries.iter().any(|skill| skill["name"] == "rfb-cli-usage"),
+        "rfb-cli-usage must be listed: {value}"
     );
     let build_all = entries
         .iter()
