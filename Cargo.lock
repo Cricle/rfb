@@ -2478,7 +2478,6 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
- "futures",
  "futures-lite",
  "reqwest 0.12.28",
  "rfb-runtime",

@@ -48,5 +48,4 @@ required-features = ["cli"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time"] }
-futures = "0.3"
 futures-lite = "2"
