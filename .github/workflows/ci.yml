@@ -2,11 +2,12 @@ name: CI
 
 # 触发约定：main 推送由 e2e.yml 负责跑真机 E2E；本工作流跑其余分支的推送与
 # 所有 PR 的 Rust 门禁（fmt/clippy/test/doc，全部 --all-features），以及
-# SDK 全量 build + 三套件测试（Python / C# / Java，debian:12 干净容器）。
+# SDK 全量 build + 四套件测试（Python / C# / Java / Node.js，debian:12 干净容器）。
 on:
   push:
     branches-ignore: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

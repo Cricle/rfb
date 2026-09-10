@@ -2,6 +2,7 @@ import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { ZbrtFrame, decode } from '../zbrt-frame.js';
+import { DecodeError } from '../errors.js';
 import * as codec from '../zbrt-codec.js';
 function frameBytes(kind: number, requestId: Buffer, payload: Buffer): Buffer {
   const header = Buffer.alloc(28);

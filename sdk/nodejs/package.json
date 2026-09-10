@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/",
+    "test": "npm run build && node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js",
     "prepublishOnly": "npm test"
   },
   "keywords": [
@@ -40,7 +40,7 @@
     "url": "https://github.com/Cricle/rfb"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.14.0",
     "typescript": "^5.5.0"
   }
 }

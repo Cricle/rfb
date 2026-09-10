@@ -41,11 +41,19 @@ export class ZbrtFrame {
     if (requestId.length !== 16) {
       throw new DecodeError('request_id must be 16 bytes');
     }
+    if (payload.length > MAX_PAYLOAD) {
+      throw new DecodeError(`payload too large: ${payload.length}`);
+    }
     checkKind(kind);
     this.kind = kind;
     this.flags = flags;
     this.requestId = Buffer.from(requestId);
     this.payload = Buffer.from(payload);
+  }
+
+  /** Static decode entry (mirrors the Java ZbrtFrame.decode). */
+  static decode(bytes: Uint8Array): ZbrtFrame {
+    return decode(bytes);
   }
 
   encode(): Buffer {

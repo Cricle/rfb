@@ -13,6 +13,9 @@
 #   （Central 强制要求 GPG 签名）。
 # - NuGet:      Rfb.Sdk -> nuget.org。凭据 NUGET_KEY（API key），
 #   包版本由 tag 推导（v0.0.1 -> 0.0.1）。
+# - npm:        sdk/nodejs 打包为 rfb-sdk（TypeScript，构建+测试后发布）；
+#   rfb-cli 为仅二进制包（linux-x64，bin 入口直接指向二进制）。凭据
+#   NPM_KEY（npm automation token，setup-node 注入 NODE_AUTH_TOKEN）。
 #
 # tag 与 workspace 版本的一致性（v0.0.1 <-> Cargo.toml version 0.0.1）在
 # crates 渠道强制校验；PyPI/Maven 版本各自固定为 0.0.1，与 tag 同步维护。
@@ -371,5 +374,110 @@ jobs:
               | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
               | LC_ALL=C fold -w 700 \
               | awk -v t=release-nuget '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
+
+  npm:
+    name: Publish rfb-sdk + rfb-cli to npm
+    needs: crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      # 重跑保护：该版本已在 npm 上时跳过发布（npm 对重复版本直接报错）。
+      - name: Check already-published packages
+        id: npm_guard
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          sdk_code=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/rfb-sdk/${VERSION}" || true)
+          cli_code=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/rfb-cli/${VERSION}" || true)
+          echo "sdk_missing=$([ "$sdk_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "cli_missing=$([ "$cli_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # rfb-sdk：TypeScript SDK。prepublishOnly 的 npm test 会在 publish 时再跑
+      # 一次构建+测试，这里显式执行以把失败挡在 publish 之前并留下日志。
+      - name: Publish rfb-sdk
+        if: steps.npm_guard.outputs.sdk_missing == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_KEY }}
+        run: |
+          set -uo pipefail
+          log=/tmp/release-npm-sdk.log
+          set +e
+          {
+            cd sdk/nodejs
+            npm install --no-audit --no-fund
+            npm test
+            npm publish
+          } 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::npm publish rfb-sdk 失败 rc=$rc（尾部见注解）"
+            tail -c 2000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-npm-sdk '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
+
+      # rfb-cli：仅二进制的 npm 包（linux-x64 原生二进制 + bin 入口，无 JS 包装）。
+      - name: Download CLI binary
+        if: steps.npm_guard.outputs.cli_missing == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: rfb-cli-linux-x64
+          path: dist-cli/raw
+      - name: Publish rfb-cli
+        if: steps.npm_guard.outputs.cli_missing == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_KEY }}
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          rm -rf dist/npm-cli
+          mkdir -p dist/npm-cli
+          cp dist-cli/raw/rfb-cli dist/npm-cli/rfb-cli
+          chmod +x dist/npm-cli/rfb-cli
+          cat > dist/npm-cli/package.json <<EOF
+          {
+            "name": "rfb-cli",
+            "version": "$VERSION",
+            "description": "RFB CLI (rfb-cli) - prebuilt native binary for linux-x64",
+            "bin": { "rfb-cli": "rfb-cli" },
+            "files": ["rfb-cli", "README.md"],
+            "os": ["linux"],
+            "cpu": ["x64"],
+            "engines": { "node": ">=18" },
+            "license": "MIT OR Apache-2.0",
+            "author": "Cricle <qnydhuaji@gmail.com>",
+            "repository": { "type": "git", "url": "https://github.com/Cricle/rfb" }
+          }
+          EOF
+          cat > dist/npm-cli/README.md <<'MDEOF'
+          # rfb-cli
+
+          Prebuilt native binary distribution of the RFB CLI for linux-x64.
+          Installed via npm (`npm install -g rfb-cli` or `npx rfb-cli`); the
+          `rfb-cli` bin entry executes the bundled native executable directly.
+
+          See <https://github.com/Cricle/rfb> for the full project, source
+          releases, and usage documentation.
+          MDEOF
+          log=/tmp/release-npm-cli.log
+          set +e
+          npm publish dist/npm-cli 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::npm publish rfb-cli 失败 rc=$rc（尾部见注解）"
+            tail -c 2000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-npm-cli '{print "::error title="t"-"NR"::"$0}'
             exit "$rc"
           fi

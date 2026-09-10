@@ -491,3 +491,4 @@ sdk/java/tests/target/
 
 # Node.js build output
 sdk/nodejs/dist/
+sdk/nodejs/lib/

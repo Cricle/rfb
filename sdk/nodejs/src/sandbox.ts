@@ -128,7 +128,7 @@ export class Sandbox {
   readonly #client: { deleteSandbox(id: string): Promise<void>; };
   readonly #guestTimeoutMs: number;
 
-  constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs: number) {
+  constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs = 10_000) {
     this.info = info;
     this.id = String(info.id);
     this.snapshotTag = String(info.snapshot_tag ?? '');

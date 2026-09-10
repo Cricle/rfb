@@ -26,6 +26,12 @@ describe('ZbrtConnection (fake frame server)', () => {
       server.listen(0, '127.0.0.1', () => {
         const addr = server.address() as net.AddressInfo;
         port = addr.port;
+        // unref: the fake server must not keep the test process alive once
+        // the suite's own sockets are closed.
+        server.unref();
+        cleanup = () => {
+          server.close();
+        };
         resolve(port);
       });
     });

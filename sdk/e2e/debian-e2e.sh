@@ -3,10 +3,11 @@
 # RFB SDK 全新 Debian 12 环境一键 E2E 验证脚本
 #
 # 目的：在一台"干净"的 Debian 12（WSL2 发行版或 CI 容器）里，从零安装工具链
-# 并把三个 SDK 测试套件全部跑绿：
+# 并把四个 SDK 测试套件全部跑绿：
 #   A) Python  : python3 -m unittest discover -s tests -v
 #   B) C#      : dotnet test（先清理 bin/obj 陈旧产物）
 #   C) Java    : mvn test（surefire）
+#   D) Node.js : npm test（tsc 构建 + node 直跑四个 node:test 套件）
 # 依赖安装（apt + dot.net 官方安装脚本）与测试执行全部内聚在本脚本内，
 # 不依赖环境里预装的任何 SDK 工具链。脚本不含任何机密。
 #
@@ -23,7 +24,8 @@
 #   # 非 WSL 环境，走同一套 apt + dotnet-install 依赖流程）
 #
 # 环境变量：
-#   E2E_SKIP_PYTHON=1 / E2E_SKIP_DOTNET=1 / E2E_SKIP_JAVA=1  跳过对应套件
+#   E2E_SKIP_PYTHON=1 / E2E_SKIP_DOTNET=1 / E2E_SKIP_JAVA=1 / E2E_SKIP_NODE=1
+#                                                            跳过对应套件
 #   E2E_SKIP_APT=1                                           跳过 apt 安装（依赖已备好时）
 # 注意（WSL2）：wsl.exe 不会把宿主环境变量转发进发行版，例如
 #   MSYS_NO_PATHCONV=1 E2E_SKIP_DOTNET=1 wsl.exe -d ... -- bash script.sh
@@ -83,11 +85,11 @@ fi
 # python3 + curl + ca-certificates：Python 套件与后续 dotnet 安装脚本所需；
 # openjdk-17-jdk-headless + maven：Java 套件。dotnet 不在 apt 里，下一步单独装。
 if [ "${E2E_SKIP_APT:-0}" != "1" ]; then
-  log "安装 apt 依赖（python3 / curl / ca-certificates / openjdk-17-jdk-headless / maven）..."
+  log "安装 apt 依赖（python3 / curl / ca-certificates / openjdk-17-jdk-headless / maven / nodejs / npm）..."
   export DEBIAN_FRONTEND=noninteractive
   $SUDO apt-get update -qq
   $SUDO apt-get install -y -qq --no-install-recommends \
-    python3 curl ca-certificates openjdk-17-jdk-headless maven
+    python3 curl ca-certificates openjdk-17-jdk-headless maven nodejs npm
   # .NET 运行时强依赖 ICU，缺失即在 dotnet 首次启动时 FailFast/SIGABRT（rc 134）。
   # ICU 包名随 Debian 版本变化（bookworm=libicu72, trixie=libicu76），按序回退。
   $SUDO apt-get install -y -qq --no-install-recommends libicu72 \
@@ -207,13 +209,34 @@ else
   fi
 fi
 
+# 套件 D：Node.js / TypeScript SDK（npm test = tsc 构建 + node 直跑套件）
+# 说明：不用 node --test 运行器——各 Node 版本对目录/通配符参数行为不一，
+# 且 Windows 下会因 fake server 句柄挂起；node 直跑 node:test 文件在
+# 18/20/22/24 行为一致，失败时退出码非 0。
+if [ "${E2E_SKIP_NODE:-0}" = "1" ]; then
+  SUMMARY+=("node   : SKIP (E2E_SKIP_NODE=1)")
+  SKIP=$((SKIP + 1))
+else
+  command -v node >/dev/null 2>&1 || die12 "node 缺失，无法运行 Node 套件"
+  command -v npm >/dev/null 2>&1 || die12 "npm 缺失，无法运行 Node 套件"
+  log "运行 Node SDK 测试（npm test：tsc 构建 + node 直跑四个套件）..."
+  if (cd "$SDK_DIR/nodejs" && npm install --no-audit --no-fund && npm test) \
+      2>&1 | tee "$OUT_DIR/node.log"; then
+    SUMMARY+=("node   : PASS")
+    PASS=$((PASS + 1))
+  else
+    SUMMARY+=("node   : FAIL（详见 $OUT_DIR/node.log）")
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
 # ---- 4. 汇总与退出码 --------------------------------------------------------
 {
   echo "========== RFB SDK Debian E2E 汇总 =========="
   for line in "${SUMMARY[@]}"; do
     echo "  $line"
   done
-  echo "结果：$PASS/3 套件通过（失败 $FAIL，跳过 $SKIP）"
+  echo "结果：$PASS/4 套件通过（失败 $FAIL，跳过 $SKIP）"
   echo "输出目录：$OUT_DIR"
 } | tee "$OUT_DIR/summary.txt"
 
