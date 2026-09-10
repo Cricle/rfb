@@ -3,6 +3,7 @@
 // Exercise request construction and failure/resource boundaries without
 // launching a VM. Including the implementation keeps its private test seam
 // private to this test module and does not alter production visibility.
+#[allow(dead_code)]
 mod firecracker {
     include!("../src/zeroboot/firecracker.rs");
 
@@ -24,7 +25,6 @@ mod firecracker {
             FirecrackerVm {
                 process: child,
                 socket_path: path.to_owned(),
-                snapshot_dir: String::new(),
                 vsock_uds_path: None,
             }
         }

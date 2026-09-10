@@ -128,7 +128,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
-    snapshot_dir: String,
     vsock_uds_path: Option<String>,
 }
 
@@ -165,55 +164,11 @@ struct MachineConfig {
 }
 
 #[derive(Serialize)]
-struct SnapshotCreate {
-    snapshot_type: String,
-    snapshot_path: String,
-    mem_file_path: String,
-}
-
-#[derive(Serialize)]
 struct VmAction {
     action_type: String,
 }
 
 impl FirecrackerVm {
-    pub fn boot(
-        kernel_path: &str,
-        rootfs_path: &str,
-        work_dir: &str,
-        mem_mib: u32,
-        init_path: &str,
-    ) -> Result<Self> {
-        Self::boot_internal(
-            "firecracker",
-            kernel_path,
-            rootfs_path,
-            work_dir,
-            mem_mib,
-            init_path,
-            None,
-        )
-    }
-
-    pub fn boot_with_vsock(
-        kernel_path: &str,
-        rootfs_path: &str,
-        work_dir: &str,
-        mem_mib: u32,
-        init_path: &str,
-        vsock: VsockConfig,
-    ) -> Result<Self> {
-        Self::boot_internal(
-            "firecracker",
-            kernel_path,
-            rootfs_path,
-            work_dir,
-            mem_mib,
-            init_path,
-            Some(vsock),
-        )
-    }
-
     fn boot_internal(
         firecracker_path: &str,
         kernel_path: &str,
@@ -224,11 +179,9 @@ impl FirecrackerVm {
         vsock: Option<VsockConfig>,
     ) -> Result<Self> {
         let socket_path = format!("{}/firecracker.sock", work_dir);
-        let snapshot_dir = format!("{}/snapshot", work_dir);
 
         // Clean up
         let _ = std::fs::remove_file(&socket_path);
-        std::fs::create_dir_all(&snapshot_dir)?;
 
         // Start Firecracker
         eprintln!("Starting Firecracker...");
@@ -258,7 +211,6 @@ impl FirecrackerVm {
         let vm = Self {
             process: process.take()?,
             socket_path,
-            snapshot_dir,
             vsock_uds_path,
         };
 
@@ -317,52 +269,8 @@ impl FirecrackerVm {
         Ok(vm)
     }
 
-    /// Pause the VM and create a snapshot
-    pub fn snapshot(&mut self) -> Result<(String, String)> {
-        let snapshot_path = format!("{}/vmstate", self.snapshot_dir);
-        let mem_path = format!("{}/mem", self.snapshot_dir);
-
-        // Pause the VM
-        eprintln!("Pausing VM...");
-        self.api_patch("/vm", &serde_json::json!({"state": "Paused"}))?;
-
-        // Create snapshot
-        eprintln!("Creating snapshot...");
-        self.api_put(
-            "/snapshot/create",
-            &SnapshotCreate {
-                snapshot_type: "Full".to_string(),
-                snapshot_path: snapshot_path.clone(),
-                mem_file_path: mem_path.clone(),
-            },
-        )?;
-
-        // Wait for files
-        std::thread::sleep(Duration::from_millis(500));
-
-        if !Path::new(&snapshot_path).exists() {
-            bail!("Snapshot state file not created");
-        }
-        if !Path::new(&mem_path).exists() {
-            bail!("Snapshot memory file not created");
-        }
-
-        let mem_size = std::fs::metadata(&mem_path)?.len();
-        eprintln!(
-            "Snapshot created: state={}B, mem={}MB",
-            std::fs::metadata(&snapshot_path)?.len(),
-            mem_size / 1024 / 1024
-        );
-
-        Ok((snapshot_path, mem_path))
-    }
-
     fn api_put<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
         self.api_request("PUT", path, body)
-    }
-
-    fn api_patch<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
-        self.api_request("PATCH", path, body)
     }
 
     fn api_request<T: Serialize>(&self, method: &str, path: &str, body: &T) -> Result<String> {
@@ -444,26 +352,4 @@ impl Drop for FirecrackerVm {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-/// Boot a Firecracker VM, wait for it to be ready, then snapshot it.
-/// Returns the paths to the snapshot files.
-pub fn create_template_snapshot(
-    kernel_path: &str,
-    rootfs_path: &str,
-    work_dir: &str,
-    mem_mib: u32,
-    wait_secs: u64,
-    init_path: &str,
-) -> Result<(String, String, u32)> {
-    let mut vm = FirecrackerVm::boot(kernel_path, rootfs_path, work_dir, mem_mib, init_path)?;
-
-    // Wait for the guest to boot and become ready
-    eprintln!("Waiting {}s for guest to boot...", wait_secs);
-    std::thread::sleep(Duration::from_secs(wait_secs));
-
-    // Take snapshot
-    let (state_path, mem_path) = vm.snapshot()?;
-
-    Ok((state_path, mem_path, mem_mib))
 }
