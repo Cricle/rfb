@@ -1,3 +1,6 @@
+//! Strict localhost URL validation shared by every command that talks to the
+//! forkd controller or a local web service.
+
 use crate::cli::error::{validation, CliError};
 
 /// Validate that a base URL is an HTTP(S) loopback target
