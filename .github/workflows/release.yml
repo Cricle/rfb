@@ -174,10 +174,27 @@ jobs:
           fi
       - name: Publish rfb-cli to PyPI
         if: steps.pypi_cli_guard.outputs.exists != 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist-cli
-          password: ${{ secrets.PYPI_KEY }}
+        env:
+          PYPI_KEY: ${{ secrets.PYPI_KEY }}
+        run: |
+          set -uo pipefail
+          # 用 twine 而非 pypa action：上传失败的原因（403 token 范围 /
+          # 400 元数据）必须以 ::error:: 注解带出，否则无法排障。
+          python -m pip install --upgrade twine
+          log=/tmp/release-py-cli.log
+          set +e
+          python -m twine upload --verbose --non-interactive \
+            -u __token__ -p "$PYPI_KEY" dist-cli/*.whl 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::twine upload rfb-cli 失败 rc=$rc（尾部见注解）"
+            tail -c 2000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=release-py-cli '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
 
   maven:
     name: Publish rfb-sdk to Maven Central

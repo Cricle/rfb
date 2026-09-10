@@ -484,3 +484,6 @@ $RECYCLE.BIN/
 image/
 # Java build output
 sdk/java/target/
+
+# Java test build output
+sdk/java/tests/target/
