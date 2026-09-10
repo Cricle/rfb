@@ -5,8 +5,9 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# Published crate from crates.io — no path/workspace references.
-rfb-sdk = "0.0.1"
+# The lib target is named `rfb` (see rfb/Cargo.toml [lib] name); the package
+# alias `rfb` lets us `use rfb::...` in code.
+rfb = { package = "rfb-sdk", version = "0.0.1", features = ["forkd"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [workspace]

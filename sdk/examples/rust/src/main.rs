@@ -9,9 +9,10 @@
 //! Run: `cargo run -- rfb`
 
 use rfb::client::RfbClient;
+use rfb::client::RfbError;
 
 #[tokio::main]
-async fn main() -> Result<(), rfb::RfbError> {
+async fn main() -> Result<(), RfbError> {
     let tag = std::env::args().nth(1).unwrap_or_else(|| "rfb".to_owned());
 
     // `from_env` reads FORKD_URL / FORKD_TOKEN; `RfbClient::new(base_url,
@@ -29,7 +30,7 @@ async fn main() -> Result<(), rfb::RfbError> {
     println!("ping: {}", sandbox.ping().await?);
 
     let result = sandbox
-        .exec(["echo", "hello"], "/workspace", 60.0, b"")
+        .exec(&["echo", "hello"], "/workspace", 60.0, b"")
         .await?;
     println!(
         "exec: exit={} stdout={}",
@@ -37,7 +38,9 @@ async fn main() -> Result<(), rfb::RfbError> {
         result.stdout_text().trim_end()
     );
 
-    sandbox.write("notes.txt", b"hello from rfb-sdk").await?;
+    sandbox
+        .write("notes.txt", b"hello from rfb-sdk", false, None)
+        .await?;
     let file = sandbox.read("notes.txt", None, None).await?;
     println!("read back {} bytes", file.data.len());
 

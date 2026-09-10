@@ -30,7 +30,21 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: |
+          set -uo pipefail
+          log=/tmp/clippy.log
+          set +e
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::clippy 失败 rc=$rc（error 行见注解）"
+            grep -E "^error" "$log" | head -20 | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=ci-clippy '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
       # 失败现场要能被公开 API 读到（日志下载需 token）：失败时把 FAILED
       # 测试名、failures 块与 panic 信息拆成 ::error:: 注解带出。
       - name: Tests

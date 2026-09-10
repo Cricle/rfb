@@ -23,7 +23,7 @@ public final class Quickstart {
 
         // Block until the snapshot reports status=ready and bootable=true.
         Snapshot snapshot = client.waitSnapshot(tag);
-        System.out.println("snapshot " + snapshot.tag() + " is ready");
+        System.out.println("snapshot " + snapshot.tag + " is ready");
 
         Sandbox sandbox = client.createSandbox(tag).get(0);
         System.out.println("sandbox " + sandbox.id() + " created");
