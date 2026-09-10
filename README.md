@@ -1,11 +1,11 @@
 # RFB
 
-[![CI](https://github.com/Cricle/rfb/actions/workflows/ci.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/ci.yml)
+[![Release](https://github.com/Cricle/rfb/actions/workflows/release.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/release.yml)
 [![Real-VM E2E](https://github.com/Cricle/rfb/actions/workflows/e2e.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/e2e.yml)
 [![Crates.io](https://img.shields.io/crates/v/rfb-sdk)](https://crates.io/crates/rfb-sdk)
 [![PyPI](https://img.shields.io/pypi/v/rfb-sdk)](https://pypi.org/project/rfb-sdk/)
 [![NuGet](https://img.shields.io/nuget/v/Rfb.Sdk)](https://www.nuget.org/packages/Rfb.Sdk/)
-[![Maven Central](https://img.shields.io/maven-central/v/io.rfb/rfb-sdk)](https://central.sonatype.com/artifact/io.rfb/rfb-sdk)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.cricle/rfb-sdk)](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
 **English** | [简体中文](README.zh.md)
@@ -27,7 +27,10 @@ CLI: `cargo install rfb-sdk --features cli` (binary: `rfb-cli`). The prebuilt **
 ```bash
 pip install rfb-cli          # PyPI wheel bundling the binary
 dotnet add package Rfb.Cli   # NuGet (binary in tools/, copied to output)
-``` Published crates contain Rust sources and crate resources only — no Firecracker binary, Linux kernel, ext4 images, snapshots, or forkd service. Those must be provisioned explicitly by the deployment system.
+npm install -g rfb-cli       # npm (binary-only package)
+```
+
+Published crates contain Rust sources and crate resources only — no Firecracker binary, Linux kernel, ext4 images, snapshots, or forkd service. Those must be provisioned explicitly by the deployment system.
 
 ## Crates
 
@@ -46,10 +49,11 @@ The same sandbox surface ships as:
 | Language | Package |
 |---|---|
 | Python | [`rfb-sdk`](https://pypi.org/project/rfb-sdk/) (`import rfb_sdk`) |
-| Java | [`io.rfb:rfb-sdk`](https://central.sonatype.com/artifact/io.rfb/rfb-sdk) (Maven Central) |
+| Java | [`io.github.cricle:rfb-sdk`](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk) (Maven Central) |
 | C#/.NET | [`Rfb.Sdk`](https://www.nuget.org/packages/Rfb.Sdk/) (NuGet) |
+| Node.js | [`rfb-sdk`](https://www.npmjs.com/package/rfb-sdk) (`import { RfbClient } from 'rfb-sdk'`) |
 
-All three suites are exercised end-to-end in CI on a clean Debian 12 container (see `sdk/e2e/debian-e2e.sh`).
+All four suites (Python / C# / Java / Node.js) are exercised end-to-end in CI on a clean Debian 12 container (see `sdk/e2e/debian-e2e.sh`).
 
 ## Features, platforms, and MSRV
 
@@ -79,7 +83,7 @@ This repository keeps `resx/firecracker/firecracker-v1.16.1-x86_64.tgz` as the o
 
 - **CI** — every PR and non-main push: Rust checks (fmt, clippy, tests, docs with `--all-features`, boundary checks) plus full SDK builds and tests (Python / C# / Java) in a clean Debian 12 container.
 - **Real-VM E2E** — pushes to `main`: boots the real Firecracker/forkd stack on a KVM runner, creates a snapshot from the forkd-agent rootfs, and runs the full `#[ignore]`-gated real-VM test suite.
-- **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-rig` to crates.io, `rfb-sdk` to PyPI, `io.rfb:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
+- **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-rig` to crates.io, `rfb-sdk` to PyPI, `io.github.cricle:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, and `rfb-sdk` (TypeScript) plus the `rfb-cli` binary to npm, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
 
 ## Release & CI
 

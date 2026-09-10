@@ -1,11 +1,11 @@
 # RFB
 
-[![CI](https://github.com/Cricle/rfb/actions/workflows/ci.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/ci.yml)
+[![Release](https://github.com/Cricle/rfb/actions/workflows/release.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/release.yml)
 [![Real-VM E2E](https://github.com/Cricle/rfb/actions/workflows/e2e.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/e2e.yml)
 [![Crates.io](https://img.shields.io/crates/v/rfb-sdk)](https://crates.io/crates/rfb-sdk)
 [![PyPI](https://img.shields.io/pypi/v/rfb-sdk)](https://pypi.org/project/rfb-sdk/)
 [![NuGet](https://img.shields.io/nuget/v/Rfb.Sdk)](https://www.nuget.org/packages/Rfb.Sdk/)
-[![Maven Central](https://img.shields.io/maven-central/v/io.rfb/rfb-sdk)](https://central.sonatype.com/artifact/io.rfb/rfb-sdk)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.cricle/rfb-sdk)](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
 [English](README.md) | **简体中文**
@@ -27,7 +27,10 @@ CLI：`cargo install rfb-sdk --features cli`（二进制名 `rfb-cli`）。预�
 ```bash
 pip install rfb-cli          # PyPI wheel 内置二进制
 dotnet add package Rfb.Cli   # NuGet（二进制位于 tools/，复制到输出目录）
-```crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Linux kernel、ext4 镜像、快照或 forkd 服务；这些必须由部署系统显式提供。
+npm install -g rfb-cli       # npm（仅二进制包）
+```
+
+crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Linux kernel、ext4 镜像、快照或 forkd 服务；这些必须由部署系统显式提供。
 
 ## crate 职责
 
@@ -46,10 +49,11 @@ dotnet add package Rfb.Cli   # NuGet（二进制位于 tools/，复制到输出�
 | 语言 | 包 |
 |---|---|
 | Python | [`rfb-sdk`](https://pypi.org/project/rfb-sdk/)（`import rfb_sdk`） |
-| Java | [`io.rfb:rfb-sdk`](https://central.sonatype.com/artifact/io.rfb/rfb-sdk)（Maven Central） |
+| Java | [`io.github.cricle:rfb-sdk`](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk)（Maven Central） |
 | C#/.NET | [`Rfb.Sdk`](https://www.nuget.org/packages/Rfb.Sdk/)（NuGet） |
+| Node.js | [`rfb-sdk`](https://www.npmjs.com/package/rfb-sdk)（`import { RfbClient } from 'rfb-sdk'`） |
 
-三套件都在 CI 的干净 Debian 12 容器里做端到端验证（见 `sdk/e2e/debian-e2e.sh`）。
+四个套件（Python / C# / Java / Node.js）都在 CI 的干净 Debian 12 容器里做端到端验证（见 `sdk/e2e/debian-e2e.sh`）。
 
 ## features、平台与 MSRV
 
@@ -77,9 +81,9 @@ rfb-cli doctor --json   # 宿主能力报告
 
 ## CI/CD
 
-- **CI**——所有 PR 与非 main 分支推送：Rust 门禁（fmt、clippy、测试、文档，全部 `--all-features`，含边界检查）+ 干净 Debian 12 容器里的 SDK 全量构建与测试（Python / C# / Java）。
+- **CI**——所有 PR 与非 main 分支推送：Rust 门禁（fmt、clippy、测试、文档，全部 `--all-features`，含边界检查）+ 干净 Debian 12 容器里的 SDK 全量构建与测试（Python / C# / Java / Node.js）。
 - **真机 E2E**——push 到 `main`：在 KVM runner 上启动真实 Firecracker/forkd 栈，从 forkd-agent rootfs 创建快照，跑全部 `#[ignore]` 门控的真机测试。
-- **Release**——推送 `v主.次.补丁` tag：按 `rfb-runtime` → `rfb-sdk` → `rfb-rig` 顺序发布到 crates.io，`rfb-sdk` 发布到 PyPI、`io.rfb:rfb-sdk` 发布到 Maven Central（GPG 签名）、`Rfb.Sdk` 发布到 NuGet，并把 `rfb-cli` 二进制与 SHA256SUMS 附件挂到 GitHub Release。发布幂等：重跑时已发布的产物自动跳过。
+- **Release**——推送 `v主.次.补丁` tag：按 `rfb-runtime` → `rfb-sdk` → `rfb-rig` 顺序发布到 crates.io，`rfb-sdk` 发布到 PyPI、`io.github.cricle:rfb-sdk` 发布到 Maven Central（GPG 签名）、`Rfb.Sdk` 发布到 NuGet、`rfb-sdk`（TypeScript）与 `rfb-cli`（仅二进制）发布到 npm，并把 `rfb-cli` 二进制与 SHA256SUMS 附件挂到 GitHub Release。发布幂等：重跑时已发布的产物自动跳过。
 
 ## 发布与 CI
 
