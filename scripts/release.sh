@@ -45,7 +45,7 @@ if [[ "$mode" == dry-run ]]; then
   # an unrelated 2022 crate; the lib target keeps the name `rfb`). Publish order
   # follows the dependency chain: rfb-runtime <- rfb-sdk <- rfb-rig.
   for crate in rfb-runtime rfb-sdk rfb-rig; do
-    cargo package -p "$crate" --locked --allow-dirty
+    cargo package -p "$crate" --locked
     cargo publish -p "$crate" --locked --dry-run
   done
   printf 'Release checks passed for workspace version %s\n' "$version"
@@ -69,7 +69,7 @@ publish_crate() {
     printf '%s %s already on crates.io; skipping\n' "$1" "$version"
     return 0
   fi
-  cargo package -p "$1" --locked --allow-dirty
+  cargo package -p "$1" --locked
   # --token on the command line: the CARGO_REGISTRIES_CRATES_IO_TOKEN env var
   # was not honored by the runner's cargo during one release run ("no token
   # found"); a CLI flag cannot be lost to environment plumbing.

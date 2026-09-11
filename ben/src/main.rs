@@ -270,7 +270,13 @@ mod zbrt {
         mem_mib: u32,
     ) -> Result<serde_json::Value, String> {
         // The provider reads this at boot time, so per-level overrides work.
-        std::env::set_var("RFB_ZBRT_VM_MEM_MIB", mem_mib.to_string());
+        // set_var is not safe with concurrent targets; the benchmark loop is
+        // sequential, but guard with OnceLock to make the intent clear.
+        static SET_MEM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        if SET_MEM.get_or_init(|| mem_mib) != &mem_mib {
+            std::env::set_var("RFB_ZBRT_VM_MEM_MIB", mem_mib.to_string());
+            let _ = SET_MEM.set(mem_mib);
+        }
         let config = ZbrtConfig {
             kernel: Some(args.kernel.clone()),
             rootfs: Some(args.rootfs.clone()),

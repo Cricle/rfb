@@ -368,6 +368,9 @@ impl SharedHostSession {
         validate_guest_cwd(cwd)?;
         let mut session = self.0.lock().await;
         let sequence = session.next_sequence();
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(VsockClientError::Timeout)?;
         let session_id = format!("rfb-web-{}", Uuid::now_v7());
         let request_id = format!("rfb-web-{}", Uuid::now_v7());
         session
@@ -383,6 +386,9 @@ impl SharedHostSession {
         let mut stdout = String::new();
         let mut stderr = String::new();
         loop {
+            if Instant::now() >= deadline {
+                return Err(VsockClientError::Timeout);
+            }
             let (frame, message) = session.recv().await?;
             match &message {
                 RuntimeMessage::Event(_) if frame.message_type != MessageType::Event => {
@@ -927,6 +933,9 @@ impl VsockGuestClient {
         let mut client = self.begin().await?;
         let session_id = format!("rfb-web-{}", Uuid::now_v7());
         let request_id = format!("rfb-web-{}", Uuid::now_v7());
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(VsockClientError::Timeout)?;
         let result = async {
             client
                 .send_control(
@@ -941,6 +950,9 @@ impl VsockGuestClient {
             let mut stdout = String::new();
             let mut stderr = String::new();
             loop {
+                if Instant::now() >= deadline {
+                    return Err(VsockClientError::Timeout);
+                }
                 let (frame, message) = client.recv().await?;
                 match &message {
                     RuntimeMessage::Event(_) if frame.message_type != MessageType::Event => {
@@ -976,10 +988,10 @@ impl VsockGuestClient {
                                 })?;
                             match terminal.stream {
                                 crate::session::TerminalStream::Stdout => {
-                                    stdout.push_str(&terminal.data)
+                                    append_capped(&mut stdout, &terminal.data)
                                 }
                                 crate::session::TerminalStream::Stderr => {
-                                    stderr.push_str(&terminal.data)
+                                    append_capped(&mut stderr, &terminal.data)
                                 }
                             }
                         }
