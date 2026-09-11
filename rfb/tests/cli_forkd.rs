@@ -126,9 +126,5 @@ async fn offline_validation_paths_do_not_connect() {
     assert!(benchmark("not a url", "snap", 0, Duration::ZERO)
         .await
         .is_err());
-    assert!(acceptance("not a url", "snap", false, false).await.is_err());
-    let err = acceptance("http://127.0.0.1:1", "snap", false, true)
-        .await
-        .expect_err("provenance gate must fail closed");
-    assert!(err.message.contains("snapshot-bind"));
+    assert!(acceptance("not a url", "snap", false).await.is_err());
 }

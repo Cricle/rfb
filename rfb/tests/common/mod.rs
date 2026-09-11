@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 /// on it so contract drift is caught here.
 pub const EXIT_NOVM: i32 = 12;
 
+/// Validation failure exit code (`src/cli/error.rs::EXIT_VALIDATION`).
+pub const EXIT_VALIDATION: i32 = 3;
+
 pub struct RunOutcome {
     pub code: i32,
     pub stdout: String,

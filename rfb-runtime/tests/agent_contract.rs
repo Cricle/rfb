@@ -309,7 +309,14 @@ async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
     let terminal: Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(terminal["timed_out"], true);
     assert_eq!(terminal["exit_code"], Value::Null);
-    assert!(terminal["error"].as_str().unwrap().contains("timeout"));
+    assert_eq!(terminal["done"], true);
+    // PROTOCOL.md §2.4: a timeout is a normal terminal outcome — a string
+    // `error` key would make the host raise Remote instead of exposing
+    // `timed_out` to callers.
+    assert!(
+        terminal.get("error").is_none(),
+        "timeout frames must not carry the error key: {terminal}"
+    );
     task.abort();
 }
 
@@ -681,6 +688,12 @@ async fn exec_timeout_keeps_official_aliases_and_terminal_state() {
     assert_eq!(result["stdout"], "");
     assert_eq!(result["err"], "process timeout");
     assert_eq!(result["stderr"], "process timeout");
-    assert_eq!(result["error"], "process timeout");
+    // PROTOCOL.md §2.4: no string `error` on the timeout terminal — the host
+    // classifies any `error` as a fatal Remote failure and would swallow
+    // `timed_out`.
+    assert!(
+        result.get("error").is_none(),
+        "timeout response must not carry the error key: {result}"
+    );
     task.abort();
 }

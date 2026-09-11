@@ -39,10 +39,11 @@ pub fn guest_path(value: Option<&Value>, _directory: bool) -> io::Result<PathBuf
             "invalid guest path",
         ));
     }
-    let workspace = workspace_root();
-    // Only an exact root match or a segment boundary ("/workspace/...") counts
-    // as inside the workspace: "/workspace2/x" must alias into the workspace.
-    let stripped = raw.strip_prefix(workspace);
+    // The guest-visible root is always the literal `/workspace`; the host
+    // root is `workspace_root()`, which may be overridden for host-side
+    // contract tests. Only an exact root match or a segment boundary
+    // ("/workspace/...") counts as inside: "/workspace2/x" must NOT alias.
+    let stripped = raw.strip_prefix(WORKSPACE);
     let inside = matches!(stripped, Some(rest) if rest.is_empty() || rest.starts_with('/'));
     let rel = if inside {
         stripped.unwrap().trim_start_matches('/')
@@ -55,8 +56,9 @@ pub fn guest_path(value: Option<&Value>, _directory: bool) -> io::Result<PathBuf
             "invalid guest path",
         ));
     }
-    let root = std::fs::canonicalize(Path::new(workspace))
-        .unwrap_or_else(|_| Path::new(workspace).to_path_buf());
+    let host_root = workspace_root();
+    let root = std::fs::canonicalize(Path::new(host_root))
+        .unwrap_or_else(|_| Path::new(host_root).to_path_buf());
     let path = root.join(rel);
     // Canonicalize the deepest *existing* ancestor and re-join the remainder
     // lexically. This lets callers create new subdirectories (write already

@@ -29,7 +29,21 @@ jobs:
           bash scripts/check-tests-folder.sh
           bash scripts/check-boundary.sh
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: |
+          set -uo pipefail
+          log=/tmp/fmt.log
+          set +e
+          cargo fmt --all -- --check 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cargo fmt 失败 rc=$rc（diff 尾部见注解）"
+            tail -c 2000 "$log" | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=ci-fmt '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
       - name: Clippy
         run: |
           set -uo pipefail
@@ -77,7 +91,26 @@ jobs:
             | awk -v t=ci-test '{print "::error title="t"-"NR"::"$0}'
           exit "$rc"
       - name: Documentation
-        run: RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
+        run: |
+          set -uo pipefail
+          log=/tmp/doc.log
+          set +e
+          RUSTDOCFLAGS='-D missing_docs -D warnings' \
+            cargo doc --workspace --all-features --lib --no-deps 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cargo doc 失败 rc=$rc（错误行与尾部见注解）"
+            {
+              grep -E '^error' "$log" | head -20 || true
+              echo "== tail =="
+              tail -c 1500 "$log"
+            } | tr '\r\n' '::' \
+              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
+              | LC_ALL=C fold -w 700 \
+              | awk -v t=ci-doc '{print "::error title="t"-"NR"::"$0}'
+            exit "$rc"
+          fi
 
   # SDK 全量验证：干净 debian:12 容器里从零装工具链，跑 Python/C#/Java 三套件
   # 的 build + tests（脚本内聚，见 sdk/e2e/debian-e2e.sh）。
@@ -193,6 +226,6 @@ jobs:
           path: |
             sdk-e2e-out/
             sdk/csharp/**/TestResults/
-            sdk/java/target/surefire-reports/
+            sdk/java/tests/target/surefire-reports/
           if-no-files-found: ignore
           retention-days: 7

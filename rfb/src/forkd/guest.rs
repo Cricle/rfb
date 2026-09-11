@@ -72,7 +72,13 @@ impl ForkdGuestClient {
     }
 
     /// Send a raw action JSON value and collect the response lines.
+    ///
+    /// The collected set is capped (aggregate bytes + line count) so a
+    /// hostile or broken guest streaming non-terminal lines cannot grow host
+    /// memory without bound; the loop otherwise ends only on a terminal key.
     pub async fn request(&self, action: Value) -> Result<Vec<Value>, ForkdGuestError> {
+        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_RESPONSE_LINES: usize = 65_536;
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
             .map_err(|_| timed_out("guest connect timeout"))??;
@@ -80,6 +86,7 @@ impl ForkdGuestClient {
         write_json(&mut write, &action, self.timeout).await?;
         let mut reader = BufReader::new(read);
         let mut responses = Vec::new();
+        let mut collected_bytes = 0usize;
         loop {
             let value = match read_json_line(&mut reader, self.timeout).await? {
                 Some(value) => value,
@@ -90,6 +97,12 @@ impl ForkdGuestClient {
                 }
             };
             check_remote_error(&value)?;
+            collected_bytes = collected_bytes.saturating_add(value.to_string().len());
+            if collected_bytes > MAX_RESPONSE_BYTES || responses.len() >= MAX_RESPONSE_LINES {
+                return Err(ForkdGuestError::Remote(
+                    "guest response exceeded limit".into(),
+                ));
+            }
             responses.push(value);
             if responses.last().is_some_and(|v| {
                 v.get("exit_code").is_some()

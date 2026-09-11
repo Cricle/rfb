@@ -827,3 +827,24 @@ fn web_bench_reads_api_key_env_from_config_and_requires_it() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn acceptance_require_provenance_requires_binding_inputs() {
+    // The provenance gate needs a binding to validate; without one the CLI
+    // must fail closed with the validation exit code (never silently skip).
+    let output = run(&[
+        "forkd",
+        "acceptance",
+        "--tag",
+        "snap",
+        "--require-provenance",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    // `--json` error envelopes go to stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("snapshot-bind"),
+        "stdout must name the missing binding: {stdout}"
+    );
+}

@@ -29,10 +29,14 @@ pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
     Ok(trimmed)
 }
 
-/// Validate a snapshot tag against the forkd naming constraint.
+/// Validate a snapshot tag against the forkd naming constraint. `.` and `..`
+/// are rejected: tags are joined into the snapshots root as directory names,
+/// so the dot entries would escape it.
 pub fn require_snapshot_tag(tag: &str) -> Result<&str, CliError> {
     let ok = !tag.is_empty()
         && tag.len() <= 128
+        && tag != "."
+        && tag != ".."
         && tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));

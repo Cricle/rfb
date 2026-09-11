@@ -88,12 +88,16 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
                 // process group before dropping the cancelled future so a timed
                 // out command cannot outlive the request.
                 terminate_id(child_id).await;
+                // PROTOCOL.md §2.4: the exec terminal shape is
+                // exit_code/stdout/stderr/timed_out — a timeout is a normal
+                // terminal outcome, NOT an `error` string (the host classifies
+                // any `error` as a fatal Remote failure and would never expose
+                // `timed_out`).
                 return Ok(json!({
                     "out": "",
                     "err": "process timeout",
                     "stdout": "",
                     "stderr": "process timeout",
-                    "error": "process timeout",
                     "exit_code": null,
                     "timed_out": true
                 }));

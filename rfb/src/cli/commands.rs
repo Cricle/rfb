@@ -527,6 +527,14 @@ pub struct ForkdGateArgs {
         help = "Require controller provenance and verified snapshot binding"
     )]
     pub require_provenance: bool,
+    /// Artifact manifest used to validate the snapshot binding; required with
+    /// `--require-provenance`.
+    #[arg(long)]
+    pub artifact_manifest: Option<PathBuf>,
+    /// Verified snapshot binding produced by `forkd snapshot-bind`; required
+    /// with `--require-provenance`.
+    #[arg(long)]
+    pub snapshot_binding: Option<PathBuf>,
 }
 
 /// Arguments for `rfb-cli forkd benchmark`.

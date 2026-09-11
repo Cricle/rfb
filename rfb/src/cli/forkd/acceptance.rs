@@ -13,19 +13,9 @@ use serde_json::{json, Value};
 
 /// Full acceptance gate: create a sandbox, exercise ping/stream/exec plus the
 /// structured filesystem RPCs and negative path validation, then destroy.
-pub async fn acceptance(
-    url: &str,
-    tag: &str,
-    require_vm: bool,
-    require_provenance: bool,
-) -> Result<Value, CliError> {
-    // Provenance is established by `snapshot-bind`; this acceptance endpoint
-    // has no binding path to inspect yet, so fail closed when requested.
-    if require_provenance {
-        return Err(validation(
-            "--require-provenance requires a verified snapshot binding; run forkd snapshot-bind first",
-        ));
-    }
+/// Provenance requirements are validated by the dispatcher
+/// (`--snapshot-binding` + `--artifact-manifest`) before this runs.
+pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value, CliError> {
     // Preflight is part of the gate: without a bootable snapshot the gate is a
     // hard BLOCKED when `require_vm` is set. Missing VM prerequisites carry the
     // documented exit-12 contract (`no_vm`), not the validation exit code.

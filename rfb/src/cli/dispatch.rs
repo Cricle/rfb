@@ -189,12 +189,29 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
         ForkdCommand::Acceptance(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::acceptance(
-                &url,
-                tag,
-                args.require_vm,
-                args.require_provenance,
-            ))?;
+            // Provenance gate: with --require-provenance a verified snapshot
+            // binding (paired with its artifact manifest) must validate before
+            // any VM work starts.
+            if args.require_provenance {
+                let Some(binding_path) = args.snapshot_binding.as_deref() else {
+                    return Err(validation(
+                        "--require-provenance requires --snapshot-binding (run forkd snapshot-bind first)",
+                    ));
+                };
+                let artifact = if let Some(path) = args.artifact_manifest.as_deref() {
+                    let artifact = image_build::ArtifactManifest::load(path)?;
+                    if artifact.backend != "forkd" {
+                        return Err(validation("artifact manifest backend must be forkd"));
+                    }
+                    Some(artifact)
+                } else {
+                    return Err(validation(
+                        "--require-provenance requires --artifact-manifest to validate artifact identity",
+                    ));
+                };
+                forkd::load_snapshot_binding(binding_path, tag, artifact.as_ref())?;
+            }
+            let value = block_on(forkd::acceptance(&url, tag, args.require_vm))?;
             render_output(json_out, value, "acceptance".to_owned());
             Ok(())
         }
@@ -350,12 +367,13 @@ fn run_target(json_out: bool, target: RunTarget) -> Result<(), CliError> {
         RunTarget::Forkd(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::acceptance(
-                &url,
-                tag,
-                args.require_vm,
-                args.require_provenance,
-            ))?;
+            if args.require_provenance {
+                // The thin wrapper has no binding inputs; keep it honest.
+                return Err(validation(
+                    "run forkd does not accept --require-provenance; use `forkd acceptance --snapshot-binding <path>`",
+                ));
+            }
+            let value = block_on(forkd::acceptance(&url, tag, args.require_vm))?;
             render_output(json_out, value, "acceptance".to_owned());
             Ok(())
         }

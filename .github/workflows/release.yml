@@ -161,7 +161,10 @@ jobs:
           chmod +x sdk/python-cli/rfb_cli/_bin/rfb-cli
           python -m build --wheel sdk/python-cli
           wheel_file=$(ls sdk/python-cli/dist/*.whl)
-          python -m wheel tags --platform-tag manylinux_2_39_x86_64 "$wheel_file"
+          # --remove：不带它 wheel tags 会同时留下原 py3-none-any wheel，
+          # 而 any-wheel 会把 linux-x64 二进制装到 mac/Windows 上（实测
+          # PyPI 0.0.1 曾同时出现两个文件）。
+          python -m wheel tags --remove --platform-tag manylinux_2_39_x86_64 "$wheel_file"
           mv sdk/python-cli/dist/*.whl dist-cli/
       - name: Skip publish if version already on PyPI (rfb-cli)
         id: pypi_cli_guard
@@ -322,8 +325,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          sdk_code=$(curl -s -o /dev/null -w "%{http_code}" "https://api.nuget.org/v3-flatcontainer/rfb.sdk/${VERSION}/rfb.sdk.${VERSION}.nupkg" || true)
-          cli_code=$(curl -s -o /dev/null -w "%{http_code}" "https://api.nuget.org/v3-flatcontainer/rfb.cli/${VERSION}/rfb.cli.${VERSION}.nupkg" || true)
+          # -L：flatcontainer 对部分网络出口返回 302 重定向，不带 -L 会把
+          # 已发布误判为未发布（重复 push 依赖 --skip-duplicate 兜底）。
+          sdk_code=$(curl -sL -o /dev/null -w "%{http_code}" "https://api.nuget.org/v3-flatcontainer/rfb.sdk/${VERSION}/rfb.sdk.${VERSION}.nupkg" || true)
+          cli_code=$(curl -sL -o /dev/null -w "%{http_code}" "https://api.nuget.org/v3-flatcontainer/rfb.cli/${VERSION}/rfb.cli.${VERSION}.nupkg" || true)
           echo "sdk_missing=$([ "$sdk_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "cli_missing=$([ "$cli_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Download CLI binary

@@ -11,6 +11,14 @@
 #   RFB_E2E_TAG=mytag bash rfb/tests/run-real.sh      # 指定快照 tag
 #   RFB_E2E_KEEP=1 bash rfb/tests/run-real.sh         # 失败后保留现场调试
 #
+# WSL2 已知限制（2026-09 实测）：部分 WSL2 内核/CPU 组合下，Firecracker
+# 快照 **恢复** 会触发 guest 内核 "Bad FPU state detected" →
+# "Kernel panic - not syncing: Fatal exception in interrupt"（PID 1 =
+# forkd-init.sh，console 见 child-*.console）。现象是所有 sandbox 的
+# guest agent 不可达（10.42.x.x ARP INCOMPLETE）。快照创建（全新 boot）
+# 不受影响。此类环境请以 GitHub KVM runner 的 e2e.yml 为准（那里 resume
+# 正常）；本脚本用于原生 Linux / 未受影响的 WSL2。
+#
 # 退出码（与 docs 的退出码表一致）：
 #   0   成功
 #   1   运行/清理阶段失败（先完成清理再退出）
@@ -141,15 +149,26 @@ else
   TAP_CREATED_BY_US=1
 fi
 
+# ---- 端口占用检查：绝不静默复用一个外来 controller。若 :8889 已有进程在
+# 监听，本轮 controller 会 bind 失败（错误只在它的 stdout 日志里），而
+# readiness 探测却会命中旧进程 —— 整轮 E2E 实际跑在陈旧栈上（实测后果：
+# 全部 sandbox 的 guest agent 不可达）。
+if curl -fsS "$FORKD_URL/v1/snapshots" >/dev/null 2>&1; then
+  die12 "已有进程在 $FORKD_URL 上监听：先停掉它（pkill -f forkd-controller）再跑；拒绝复用外来栈"
+fi
+
 # ---- forkd-controller：独立 state/audit/pid，snapshot root 指向默认快照目录
 # （provenance 测试会从 $HOME/.local/share/forkd/snapshots/<tag> 读取产物）。
+# 注意：controller 必须带 serve 子命令，--state 是 JSON 文件路径、--bind 是
+# 监听地址（与 e2e.yml 保持一致；裸 --state-dir/--listen 会被 clap 拒绝）。
 mkdir -p "$RUN_DIR/controller/state" "$SNAPSHOT_ROOT"
-log "启动 forkd-controller（state=$RUN_DIR/controller/state）"
-"$CONTROLLER_BIN" \
-  --state-dir "$RUN_DIR/controller/state" \
+log "启动 forkd-controller serve（state=$RUN_DIR/controller/state/state.json）"
+"$CONTROLLER_BIN" serve \
+  --state "$RUN_DIR/controller/state/state.json" \
   --audit-log "$RUN_DIR/controller/audit.log" \
   --snapshot-root "$SNAPSHOT_ROOT" \
-  --listen 127.0.0.1:8889 &
+  --bind 127.0.0.1:8889 \
+  > "$RUN_DIR/controller/stdout.log" 2>&1 &
 CONTROLLER_OURS=1
 echo $! > "$RUN_DIR/controller/pid"
 controller_up=0
@@ -161,8 +180,16 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [ "$controller_up" -ne 1 ]; then
-  log "controller 60s 未就绪，audit 日志："
+  log "controller 60s 未就绪，stdout/audit 日志："
+  tail -n 40 "$RUN_DIR/controller/stdout.log" 2>/dev/null || true
   tail -n 40 "$RUN_DIR/controller/audit.log" 2>/dev/null || true
+  exit 1
+fi
+# 就绪后复检：本轮 controller 进程必须还活着（端口竞态时它会 bind 失败退出，
+# 而 readiness 探测命中的是外来进程）。
+if ! kill -0 "$(cat "$RUN_DIR/controller/pid")" 2>/dev/null; then
+  log "本轮 controller 已退出（端口被占？）；stdout 日志："
+  tail -n 40 "$RUN_DIR/controller/stdout.log" 2>/dev/null || true
   exit 1
 fi
 log "controller 就绪（pid $(cat "$RUN_DIR/controller/pid")）"

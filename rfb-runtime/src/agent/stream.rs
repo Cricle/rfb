@@ -95,9 +95,10 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
                 // `done` is the host's terminal marker for a null exit_code;
                 // without it a null exit_code frame fails to decode on the
-                // host. No `err` key here: the host would deliver it as
-                // stderr output instead of a terminal frame.
-                write_json(writer, json!({"exit_code":null,"timed_out":true,"done":true,"error":"process timeout"})).await?;
+                // host. No `err`/`error` key here: the host would deliver a
+                // string `error` as a fatal Remote failure instead of the
+                // timeout terminal.
+                write_json(writer, json!({"exit_code":null,"timed_out":true,"done":true})).await?;
                 return Ok(());
             }
             status=child.wait()=>{
@@ -123,10 +124,22 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     terminate(&mut child).await;
                     let _ = child.wait().await;
                     drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true,"error":"stream input EOF"})).await?;
+                    // A client-side stdin EOF ends the session with a clean
+                    // terminal frame (no `error` key: the host turns any
+                    // string `error` into a fatal Remote failure).
+                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                     return Ok(());
                 }
-                if input.len()>MAX_LINE { terminate(&mut child).await; return Ok(()); }
+                if input.len() > MAX_LINE {
+                    // Oversized input line: kill the child and still emit the
+                    // terminal frame so the host session cannot hang until its
+                    // read timeout.
+                    terminate(&mut child).await;
+                    let _ = child.wait().await;
+                    drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
+                    return Ok(());
+                }
                 let v:Value=serde_json::from_slice(input.trim_ascii()).unwrap_or(Value::Null);
                 if v.get("action").and_then(Value::as_str)==Some("stop") {
                     terminate(&mut child).await;

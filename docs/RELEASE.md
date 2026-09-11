@@ -7,22 +7,23 @@
 
 | 工作流 | 触发 | 内容 |
 |---|---|---|
-| `ci.yml` | 全部 PR + 非 main 分支推送 | Rust 门禁（fmt/clippy/test/doc，`--all-features`，含边界检查）+ SDK 全量验证（debian:12 容器内 Python / C# / Java 三套件 build+tests） |
+| `ci.yml` | 全部 PR + 非 main 分支推送（+手动） | Rust 门禁（fmt/clippy/test/doc，`--all-features`，含边界检查）+ SDK 全量验证（debian:12 容器内 Python / C# / Java / Node.js 四套件 build+tests） |
 | `e2e.yml` | push main（+手动） | KVM 真机 E2E：构建 rfb-cli 与 forkd-agent rootfs → 起真实 forkd-controller → 建快照 → 跑全部 `#[ignore]` 真机测试（串行） |
-| `release.yml` | push `v*.*.*` tag | 四渠道发布 + GitHub Release（见下） |
+| `release.yml` | push `v*.*.*` tag | 五渠道发布 + GitHub Release（见下） |
 
 所有 workflow 的失败现场都通过 `::error::`/`::warning::` 注解带出
 （check-runs annotations 公开 API 可读），因为日志下载需要 token。
 
-## 2. 发布四渠道
+## 2. 发布五渠道
 
 | 渠道 | 产物 | 发布方式 |
 |---|---|---|
 | crates.io | `rfb-runtime` → `rfb-sdk` → `rfb-rig`（0.0.1） | `scripts/release.sh`：门禁（fmt/test/doc）+ 按依赖序逐个 `package`+`publish`，渠道间等待索引传播；`--token` CLI 直传凭据 |
-| PyPI | `rfb-sdk`（SDK 绑定）+ `rfb-cli`（仅 linux-x64 二进制 wheel，平台标签 `manylinux_2_39_x86_64`） | `python -m build` + twine；二进制来自 crates job 的 artifact |
+| PyPI | `rfb-sdk`（SDK 绑定）+ `rfb-cli`（仅 linux-x64 二进制 wheel，平台标签 `manylinux_2_39_x86_64`；构建用 `wheel tags --remove`，避免 any-wheel 把 ELF 带到 mac/Windows） | `python -m build` + twine；二进制来自 crates job 的 artifact |
 | Maven Central | `io.github.cricle:rfb-sdk` | GPG 签名 + central-publishing-maven-plugin（自动发布，等待 published） |
 | NuGet | `Rfb.Sdk`（SDK）+ `Rfb.Cli`（binary-only 包） | `dotnet pack` + `dotnet nuget push --skip-duplicate`；二进制同上来自 artifact |
-| GitHub Release | `rfb-<tag>.tar.gz`、`rfb-cli-linux-x64`、`SHA256SUMS` | crates job 构建并上传 rfb-cli artifact，pypi/nuget job 经 needs 下载后打包 |
+| npm | `rfb-sdk`（TypeScript SDK，构建+测试后发布）+ `rfb-cli`（仅二进制包，bin 入口直连 ELF） | `npm publish`（`NODE_AUTH_TOKEN`=NPM_KEY）；凭据必须是 **granular access token**：包权限 Read and write、范围 All packages、创建时勾选 bypass 2FA（classic/automation token 会被 npm 拒绝：403 EOTP） |
+| GitHub Release | `rfb-<tag>.tar.gz`、`rfb-cli-linux-x64`、`SHA256SUMS` | crates job 构建并上传 rfb-cli artifact，pypi/nuget/npm job 经 needs 下载后打包 |
 
 主 crate 发布名是 `rfb-sdk`（crates.io 裸名 `rfb` 被 2022 年的无关项目占用）；
 lib 名保持 `rfb`，`rfb-cli` 二进制不变。
@@ -52,6 +53,7 @@ lib 名保持 `rfb`，`rfb-cli` 二进制不变。
 | `GPG_PRIVATE_KEY` | armored 私钥全文（Maven Central 强制签名） |
 | `GPG_PASSPHRASE` | 私钥口令 |
 | `NUGET_KEY` | nuget.org API key |
+| `NPM_KEY` | npm **granular access token**（Read and write + All packages + bypass 2FA；npm 2025 起拒绝 classic/automation token 的 CI 发布） |
 
 ### 4.2 Maven namespace（一次性）
 

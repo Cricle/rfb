@@ -579,3 +579,536 @@ fn sha256_file(path: &std::path::Path) -> String {
     let bytes = std::fs::read(path).expect("read rootfs for digest");
     format!("{:x}", Sha256::digest(&bytes))
 }
+
+// ---------------------------------------------------------------------------
+// Guest-level success/failure matrix: per-op semantics against live sandboxes,
+// reusing the CI snapshot. Each test owns and reaps its sandboxes.
+// ---------------------------------------------------------------------------
+
+const CONTROLLER_URL: &str = "http://127.0.0.1:8889";
+
+/// Best-effort sandbox teardown on scope exit, even on panic. Lives at the
+/// sync level so its Drop can safely `block_on` outside any tokio runtime.
+struct SandboxGuard {
+    id: String,
+}
+
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        let _ = common::block_on(rfb::cli::forkd::destroy_sandbox(CONTROLLER_URL, &self.id));
+    }
+}
+
+/// Create one sandbox and wait for its guest agent. The leak-guard is
+/// installed BEFORE the readiness wait so a boot failure still destroys the
+/// sandbox instead of leaving it holding the shared tap (a leaked sandbox
+/// makes every later create fail with 503).
+fn spawn_guarded_sandbox(tag: &str) -> (rfb::forkd::SandboxInfo, SandboxGuard) {
+    let sandbox = common::block_on(async {
+        rfb::cli::forkd::create_sandbox(CONTROLLER_URL, tag, 1, None)
+            .await
+            .expect("sandbox create")
+            .into_iter()
+            .next()
+            .expect("sandbox")
+    });
+    let guard = SandboxGuard {
+        id: sandbox.id.clone(),
+    };
+    common::block_on(async {
+        rfb::cli::forkd::wait_for_guest_ready(&sandbox.guest_addr, Duration::from_secs(30))
+            .await
+            .expect("guest ready");
+    });
+    (sandbox, guard)
+}
+
+fn guest_exec(address: &str, args: &[&str], timeout_secs: u64) -> Value {
+    let args: Vec<&str> = args.to_vec();
+    common::block_on(rfb::cli::forkd::guest_call(
+        address,
+        serde_json::json!({
+            "action": "exec",
+            "cwd": "/workspace",
+            "timeout": timeout_secs,
+            "args": args,
+        }),
+        true,
+    ))
+    .expect("guest exec")
+}
+
+fn guest_eval(address: &str, code: &str) -> Value {
+    common::block_on(rfb::cli::forkd::guest_call(
+        address,
+        serde_json::json!({
+            "action": "eval",
+            "code": code,
+            "cwd": "/workspace",
+            "timeout": 10,
+        }),
+        true,
+    ))
+    .expect("guest eval")
+}
+
+fn json_bytes(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_u64().expect("byte in array") as u8)
+            .collect(),
+        Value::String(text) => text.as_bytes().to_vec(),
+        other => panic!("expected byte array or string, got {other}"),
+    }
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn guest_exec_streams_exit_codes_and_rejects_missing_binaries() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+
+    // stdout/stderr separation through a real shell.
+    let result = guest_exec(
+        &address,
+        &["/bin/sh", "-c", "echo out-line; echo err-line >&2"],
+        10,
+    );
+    assert_eq!(result["exit_code"], 0, "sh streams: {result}");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("out-line"),
+        "stdout must carry the stdout line: {result}"
+    );
+    assert!(
+        result["stderr"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("err-line"),
+        "stderr must carry the stderr line: {result}"
+    );
+    assert_eq!(result["timed_out"], false);
+
+    // Exit-code propagation.
+    let result = guest_exec(&address, &["/bin/sh", "-c", "exit 7"], 10);
+    assert_eq!(result["exit_code"], 7, "exit 7: {result}");
+    let result = guest_exec(&address, &["/bin/false"], 10);
+    assert_eq!(result["exit_code"], 1, "/bin/false: {result}");
+
+    // Missing binary is a surfaced error, not a hang or a fake success.
+    let error = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({
+            "action": "exec", "cwd": "/workspace", "timeout": 10,
+            "args": ["/no/such/binary-e2e"],
+        }),
+        true,
+    ));
+    assert!(error.is_err(), "missing binary must surface an error");
+
+    // The agent stays healthy after every failure above.
+    let result = guest_exec(&address, &["/bin/true"], 10);
+    assert_eq!(
+        result["exit_code"], 0,
+        "agent must survive failures: {result}"
+    );
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn guest_exec_timeout_kills_and_agent_recovers() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+
+    let started = std::time::Instant::now();
+    let result = guest_exec(&address, &["/bin/sleep", "30"], 2);
+    assert_eq!(result["timed_out"], true, "sleep must time out: {result}");
+    assert!(
+        result["exit_code"].is_null(),
+        "timeout has null exit_code: {result}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "timeout must not wait for the child: {started:?}"
+    );
+
+    // The agent must stay responsive (timeout killed only the child).
+    let result = guest_exec(&address, &["/bin/true"], 10);
+    assert_eq!(
+        result["exit_code"], 0,
+        "agent unhealthy after timeout: {result}"
+    );
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn guest_eval_runs_code_and_maps_failures() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+
+    let result = guest_eval(&address, "echo hello-eval");
+    assert_eq!(result["status"], 0, "eval success status: {result}");
+    let output = String::from_utf8_lossy(&json_bytes(&result["output"])).into_owned();
+    assert!(output.contains("hello-eval"), "eval output: {output:?}");
+
+    assert_eq!(guest_eval(&address, "exit 3")["status"], 3, "eval exit 3");
+    assert_eq!(
+        guest_eval(&address, "definitely-not-a-command-e2e")["status"],
+        127,
+        "eval unknown command maps to 127"
+    );
+    assert_eq!(
+        guest_eval(&address, "echo 'unterminated")["status"],
+        2,
+        "eval syntax error maps to 2"
+    );
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn guest_fs_binary_roundtrip_append_and_read_miss() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+    let path = "/workspace/.rfb-e2e-binary.bin";
+    let payload: Vec<u8> = (0..=255u8).collect();
+
+    let written = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "write", "path": path, "data": payload, "append": false}),
+        false,
+    ))
+    .expect("write payload");
+    assert_eq!(written["bytes_written"], 256, "write: {written}");
+
+    let read = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "read", "path": path, "max_bytes": 4096}),
+        false,
+    ))
+    .expect("read payload");
+    assert_eq!(json_bytes(&read["data"]), payload, "binary roundtrip");
+    assert_eq!(read["truncated"], false);
+    assert_eq!(read["total_bytes"], 256);
+
+    // Offset + bounded read.
+    let sliced = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "read", "path": path, "offset": 10, "max_bytes": 5}),
+        false,
+    ))
+    .expect("read slice");
+    assert_eq!(
+        json_bytes(&sliced["data"]),
+        payload[10..15].to_vec(),
+        "offset slice"
+    );
+    assert_eq!(sliced["truncated"], true, "slice must report truncation");
+
+    // Append grows the file.
+    let appended = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "write", "path": path, "data": [1, 2], "append": true}),
+        false,
+    ))
+    .expect("append");
+    assert_eq!(appended["bytes_written"], 2);
+    let read = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "read", "path": path, "max_bytes": 4096}),
+        false,
+    ))
+    .expect("read after append");
+    assert_eq!(
+        read["total_bytes"], 258,
+        "append must grow the file: {read}"
+    );
+
+    // Missing file is a surfaced error.
+    let missing = common::block_on(rfb::cli::forkd::guest_call(
+        &address,
+        serde_json::json!({"action": "read", "path": "/workspace/.rfb-e2e-missing.bin"}),
+        false,
+    ));
+    assert!(missing.is_err(), "reading a missing file must fail");
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+
+    // Happy path: started → output → exit(0).
+    let (stdout, stderr, exit_code) = common::block_on(async {
+        use rfb::forkd_guest::ForkdGuestClient;
+        let mut stream = ForkdGuestClient::new(address.clone())
+            .stream(
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo stream-out; echo stream-err >&2".into(),
+                ],
+                Some("/workspace"),
+                None,
+                None,
+            )
+            .await
+            .expect("open stream");
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let exit_code = loop {
+            match stream.next_event().await.expect("stream event") {
+                Some(value) => {
+                    if let Some(code) = value.get("exit_code") {
+                        break code.as_i64();
+                    }
+                    if let Some(out) = value.get("out").and_then(Value::as_str) {
+                        stdout.push_str(out);
+                    }
+                    if let Some(err) = value.get("err").and_then(Value::as_str) {
+                        stderr.push_str(err);
+                    }
+                }
+                None => panic!("stream closed before exit"),
+            }
+        };
+        (stdout, stderr, exit_code)
+    });
+    assert_eq!(exit_code, Some(0), "stream exit code");
+    assert!(stdout.contains("stream-out"), "stream stdout: {stdout:?}");
+    assert!(stderr.contains("stream-err"), "stream stderr: {stderr:?}");
+
+    // stop: kills a long-running child and yields a terminal frame; idempotent.
+    common::block_on(async {
+        use rfb::forkd_guest::ForkdGuestClient;
+        let mut stream = ForkdGuestClient::new(address.clone())
+            .stream(
+                vec!["/bin/sleep".into(), "30".into()],
+                Some("/workspace"),
+                None,
+                None,
+            )
+            .await
+            .expect("open sleep stream");
+        let started = std::time::Instant::now();
+        stream.stop().await.expect("stop");
+        stream.stop().await.expect("second stop is idempotent");
+        let mut terminal = false;
+        while let Some(value) = stream.next_event().await.expect("event after stop") {
+            if value.get("exit_code").is_some() {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(terminal, "stop must produce a terminal frame");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "stop must not wait for the child"
+        );
+    });
+
+    // pty is explicitly rejected (never silently degraded).
+    let pty_error = common::block_on(async {
+        use rfb::forkd_guest::ForkdGuestClient;
+        let mut stream = ForkdGuestClient::new(address.clone())
+            .stream(vec!["/bin/true".into()], None, Some(true), None)
+            .await
+            .expect("open pty stream");
+        loop {
+            match stream.next_event().await {
+                Ok(Some(value)) => {
+                    if value.get("exit_code").is_some() {
+                        return None;
+                    }
+                }
+                Ok(None) => return None,
+                Err(error) => return Some(error.to_string()),
+            }
+        }
+    });
+    let pty_error = pty_error.expect("pty request must be rejected");
+    assert!(pty_error.contains("pty"), "pty error message: {pty_error}");
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn sandbox_create_rejects_invalid_and_unknown_tags() {
+    common::require_real();
+    common::block_on(async {
+        let invalid = rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "bad/tag!", 1, None).await;
+        assert!(invalid.is_err(), "path-like tag must be rejected");
+        let unknown =
+            rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "rfb-e2e-no-such-tag-xyz", 1, None)
+                .await;
+        assert!(unknown.is_err(), "unknown snapshot tag must be rejected");
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn sandbox_delete_is_idempotent_and_guest_dies() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+    let (sandbox, _guard) = spawn_guarded_sandbox(&tag);
+    let address = sandbox.guest_addr.clone();
+    let id = sandbox.id.clone();
+
+    common::block_on(async {
+        assert!(
+            rfb::cli::forkd::ping_sandbox(CONTROLLER_URL, &id)
+                .await
+                .is_ok(),
+            "controller ping before delete"
+        );
+        rfb::cli::forkd::destroy_sandbox(CONTROLLER_URL, &id)
+            .await
+            .expect("destroy");
+        rfb::cli::forkd::destroy_sandbox(CONTROLLER_URL, &id)
+            .await
+            .expect("double delete is idempotent");
+
+        // The guest is truly gone, not just unregistered.
+        let ping =
+            rfb::cli::forkd::guest_call(&address, serde_json::json!({"action":"ping"}), false)
+                .await;
+        assert!(ping.is_err(), "guest must be unreachable after delete");
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn wait_for_guest_ready_rejects_bad_address_and_times_out() {
+    common::require_real();
+    common::block_on(async {
+        let empty = rfb::cli::forkd::wait_for_guest_ready("", Duration::from_secs(2)).await;
+        assert!(empty.is_err(), "empty guest address must be rejected");
+
+        let started = std::time::Instant::now();
+        let dead =
+            rfb::cli::forkd::wait_for_guest_ready("127.0.0.1:1", Duration::from_secs(2)).await;
+        let error = dead.expect_err("closed port must never become ready");
+        assert!(
+            error.message.contains("not ready"),
+            "dead-port error must name the readiness failure: {error:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "must respect the deadline"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn shared_tap_rejects_multi_spawn_and_sequential_sandboxes_are_isolated() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+
+    // Design contract for the shared host tap: n>1 is rejected with an
+    // actionable error (per_child_netns=true is the documented alternative).
+    let error = common::block_on(rfb::cli::forkd::create_sandbox(
+        CONTROLLER_URL,
+        &tag,
+        2,
+        None,
+    ))
+    .expect_err("n>1 on the shared tap must be rejected");
+    assert!(
+        error.message.contains("n>1") || error.message.contains("per_child_netns"),
+        "multi-spawn error must be actionable: {error:?}"
+    );
+
+    // Sequential single spawns work, and /workspace state is per-sandbox: a
+    // file written in the first sandbox is invisible in the second.
+    let marker = "isolated-payload";
+    let (first, first_guard) = spawn_guarded_sandbox(&tag);
+    common::block_on(async {
+        rfb::cli::forkd::guest_call(
+            &first.guest_addr,
+            serde_json::json!({"action":"write","path":"/workspace/iso.txt","data":marker}),
+            false,
+        )
+        .await
+        .expect("write in first sandbox");
+        let read = rfb::cli::forkd::guest_call(
+            &first.guest_addr,
+            serde_json::json!({"action":"read","path":"/workspace/iso.txt"}),
+            false,
+        )
+        .await
+        .expect("read back in first sandbox");
+        let data: Vec<u8> = serde_json::from_value(read["data"].clone()).expect("byte array data");
+        assert_eq!(data, marker.as_bytes(), "first sandbox keeps its own file");
+    });
+    let first_id = first.id.clone();
+    drop(first_guard);
+
+    // Wait until the controller reaped the first sandbox (its teardown frees
+    // the shared tap for the next spawn).
+    let reaped = common::block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = rfb::cli::forkd::list_sandboxes(CONTROLLER_URL)
+                .await
+                .expect("list");
+            if !remaining.iter().any(|sandbox| sandbox.id == first_id) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    assert!(
+        reaped,
+        "first sandbox must be reaped before the second spawn"
+    );
+
+    let (second, _second_guard) = spawn_guarded_sandbox(&tag);
+    common::block_on(async {
+        let read = rfb::cli::forkd::guest_call(
+            &second.guest_addr,
+            serde_json::json!({"action":"read","path":"/workspace/iso.txt"}),
+            false,
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "second sandbox must not see the first's file"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn cli_snapshot_info_rejects_invalid_tag_with_validation_exit() {
+    common::require_real();
+    let out = common::run(
+        common::cli().args(["forkd", "snapshot-info", "--tag", "bad/tag!", "--json"]),
+        Duration::from_secs(60),
+        "snapshot-info invalid tag",
+    );
+    assert_eq!(
+        out.code,
+        common::EXIT_VALIDATION,
+        "invalid tag must exit 3: {} / {}",
+        out.stdout,
+        out.stderr
+    );
+    let value = common::parse_json(&out, "snapshot-info invalid tag");
+    assert_eq!(value["error"]["code"], common::EXIT_VALIDATION);
+}

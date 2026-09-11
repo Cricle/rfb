@@ -314,15 +314,18 @@ pub fn build_rootfs(
     let mut content_bytes = fs::metadata(runtime_bin)
         .map_err(|error| io(error.to_string()))?
         .len();
+    // /bin/sh (rfb-busybox) installs in every image mode.
+    if let Some(parent) = runtime_bin.parent() {
+        content_bytes += fs::metadata(parent.join("rfb-busybox"))
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+    }
     if zbrt {
-        // The multi-call applets and (when present) the static busybox are
-        // installed alongside the runtime binary. Interpreter hardlinks add
-        // zero bytes; site-package trees are real content.
+        // The multi-call applets are installed alongside the runtime binary.
+        // Interpreter hardlinks add zero bytes; site-package trees are real
+        // content.
         if let Some(parent) = runtime_bin.parent() {
             content_bytes += fs::metadata(parent.join("rfb-mini-tools"))
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            content_bytes += fs::metadata(parent.join("rfb-busybox"))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
         }
@@ -379,9 +382,8 @@ pub fn build_rootfs(
             run_debugfs(&image_path, &format!("mkdir /{d}"), false)?;
         }
     }
-    // A static busybox (when staged next to the runtime binary) becomes
-    // /bin/sh plus hardlinked applets, so guest shells and shell-string
-    // commands work in every image mode.
+    // rfb-busybox becomes /bin/sh plus hardlinked applets, so guest shells
+    // and shell-string commands (eval, exec) work in every image mode.
     let busybox_src = runtime_bin
         .parent()
         .map(|parent| parent.join("rfb-busybox"));
@@ -400,14 +402,11 @@ pub fn build_rootfs(
         )?;
         run_debugfs(&image_path, "set_inode_field /bin/sh mode 0100755", false)?;
         // Hardlinked multi-call entry points (same inode, zero extra image
-        // bytes): mcp_bash distillation pipelines lean on these log-processing
-        // applets (grep/awk/sed/sort/…), so hardlink them alongside the
-        // coreutils set.
-        for applet in [
-            "bash", "ls", "pwd", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ps", "whoami", "id",
-            "head", "tail", "wc", "grep", "find", "sleep", "env", "awk", "sed", "sort", "uniq",
-            "cut", "tr", "xargs",
-        ] {
+        // bytes): `bash` is the same shell under its alternative name and
+        // `sleep` the one coreutil the timeout/eval contracts exercise.
+        // Unimplemented applet names stay absent rather than
+        // present-but-broken.
+        for applet in ["bash", "sleep"] {
             run_debugfs(&image_path, &format!("ln /bin/sh /bin/{applet}"), false)?;
         }
     }
