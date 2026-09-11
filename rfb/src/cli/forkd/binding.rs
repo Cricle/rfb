@@ -136,7 +136,7 @@ pub fn typed_provenance_diagnostics(p: Option<&Value>, a: &ArtifactManifest) -> 
     if v.vcpu_count != Some(a.vm.cpus as u64) {
         out.push("vcpu_count: mismatch or missing".into());
     }
-    if v.memory_bytes != Some(a.vm.memory_bytes) {
+    if a.vm.memory_bytes != 0 && v.memory_bytes != Some(a.vm.memory_bytes) {
         out.push("memory_bytes: mismatch or missing".into());
     }
     if v.network != Some(a.snapshot.as_ref().map(|x| x.network).unwrap_or(false)) {
@@ -488,7 +488,7 @@ pub async fn snapshot_bind(
                 .and_then(|x| x.vmstate_sha256.as_ref()),
         )
         && matches_u64("vcpu_count", artifact.vm.cpus as u64)
-        && matches_u64("memory_bytes", artifact.vm.memory_bytes)
+        && (artifact.vm.memory_bytes == 0 || matches_u64("memory_bytes", artifact.vm.memory_bytes))
         && matches_bool(
             "network",
             artifact

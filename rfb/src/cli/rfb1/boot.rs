@@ -203,7 +203,6 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
     // config, vsock, then InstanceStart.
     let mut boot_args = rfb_runtime::boot_args::BootArgs::new()
         .random_trust_cpu()
-        .root_rw("/dev/vda")
         .init(init_path);
     if vsock_flag_present {
         boot_args = boot_args.vsock();
@@ -223,7 +222,7 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
             "drive_id": "rootfs",
             "path_on_host": rootfs.to_string_lossy(),
             "is_root_device": true,
-            "is_read_only": false,
+            "is_read_only": true,
         }),
     )?;
     api_put(

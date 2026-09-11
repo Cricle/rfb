@@ -46,10 +46,10 @@ jobs:
     steps:
       # fetch-depth 0：release.sh 用 git describe --tags --exact-match 校验
       # tag 与 workspace 版本一致，浅克隆拿不到 tag 会导致发布误判失败。
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
       - name: Validate tag matches workspace version
         env:
           TAG: ${{ github.ref_name }}
@@ -94,7 +94,7 @@ jobs:
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-cli-linux-x64" >> dist/SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           files: |
             dist/rfb-${{ github.ref_name }}.tar.gz
@@ -104,7 +104,7 @@ jobs:
       # CLI 二进制供 npm / nuget job 打包（rfb-cli / Rfb.Cli；两者都是
       # 仅清单 + 二进制的包，不含任何包装代码）。
       - name: Upload CLI binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rfb-cli-linux-x64
           path: dist/rfb-cli
@@ -115,10 +115,16 @@ jobs:
     name: Publish rfb-sdk to PyPI
     needs: crates
     runs-on: ubuntu-latest
+    # OIDC trusted publishing：首次发布前需在
+    # https://pypi.org/manage/project/rfb-sdk/settings/ 启用
+    # "Trusted Publishing"（信任本仓库的当前名字和工作流）；配置完成后可撤回
+    # PYPI_KEY secret。配置前发布会因 OIDC 凭据无效而失败。
+    permissions:
+      id-token: write
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
       - name: Build sdist and wheel
@@ -152,10 +158,10 @@ jobs:
           fi
       - name: Publish rfb-sdk to PyPI
         if: steps.pypi_guard.outputs.exists != 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
         with:
           packages-dir: sdk/python/dist
-          password: ${{ secrets.PYPI_KEY }}
+          trusted-publishing: true
 
   maven:
     name: Publish rfb-sdk to Maven Central
@@ -165,8 +171,8 @@ jobs:
     env:
       HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
@@ -283,8 +289,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: '8.0.x'
       # 重跑保护：已上架的包跳过 pack/push。
@@ -301,7 +307,7 @@ jobs:
           echo "cli_missing=$([ "$cli_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Download CLI binary
         if: steps.nuget_guard.outputs.cli_missing == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rfb-cli-linux-x64
           path: rfb-cli-bin
@@ -351,10 +357,13 @@ jobs:
     name: Publish rfb-sdk + rfb-cli to npm
     needs: crates
     runs-on: ubuntu-latest
+    # --provenance 需要 id-token write 权限（生成 npm 的 Sigstore 签名）。
+    permissions:
+      id-token: write
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -385,7 +394,7 @@ jobs:
             cd sdk/nodejs
             npm ci --no-audit --no-fund
             npm test
-            npm publish
+            npm publish --provenance
           } 2>&1 | tee "$log"
           rc=$?
           set -e
@@ -398,7 +407,7 @@ jobs:
       # rfb-cli：仅二进制的 npm 包（linux-x64 原生二进制 + bin 入口，无 JS 包装）。
       - name: Download CLI binary
         if: steps.npm_guard.outputs.cli_missing == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rfb-cli-linux-x64
           path: dist-cli/raw
@@ -447,7 +456,7 @@ jobs:
           set +e
           # `./` 前缀强制目录语义：不带它 npm 会把 dist/npm-cli 当 GitHub 简写
           # （owner/repo）解析并去 git ls-remote（实测 rc=128）。
-          npm publish ./dist/npm-cli 2>&1 | tee "$log"
+          npm publish ./dist/npm-cli --provenance 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then

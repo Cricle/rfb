@@ -254,7 +254,7 @@ impl ArtifactManifest {
         mode: &str,
         entrypoint: &str,
         protocol: &str,
-        size_mb: u64,
+        _size_mb: u64,
     ) -> Result<Self, CliError> {
         let (backend, profile, transport) = match mode {
             "forkd-agent" => ("forkd", "forkd-agent-tcp", "tcp"),
@@ -279,7 +279,11 @@ impl ArtifactManifest {
             firecracker: None,
             vm: ArtifactVm {
                 cpus: 1,
-                memory_bytes: size_mb * 1024 * 1024,
+                // A rootfs artifact has no VM memory to report. Setting
+                // memory_bytes to 0 makes the provenance identity skip the
+                // memory comparison, so --require-provenance does not
+                // permanently reject CLI-built rootfs artifacts.
+                memory_bytes: 0,
             },
             snapshot: None,
         })
