@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # 冷启动全特性编译（rustpython/mlua）约 8-12 分钟；rust-cache 复用
       # registry 与 target，key 跟随 Cargo.lock。
@@ -182,7 +182,7 @@ jobs:
           fi
           git --version
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 依赖安装（apt：python3/libicu/maven 等；dotnet：官方安装脚本）与三个
       # 套件的执行全部内聚在脚本内。容器默认即 root，无需 sudo。
