@@ -177,11 +177,17 @@ export class ZbrtConnection {
   async #cancelRoundTrip(reason: string | null, target16: Buffer | null): Promise<ZbrtFrame> {
     const id = this.newRequestId();
     await this.#writeFrame(new ZbrtFrame(KIND_CANCEL, 0, id, codec.encodeCancel(reason, target16)));
-    const frame = await this.#reader?.next();
-    if (!frame) throw new TransportError('connection closed by guest');
-    if (frame.kind === KIND_CANCEL_ACK) return frame;
-    if (frame.kind === KIND_ERROR) throw this.errorFromFrame(frame);
-    throw this.unexpectedFrame(frame, 'CancelAck');
+    // The guest may emit straggler Output/Exit frames for the cancelled turn
+    // before the CancelAck; skip them and keep reading until the ack instead
+    // of failing the decode (mirrors the Python reference's wait-for-ack).
+    while (true) {
+      const frame = await this.#reader?.next();
+      if (!frame) throw new TransportError('connection closed by guest');
+      if (frame.kind === KIND_CANCEL_ACK) return frame;
+      if (frame.kind === KIND_ERROR) throw this.errorFromFrame(frame);
+      if (frame.kind === KIND_OUTPUT || frame.kind === KIND_EXIT) continue;
+      throw this.unexpectedFrame(frame, 'CancelAck');
+    }
   }
 
   /** Optional Hello handshake; the guest is auto-ready without it. */

@@ -139,7 +139,9 @@ public sealed class RfbClient
         switch (sandboxOrId)
         {
             case Sandbox existing:
-                return new Sandbox(this, existing.Info, transport, _timeout);
+                // Attach as-is: an existing handle keeps its transport instead
+                // of being silently reset to the default.
+                return existing;
             case string id:
                 {
                     GuestValidation.Id(id);

@@ -216,7 +216,11 @@ export class Sandbox {
       max_results: validation.MAX_GUEST_RESULTS,
     });
     this.#checkResultSize(last);
-    return (last.entries ?? []).map((entry: Record<string, unknown>) => ({
+    const entries = last.entries;
+    if (!Array.isArray(entries)) {
+      throw new DecodeError('guest response is missing entries');
+    }
+    return entries.map((entry: Record<string, unknown>) => ({
       name: String(entry.name ?? ''),
       isDir: entry.is_dir === true,
       size: typeof entry.size === 'number' ? entry.size : null,
@@ -232,7 +236,11 @@ export class Sandbox {
       pattern,
     });
     this.#checkResultSize(last);
-    return (last.matches ?? []).map((match: unknown) => String(match));
+    const matches = last.matches;
+    if (!Array.isArray(matches)) {
+      throw new DecodeError('guest response is missing matches');
+    }
+    return matches.map((match: unknown) => String(match));
   }
 
   /** Grep file contents; matches carry path/line/column/text. */
@@ -245,7 +253,11 @@ export class Sandbox {
       max_bytes: validation.MAX_GUEST_RESULT_BYTES,
     });
     this.#checkResultSize(last);
-    return (last.matches ?? []).map((match: Record<string, unknown>) => ({
+    const matches = last.matches;
+    if (!Array.isArray(matches)) {
+      throw new DecodeError('guest response is missing matches');
+    }
+    return matches.map((match: Record<string, unknown>) => ({
       path: String(match.path ?? ''),
       line: typeof match.line === 'number' ? match.line : null,
       column: typeof match.column === 'number' ? match.column : null,
@@ -291,7 +303,10 @@ export class Sandbox {
       try {
         const payload = await conn.fs(5, path, Buffer.from(JSON.stringify({ data: [...bytes], append: options.append ?? false, mode: null }), 'utf8'));
         const last = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
-        return typeof last.bytes_written === 'number' ? last.bytes_written : 0;
+        if (typeof last.bytes_written !== 'number') {
+          throw new DecodeError('guest response is missing bytes_written');
+        }
+        return last.bytes_written;
       } finally {
         conn.close();
       }
@@ -302,7 +317,10 @@ export class Sandbox {
       data: [...bytes],
       append: options.append ?? false,
     });
-    return typeof last.bytes_written === 'number' ? last.bytes_written : 0;
+    if (typeof last.bytes_written !== 'number') {
+      throw new DecodeError('guest response is missing bytes_written');
+    }
+    return last.bytes_written;
   }
 
   /** Interactive stream over the sandbox transport. */

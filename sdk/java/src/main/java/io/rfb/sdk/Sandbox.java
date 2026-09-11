@@ -126,7 +126,9 @@ public final class Sandbox {
             throw new ValidationError("exec timeout must be a positive, finite number of seconds");
         }
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
-            long timeoutMs = (long) (timeoutS * 1000);
+            // The ZBRT deadline travels as whole seconds (ceil), not
+            // truncated milliseconds.
+            long timeoutMs = (long) Math.ceil(timeoutS) * 1000;
             try (ZbrtConnection conn = openZbrt()) {
                 ZbrtConnection.Exec exec = conn.execute(args, cwd, stdin, timeoutMs);
                 return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
@@ -216,8 +218,12 @@ public final class Sandbox {
     public List<DirEntry> ls(String path) {
         Validation.fsPath(path);
         JsonNode node = toolOrFs(1, path, Json.object().put("max_results", Validation.MAX_GUEST_RESULTS));
+        JsonNode entriesNode = node.get("entries");
+        if (entriesNode == null || !entriesNode.isArray()) {
+            throw new DecodeError("guest response is missing entries");
+        }
         List<DirEntry> entries = new ArrayList<>();
-        for (JsonNode entry : node.path("entries")) {
+        for (JsonNode entry : entriesNode) {
             entries.add(new DirEntry(
                     entry.path("name").asText(""),
                     entry.path("is_dir").asBoolean(false),
@@ -237,8 +243,12 @@ public final class Sandbox {
         JsonNode node = toolOrFs(2, path, Json.object()
                 .put("max_results", Validation.MAX_GUEST_RESULTS)
                 .put("pattern", pattern));
+        JsonNode matchesNode = node.get("matches");
+        if (matchesNode == null || !matchesNode.isArray()) {
+            throw new DecodeError("guest response is missing matches");
+        }
         List<String> matches = new ArrayList<>();
-        for (JsonNode match : node.path("matches")) {
+        for (JsonNode match : matchesNode) {
             matches.add(match.asText());
         }
         return matches;
@@ -256,8 +266,12 @@ public final class Sandbox {
                 .put("max_results", Validation.MAX_GUEST_RESULTS)
                 .put("pattern", pattern)
                 .put("max_bytes", Validation.MAX_GUEST_RESULT_BYTES));
+        JsonNode matchesNode = node.get("matches");
+        if (matchesNode == null || !matchesNode.isArray()) {
+            throw new DecodeError("guest response is missing matches");
+        }
         List<GrepMatch> matches = new ArrayList<>();
-        for (JsonNode match : node.path("matches")) {
+        for (JsonNode match : matchesNode) {
             matches.add(new GrepMatch(
                     match.path("path").asText(""),
                     match.hasNonNull("line") ? match.get("line").asLong() : null,
@@ -319,7 +333,11 @@ public final class Sandbox {
             args.set("data", Json.bytesNode(bytes));
             args.put("append", append);
             args.put("mode", mode);
-            return zbrtFs(5, path, args).path("bytes_written").asInt(0);
+            JsonNode written = zbrtFs(5, path, args);
+            if (!written.hasNonNull("bytes_written")) {
+                throw new DecodeError("guest response is missing bytes_written");
+            }
+            return written.get("bytes_written").asInt();
         }
         ObjectNode args = Json.object()
                 .put("append", append);
@@ -331,7 +349,11 @@ public final class Sandbox {
                 .put("action", "write")
                 .put("path", path);
         action.setAll(args);
-        return (int) toolRequest(action).path("bytes_written").asLong(0);
+        JsonNode written = toolRequest(action);
+        if (!written.hasNonNull("bytes_written")) {
+            throw new DecodeError("guest response is missing bytes_written");
+        }
+        return (int) written.get("bytes_written").asLong();
     }
 
     // ---- stream ----------------------------------------------------------

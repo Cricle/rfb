@@ -51,7 +51,9 @@ internal sealed class NdjsonLineReader
                     _start = nl + 1;
                     if (_line.Length > ForkdGuestNdjson.MaxLineBytes)
                     {
-                        throw new TransportException($"guest response exceeded {ForkdGuestNdjson.MaxLineBytes} bytes");
+                        // An oversized line is a decode failure, not a transport
+                        // failure (Python/Java classify it the same).
+                        throw new DecodeException($"guest response exceeded {ForkdGuestNdjson.MaxLineBytes} bytes");
                     }
 
                     var line = Trim(_line);
@@ -69,7 +71,9 @@ internal sealed class NdjsonLineReader
                     _line.Write(_pending, _start, _end - _start);
                     if (_line.Length > ForkdGuestNdjson.MaxLineBytes)
                     {
-                        throw new TransportException($"guest response exceeded {ForkdGuestNdjson.MaxLineBytes} bytes");
+                        // An oversized line is a decode failure, not a transport
+                        // failure (Python/Java classify it the same).
+                        throw new DecodeException($"guest response exceeded {ForkdGuestNdjson.MaxLineBytes} bytes");
                     }
                 }
 
@@ -81,7 +85,7 @@ internal sealed class NdjsonLineReader
                 {
                     if (_line.Length > 0)
                     {
-                        throw new TransportException("guest connection closed mid-line");
+                        throw new DecodeException("guest connection closed mid-line");
                     }
 
                     return null; // clean EOF

@@ -382,9 +382,10 @@ internal sealed class ZbrtStreamSession
         throw new RemoteException("guest stream does not support stdin over zbrt transport");
     }
 
-    /// <summary>Idempotent stop: send Cancel (reason "stop") targeting this request.
-    /// The eventual CancelAck is skipped by NextEventAsync and the terminal Exit
-    /// event is delivered there, mirroring the Rust/Python/Java baseline.</summary>
+    /// <summary>Idempotent stop: send Cancel (reason "stop") targeting this request
+    /// and await the CancelAck. Straggler Output/Exit frames for the cancelled
+    /// turn are skipped while waiting, mirroring the Python/Java baselines; the
+    /// caller's next NextEventAsync still delivers the terminal Exit.</summary>
     public async Task StopAsync()
     {
         if (_terminal || _stopped)
@@ -396,5 +397,36 @@ internal sealed class ZbrtStreamSession
         var payload = ZbrtFrameCodec.EncodeCancel("stop", _requestId);
         var cancel = new ZbrtFrame { Kind = ZbrtKind.Cancel, RequestId = _requestId, Payload = payload };
         await _client.WriteFrameAsync(cancel);
+        while (true)
+        {
+            ZbrtFrame frame;
+            try
+            {
+                frame = await _client.ReadFrameAsync();
+            }
+            catch (TransportException e) when (e.Message == "guest closed connection")
+            {
+                // Clean close: the stream is over; the ack will never arrive.
+                return;
+            }
+
+            if (frame.Kind == ZbrtKind.CancelAck)
+            {
+                return;
+            }
+
+            if (frame.Kind == ZbrtKind.Error)
+            {
+                var (_, message) = ZbrtFrameCodec.DecodeError(frame.Payload);
+                throw new RemoteException(message);
+            }
+
+            if (frame.Kind == ZbrtKind.Output || frame.Kind == ZbrtKind.Exit)
+            {
+                continue;
+            }
+
+            throw new DecodeException($"expected CancelAck, got frame kind {(int)frame.Kind}");
+        }
     }
 }

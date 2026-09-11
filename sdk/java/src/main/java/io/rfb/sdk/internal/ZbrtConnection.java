@@ -111,8 +111,7 @@ public final class ZbrtConnection implements AutoCloseable {
         if (target16 != null && target16.length != 16) {
             throw new DecodeError("cancel target must be 16 bytes");
         }
-        ZbrtFrame frame = roundTrip(ZbrtFrame.KIND_CANCEL,
-                ZbrtCodec.encodeCancel(reason, target16), ZbrtFrame.KIND_CANCEL_ACK, "CancelAck");
+        ZbrtFrame frame = cancelRoundTrip(reason, target16);
         if (frame.payload().length != 0) {
             throw new DecodeError("CancelAck payload must be empty");
         }
@@ -283,8 +282,31 @@ public final class ZbrtConnection implements AutoCloseable {
     // ---- plumbing --------------------------------------------------------
 
     private void sendCancel(String reason, byte[] target16) {
-        roundTrip(ZbrtFrame.KIND_CANCEL, ZbrtCodec.encodeCancel(reason, target16),
-                ZbrtFrame.KIND_CANCEL_ACK, "CancelAck");
+        cancelRoundTrip(reason, target16);
+    }
+
+    /**
+     * Send Cancel and wait for the CancelAck. The guest may emit straggler
+     * Output/Exit frames for the cancelled turn before the ack; they are
+     * skipped instead of failing the decode (mirrors the Python reference).
+     */
+    private ZbrtFrame cancelRoundTrip(String reason, byte[] target16) {
+        byte[] id = newRequestId();
+        writeFrame(new ZbrtFrame(ZbrtFrame.KIND_CANCEL, 0, id,
+                ZbrtCodec.encodeCancel(reason, target16)));
+        while (true) {
+            ZbrtFrame frame = readReply(id);
+            if (frame.kind() == ZbrtFrame.KIND_CANCEL_ACK) {
+                return frame;
+            }
+            if (frame.kind() == ZbrtFrame.KIND_ERROR) {
+                throw errorFrame(frame);
+            }
+            if (frame.kind() == ZbrtFrame.KIND_OUTPUT || frame.kind() == ZbrtFrame.KIND_EXIT) {
+                continue;
+            }
+            throw unexpected(frame, "CancelAck");
+        }
     }
 
     /**

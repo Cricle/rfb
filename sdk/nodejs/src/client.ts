@@ -27,6 +27,16 @@ export interface SnapshotSummary {
 export interface CreateSandboxOptions {
   n?: number;
   transport?: string;
+  /** Isolated network namespace per child (default false, shared tap). */
+  perChildNetns?: boolean;
+  /** Memory cap for each child in MiB (null = controller default). */
+  memoryLimitMib?: number | null;
+  /** Prewarm throwaway children (default false). */
+  prewarm?: boolean;
+  /** Live-fork from a running parent (default false). */
+  liveFork?: boolean;
+  /** Back children with hugepages (default false). */
+  hugepages?: boolean;
 }
 
 function envUrl(): string {
@@ -116,6 +126,11 @@ export class RfbClient {
     return JSON.parse(this.#expectOk(await this.#send('GET', '/v1/snapshots')));
   }
 
+  /** GET /v1/sandboxes — the live sandbox registry. */
+  async listSandboxes(): Promise<SandboxInfo[]> {
+    return JSON.parse(this.#expectOk(await this.#send('GET', '/v1/sandboxes')));
+  }
+
   /** Snapshot detail: /info → legacy endpoint; both 404 → null. */
   async snapshot(tag: string): Promise<SnapshotSummary | null> {
     validation.sandboxId(tag);
@@ -156,7 +171,15 @@ export class RfbClient {
    * "zbrt" — both are fully implemented; anything else raises ValidationError.
    */
   async createSandbox(tag: string, options: CreateSandboxOptions = {}): Promise<Sandbox[]> {
-    const { n = 1, transport = TRANSPORT_NDJSON } = options;
+    const {
+      n = 1,
+      transport = TRANSPORT_NDJSON,
+      perChildNetns = false,
+      memoryLimitMib = null,
+      prewarm = false,
+      liveFork = false,
+      hugepages = false,
+    } = options;
     validation.sandboxId(tag);
     if (transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT) {
       throw new ValidationError(`invalid transport: ${transport}`);
@@ -164,18 +187,26 @@ export class RfbClient {
     const result = await this.#send('POST', '/v1/sandboxes', {
       snapshot_tag: tag,
       n,
-      per_child_netns: false,
-      memory_limit_mib: null,
-      prewarm: false,
-      live_fork: false,
-      hugepages: false,
+      per_child_netns: perChildNetns,
+      memory_limit_mib: memoryLimitMib,
+      prewarm,
+      live_fork: liveFork,
+      hugepages,
     });
     const infos = JSON.parse(this.#expectOk(result)) as SandboxInfo[];
     return infos.map((info) => new Sandbox(info, this, transport, this.timeoutS * 1000));
   }
 
-  /** Attach to a sandbox by id (resolved via the controller's sandbox list). */
-  async connect(sandboxId: string): Promise<Sandbox> {
+  /**
+   * Attach to a sandbox by id (resolved via the controller's sandbox list),
+   * or pass an existing `Sandbox` to reuse it as-is — its transport is
+   * preserved (attaching an existing handle never resets it).
+   */
+  async connect(target: string | Sandbox): Promise<Sandbox> {
+    if (target instanceof Sandbox) {
+      return target;
+    }
+    const sandboxId = target;
     validation.sandboxId(sandboxId);
     const result = await this.#send('GET', '/v1/sandboxes');
     const list = JSON.parse(this.#expectOk(result)) as SandboxInfo[];

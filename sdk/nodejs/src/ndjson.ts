@@ -119,6 +119,13 @@ export function request(
         while (raw.length > 0 && (raw[raw.length - 1] === 0x0a || raw[raw.length - 1] === 0x0d)) {
           raw = raw.subarray(0, raw.length - 1);
         }
+        // The cap applies to newline-terminated lines too: without this a
+        // single oversized line slips through and the JSON parse materializes
+        // it (Python/Java/C# all reject here).
+        if (raw.length > MAX_LINE_BYTES) {
+          fail(new DecodeError(`guest response exceeded ${MAX_LINE_BYTES} bytes`));
+          return;
+        }
         if (raw.length === 0) {
           continue; // skip empty keepalive lines
         }
