@@ -8,10 +8,11 @@ mod process;
 use crate::policy::PathPolicy;
 use crate::resources::RuntimeLimits;
 use crate::runtime_service::GuestEvent;
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Serial, shell-free workspace executor with a cancellable active child.
 pub struct WorkspaceGuestExecutor {
@@ -28,7 +29,26 @@ pub struct WorkspaceGuestExecutor {
     /// walk. Writes patch it by delta and `exec` invalidates it (its child can
     /// mutate the workspace arbitrarily), so the size limit never costs a full
     /// O(workspace) walk per write.
-    workspace_size_cache: Mutex<Option<u64>>,
+    ///
+    /// Shared by every executor on the same root: the ZeroBoot provider pools
+    /// ZBRT connections into one guest, so concurrent executors write the same
+    /// workspace, and a per-connection cache would let each of them project
+    /// against a stale total — making `max_workspace_bytes` a per-connection
+    /// bound instead of a workspace bound.
+    workspace_size_cache: SizeCache,
+}
+
+/// Cached workspace byte total: `None` means "walk the tree on next use".
+type SizeCache = Arc<Mutex<Option<u64>>>;
+
+/// Process-wide registry of workspace size caches, keyed by workspace root.
+fn shared_size_cache(root: &Path) -> SizeCache {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SizeCache>>> = OnceLock::new();
+    let registry = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(registry.entry(root.to_path_buf()).or_default())
 }
 
 impl WorkspaceGuestExecutor {
@@ -41,13 +61,14 @@ impl WorkspaceGuestExecutor {
         limits.validate().map_err(str::to_owned)?;
         let root = root.into();
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let workspace_size_cache = shared_size_cache(&root);
         Ok(Self {
             policy: PathPolicy::new(root, Vec::new()),
             limits,
             active: None,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             event_sink: None,
-            workspace_size_cache: Mutex::new(None),
+            workspace_size_cache,
         })
     }
 

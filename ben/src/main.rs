@@ -261,6 +261,40 @@ mod zbrt {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// One bare ZBRT round trip: no guest process, no workspace write. Run as
+    /// a ladder next to the exec ladder to separate transport cost from
+    /// command cost.
+    async fn health_once(
+        sandbox: &rfb::zeroboot::ZeroBootSandbox,
+    ) -> Result<f64, rfb::SandboxError> {
+        let started = Instant::now();
+        let health = sandbox.health().await?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if !health.healthy {
+            return Err(rfb::SandboxError::Execution(
+                "guest reported unhealthy".into(),
+            ));
+        }
+        Ok(elapsed_ms)
+    }
+
+    /// The guest's own view of its CPU count, read through the ZBRT eval path.
+    /// Reported so a vCPU level that never reaches the kernel (or an AP that
+    /// fails to boot) shows up as data instead of being inferred from timings.
+    async fn guest_cpu_count(
+        sandbox: &rfb::zeroboot::ZeroBootSandbox,
+        timeout: u64,
+    ) -> Option<u64> {
+        let request = ExecSpec {
+            args: vec!["print(open('/proc/cpuinfo').read().count('processor'))".into()],
+            timeout: Some(Duration::from_secs(timeout)),
+            ..ExecSpec::new("eval")
+        };
+        let result = sandbox.exec(request).await.ok()?;
+        let text = String::from_utf8_lossy(&result.stdout);
+        text.trim().parse().ok()
+    }
+
     async fn echo_once(
         sandbox: &rfb::zeroboot::ZeroBootSandbox,
         timeout: u64,
@@ -331,6 +365,7 @@ mod zbrt {
                 .await
                 .map_err(|error| format!("warmup failed: {error}"))?;
         }
+        let guest_cpus = guest_cpu_count(&sandbox, args.timeout_secs).await;
 
         let mut single_latencies = Vec::with_capacity(args.samples);
         let mut single_failures = 0usize;
@@ -342,6 +377,7 @@ mod zbrt {
         }
 
         let mut ladder = Vec::with_capacity(levels.len());
+        let mut ladder_health = Vec::with_capacity(levels.len());
         for &level in &levels {
             let mut handles = Vec::with_capacity(level);
             let rounds = args.rounds;
@@ -381,6 +417,43 @@ mod zbrt {
                 "ops_per_sec": if wall_ms > 0.0 { ops / (wall_ms / 1000.0) } else { 0.0 },
                 "latency": latency_summary(latencies, failures),
             }));
+
+            let mut handles = Vec::with_capacity(level);
+            let health_started = Instant::now();
+            for _ in 0..level {
+                let worker = Arc::clone(&sandbox);
+                handles.push(tokio::spawn(async move {
+                    let mut latencies = Vec::with_capacity(4);
+                    let mut failures = 0usize;
+                    for _ in 0..rounds {
+                        match health_once(&worker).await {
+                            Ok(ms) => latencies.push(ms),
+                            Err(_) => failures += 1,
+                        }
+                    }
+                    (latencies, failures)
+                }));
+            }
+            let mut latencies = Vec::with_capacity(level * args.rounds);
+            let mut failures = 0usize;
+            for handle in handles {
+                match handle.await {
+                    Ok((mut ops, worker_failures)) => {
+                        latencies.append(&mut ops);
+                        failures += worker_failures;
+                    }
+                    Err(_) => failures += 1,
+                }
+            }
+            let wall_ms = health_started.elapsed().as_secs_f64() * 1000.0;
+            let ops = latencies.len() as f64;
+            ladder_health.push(serde_json::json!({
+                "level": level,
+                "rounds_per_worker": args.rounds,
+                "wall_ms": wall_ms,
+                "ops_per_sec": if wall_ms > 0.0 { ops / (wall_ms / 1000.0) } else { 0.0 },
+                "latency": latency_summary(latencies, failures),
+            }));
         }
         drop(sandbox);
         std::thread::sleep(Duration::from_millis(200));
@@ -391,9 +464,11 @@ mod zbrt {
             "mem_mib": mem_mib,
             "vcpus": vcpus,
             "sessions": sessions,
+            "guest_cpus": guest_cpus,
             "cold_boot_ms": cold_boot_ms,
             "single": latency_summary(single_latencies, single_failures),
             "ladder": ladder,
+            "ladder_health": ladder_health,
             "firecracker_peak_rss_kib": peak_rss_kib,
         }))
     }
