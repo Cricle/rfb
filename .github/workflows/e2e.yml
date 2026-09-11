@@ -273,6 +273,80 @@ jobs:
             --sandboxes 3 --rounds 2 --reuse-execs 25 --json \
             | tee "$RUN_DIR/bench-workload.json"
 
+      # 沙箱启动吞吐 + 资源占用：并行发起 N 个独立创建请求测「每秒启动数」，
+      # 并在创建前/创建后/稳定期/销毁后四个时点采样 forkd-controller 与全部
+      # firecracker 进程的 RSS、CPU ticks、FD 数。部分创建失败不判红（记录
+      # n_created），结果写入 bench-resources.jsonl 随 artifact 归档。
+      - name: Sandbox burst benchmark (parallel starts + memory/CPU sampling)
+        run: |
+          set -euo pipefail
+          TAG="ci-e2e-$GITHUB_RUN_ID"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          export FORKD_SNAPSHOT_TAG="$TAG"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          OUT="$RUN_DIR/bench-resources.jsonl"
+
+          # 采样：controller + firecracker 的 RSS(MiB)、CPU ticks、FD 合计。
+          # /proc/<pid>/stat 的 comm 含空格/括号，故在最后一个 ')' 之后切片，
+          # 此处位置 12/13 对应 utime/stime。
+          sample() {
+            local label="$1" ctl_rss=0 fc_rss=0 fc_count=0 fds=0 ticks=0 p stat rest rss
+            for p in $(pgrep -f forkd-controller || true); do
+              rss=$(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
+              ctl_rss=$((ctl_rss + rss))
+              fds=$((fds + $(ls "/proc/$p/fd" 2>/dev/null | wc -l)))
+              stat=$(cat "/proc/$p/stat" 2>/dev/null || true)
+              if [ -n "$stat" ]; then
+                rest=${stat#*) }
+                set -- $rest
+                ticks=$((ticks + $12 + $13))
+              fi
+            done
+            for p in $(pgrep -x firecracker || true); do
+              fc_count=$((fc_count + 1))
+              rss=$(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
+              fc_rss=$((fc_rss + rss))
+              fds=$((fds + $(ls "/proc/$p/fd" 2>/dev/null | wc -l)))
+              stat=$(cat "/proc/$p/stat" 2>/dev/null || true)
+              if [ -n "$stat" ]; then
+                rest=${stat#*) }
+                set -- $rest
+                ticks=$((ticks + $12 + $13))
+              fi
+            done
+            printf '{"label":"%s","controller_rss_mb":%s,"firecracker_count":%s,"firecracker_rss_mb":%s,"cpu_ticks":%s,"fds":%s}\n' \
+              "$label" "$((ctl_rss / 1024))" "$fc_count" "$((fc_rss / 1024))" "$ticks" "$fds" \
+              | tee -a "$OUT"
+          }
+
+          N=6
+          sample idle
+          start=$(date +%s.%N)
+          for i in $(seq 1 "$N"); do
+            ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --json \
+              > "$RUN_DIR/burst-$i.json" 2>&1 &
+          done
+          wait || true
+          end=$(date +%s.%N)
+          created=$( { grep -l '"id"' "$RUN_DIR"/burst-*.json 2>/dev/null || true; } | wc -l)
+          python3 -c '
+          import sys
+          n, created, start, end = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+          wall = max(end - start, 0.001)
+          print("{\"label\":\"burst\",\"n_requested\":%d,\"n_created\":%d,\"wall_s\":%.3f,\"starts_per_sec\":%.2f}"
+                % (n, created, wall, created / wall))
+          ' "$N" "$created" "$start" "$end" | tee -a "$OUT"
+          sample after-burst
+          sleep 3
+          sample steady
+          for f in "$RUN_DIR"/burst-*.json; do
+            sid=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$f" 2>/dev/null || true)
+            [ -n "$sid" ] || continue
+            ./target/release/rfb-cli forkd sandbox-destroy "$sid" --json > /dev/null || true
+          done
+          sample after-destroy
+
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
       # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
       # FORKD_TOKEN），日志天然脱敏 —— 若未来引入认证，必须先过滤再上传。
