@@ -39,8 +39,8 @@ class ZbrtClientTest {
     private Sandbox zbrtSandbox() {
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = server.address();
+        info.setId("sb-1");
+        info.setGuestAddr(server.address());
         return Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
     }
 
@@ -71,10 +71,10 @@ class ZbrtClientTest {
                 normalizedFrameHex(captured.get()),
                 "EVAL_ZBRT_BASIC wire bytes");
         assertExecuteFields(captured.get(), List.of("eval", "1+1"), "/workspace", 5000);
-        assertEquals(Integer.valueOf(0), result.exitCode);
-        assertArrayEquals(HexFormat.of().parseHex("32"), result.stdout);
-        assertEquals(0, result.stderr.length);
-        assertFalse(result.timedOut);
+        assertEquals(Integer.valueOf(0), result.getExitCode());
+        assertArrayEquals(HexFormat.of().parseHex("32"), result.getStdout());
+        assertEquals(0, result.getStderr().length);
+        assertFalse(result.isTimedOut());
         server.close();
 
         // EVAL_ZBRT_DEFAULTS: eval("print(40+2)") — cwd flag 0, timeout_ms=0.
@@ -94,8 +94,8 @@ class ZbrtClientTest {
                 normalizedFrameHex(capturedDefaults.get()),
                 "EVAL_ZBRT_DEFAULTS wire bytes");
         assertExecuteFields(capturedDefaults.get(), List.of("eval", "print(40+2)"), null, 0);
-        assertEquals(Integer.valueOf(0), defaults.exitCode);
-        assertArrayEquals(HexFormat.of().parseHex("3432"), defaults.stdout);
+        assertEquals(Integer.valueOf(0), defaults.getExitCode());
+        assertArrayEquals(HexFormat.of().parseHex("3432"), defaults.getStdout());
     }
 
     /** Field-level assertions on a captured Execute frame (shared vector contract). */

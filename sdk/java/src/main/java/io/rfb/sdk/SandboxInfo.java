@@ -40,10 +40,22 @@ public class SandboxInfo {
         return id;
     }
 
+    /** Sets the sandbox id. */
+    @JsonProperty("id")
+    public void setId(String id) {
+        this.id = id;
+    }
+
     /** Tag of the snapshot this sandbox was created from. */
     @JsonProperty("snapshot_tag")
     public String getSnapshotTag() {
         return snapshotTag;
+    }
+
+    /** Sets the snapshot tag. */
+    @JsonProperty("snapshot_tag")
+    public void setSnapshotTag(String snapshotTag) {
+        this.snapshotTag = snapshotTag;
     }
 
     /** Network namespace (null for shared-tap sandboxes). */
@@ -52,10 +64,22 @@ public class SandboxInfo {
         return netns;
     }
 
+    /** Sets the network namespace. */
+    @JsonProperty("netns")
+    public void setNetns(String netns) {
+        this.netns = netns;
+    }
+
     /** Creation time (Unix seconds). */
     @JsonProperty("created_at_unix")
     public Long getCreatedAtUnix() {
         return createdAtUnix;
+    }
+
+    /** Sets the creation time (Unix seconds). */
+    @JsonProperty("created_at_unix")
+    public void setCreatedAtUnix(Long createdAtUnix) {
+        this.createdAtUnix = createdAtUnix;
     }
 
     /** Host:port of the guest agent (TCP). */
@@ -64,10 +88,22 @@ public class SandboxInfo {
         return guestAddr;
     }
 
+    /** Sets the guest agent address. */
+    @JsonProperty("guest_addr")
+    public void setGuestAddr(String guestAddr) {
+        this.guestAddr = guestAddr;
+    }
+
     /** Memory cap in MiB (null = controller default). */
     @JsonProperty("memory_limit_mib")
     public Long getMemoryLimitMib() {
         return memoryLimitMib;
+    }
+
+    /** Sets the memory cap in MiB. */
+    @JsonProperty("memory_limit_mib")
+    public void setMemoryLimitMib(Long memoryLimitMib) {
+        this.memoryLimitMib = memoryLimitMib;
     }
 
     /** PID of the backing Firecracker process. */
@@ -76,16 +112,34 @@ public class SandboxInfo {
         return pid;
     }
 
+    /** Sets the backing Firecracker PID. */
+    @JsonProperty("pid")
+    public void setPid(Long pid) {
+        this.pid = pid;
+    }
+
     /** True when this sandbox has produced a branch. */
     @JsonProperty("has_branched")
     public boolean isHasBranched() {
         return hasBranched;
     }
 
+    /** Sets the branched flag. */
+    @JsonProperty("has_branched")
+    public void setHasBranched(boolean hasBranched) {
+        this.hasBranched = hasBranched;
+    }
+
     /** Number of branches spawned from this sandbox. */
     @JsonProperty("branch_count")
     public long getBranchCount() {
         return branchCount;
+    }
+
+    /** Sets the branch count. */
+    @JsonProperty("branch_count")
+    public void setBranchCount(long branchCount) {
+        this.branchCount = branchCount;
     }
 
     @Override

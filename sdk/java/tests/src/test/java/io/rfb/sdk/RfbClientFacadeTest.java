@@ -116,20 +116,20 @@ class RfbClientFacadeTest {
         });
 
         RfbClient client = new RfbClient(controllerBase, "token-x", 5.0);
-        assertTrue(client.waitSnapshot("base").bootable);
+        assertTrue(client.waitSnapshot("base").isBootable());
 
         Sandbox sandbox = client.createSandbox("base").get(0);
         assertEquals("sb-1", sandbox.id());
 
         ExecResult exec = sandbox.exec(List.of("echo", "hi"));
-        assertEquals(Integer.valueOf(0), exec.exitCode);
+        assertEquals(Integer.valueOf(0), exec.getExitCode());
         assertEquals("hi", exec.stdoutText());
 
         assertEquals(5, sandbox.write("notes.txt", "hello".getBytes(StandardCharsets.UTF_8)));
 
         FileRead read = sandbox.read("notes.txt");
-        assertEquals("hello", new String(read.data, StandardCharsets.UTF_8));
-        assertEquals(Long.valueOf(5), read.totalBytes);
+        assertEquals("hello", new String(read.getData(), StandardCharsets.UTF_8));
+        assertEquals(Long.valueOf(5), read.getTotalBytes());
 
         sandbox.delete();
     }
@@ -188,8 +188,8 @@ class RfbClientFacadeTest {
         // unreachable on purpose: validation must reject before any connect.
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = "127.0.0.1:1";
+        info.setId("sb-1");
+        info.setGuestAddr("127.0.0.1:1");
         Sandbox sandbox = Sandbox.attach(client, info, RfbClient.TRANSPORT_NDJSON);
         assertThrows(ValidationError.class,
                 () -> sandbox.stream(List.of(), null, null, null));
@@ -201,8 +201,8 @@ class RfbClientFacadeTest {
         // listSandboxes it would raise; direct attach must return as-is
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "direct-1";
-        info.guestAddr = "127.0.0.1:1";
+        info.setId("direct-1");
+        info.setGuestAddr("127.0.0.1:1");
         Sandbox attached = Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
         assertSame(attached, client.connect(attached));
         assertEquals(RfbClient.TRANSPORT_ZBRT, client.connect(attached).transport());

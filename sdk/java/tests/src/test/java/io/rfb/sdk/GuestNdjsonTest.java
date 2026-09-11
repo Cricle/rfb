@@ -40,9 +40,9 @@ class GuestNdjsonTest {
     private Sandbox sandboxOn(String address) {
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.snapshotTag = "base";
-        info.guestAddr = address;
+        info.setId("sb-1");
+        info.setSnapshotTag("base");
+        info.setGuestAddr(address);
         return Sandbox.attach(client, info, RfbClient.TRANSPORT_NDJSON);
     }
 
@@ -100,10 +100,10 @@ class GuestNdjsonTest {
             writeLines(out, "{\"out\":\"hi\",\"err\":\"boo\",\"exit_code\":3,\"timed_out\":false}");
         });
         ExecResult result = sandbox.exec(List.of("echo", "hi"));
-        assertEquals(Integer.valueOf(3), result.exitCode);
+        assertEquals(Integer.valueOf(3), result.getExitCode());
         assertEquals("hi", result.stdoutText());
         assertEquals("boo", result.stderrText());
-        assertFalse(result.timedOut);
+        assertFalse(result.isTimedOut());
     }
 
     @Test
@@ -125,7 +125,7 @@ class GuestNdjsonTest {
             writeLines(out, "{\"out\":\"o\",\"exit_code\":0}");
         });
         ExecResult result = sandbox.exec(List.of("x"), null, 60.0, "abc".getBytes(StandardCharsets.UTF_8));
-        assertEquals(Integer.valueOf(0), result.exitCode);
+        assertEquals(Integer.valueOf(0), result.getExitCode());
     }
 
     @Test
@@ -137,7 +137,7 @@ class GuestNdjsonTest {
             writeLines(out, "{\"output\":[111,117,116],\"exit_code\":0,\"timed_out\":false}");
         });
         ExecResult result = sandbox.eval("print(1)");
-        assertEquals(Integer.valueOf(0), result.exitCode);
+        assertEquals(Integer.valueOf(0), result.getExitCode());
         assertEquals("out", result.stdoutText());
     }
 
@@ -179,11 +179,11 @@ class GuestNdjsonTest {
         });
         List<DirEntry> entries = sandbox.ls();
         assertEquals(2, entries.size());
-        assertEquals("a.txt", entries.get(0).name);
-        assertEquals(Boolean.FALSE, entries.get(0).isDir);
-        assertEquals(Long.valueOf(3), entries.get(0).size);
-        assertEquals(Boolean.TRUE, entries.get(1).isDir);
-        assertNull(entries.get(1).size);
+        assertEquals("a.txt", entries.get(0).getName());
+        assertEquals(Boolean.FALSE, entries.get(0).isDir());
+        assertEquals(Long.valueOf(3), entries.get(0).getSize());
+        assertEquals(Boolean.TRUE, entries.get(1).isDir());
+        assertNull(entries.get(1).getSize());
     }
 
     @Test
@@ -207,10 +207,10 @@ class GuestNdjsonTest {
         });
         List<GrepMatch> matches2 = sandboxGrep.grep("x");
         assertEquals(1, matches2.size());
-        assertEquals("a.txt", matches2.get(0).path);
-        assertEquals(Long.valueOf(1), matches2.get(0).line);
-        assertEquals(Long.valueOf(2), matches2.get(0).column);
-        assertEquals("x", matches2.get(0).text);
+        assertEquals("a.txt", matches2.get(0).getPath());
+        assertEquals(Long.valueOf(1), matches2.get(0).getLine());
+        assertEquals(Long.valueOf(2), matches2.get(0).getColumn());
+        assertEquals("x", matches2.get(0).getText());
     }
 
     @Test
@@ -223,8 +223,8 @@ class GuestNdjsonTest {
             writeLines(out, "{\"data\":[104,105],\"truncated\":false,\"total_bytes\":2}");
         });
         FileRead read = sandboxRead.read("notes.txt", 5L, null);
-        assertEquals("hi", new String(read.data, StandardCharsets.UTF_8));
-        assertEquals(Long.valueOf(2), read.totalBytes);
+        assertEquals("hi", new String(read.getData(), StandardCharsets.UTF_8));
+        assertEquals(Long.valueOf(2), read.getTotalBytes());
 
         server.close();
         Sandbox sandboxWrite = sandbox((in, out) -> {
@@ -297,15 +297,15 @@ class GuestNdjsonTest {
         try (GuestStream stream = sandbox.stream(List.of("tail", "-f", "x"), null, true,
                 Map.of("LOG", "debug"))) {
             StreamEvent started = stream.nextEvent();
-            assertEquals(StreamEvent.STARTED, started.kind);
+            assertEquals(StreamEvent.STARTED, started.getKind());
             stream.sendInput("hello");
             StreamEvent chunk = stream.nextEvent();
-            assertEquals(StreamEvent.STDOUT, chunk.kind);
-            assertEquals("echo", new String(chunk.data, StandardCharsets.UTF_8));
+            assertEquals(StreamEvent.STDOUT, chunk.getKind());
+            assertEquals("echo", new String(chunk.getData(), StandardCharsets.UTF_8));
             stream.stop();
             StreamEvent exit = stream.nextEvent();
-            assertEquals(StreamEvent.EXIT, exit.kind);
-            assertEquals(Integer.valueOf(0), exit.code);
+            assertEquals(StreamEvent.EXIT, exit.getKind());
+            assertEquals(Integer.valueOf(0), exit.getCode());
         }
     }
 
@@ -316,13 +316,13 @@ class GuestNdjsonTest {
             writeLines(out, "{\"stream\":\"started\"}", "{\"err\":\"boom\"}", "{\"done\":true}");
         });
         try (GuestStream stream = sandbox.stream(List.of("x"))) {
-            assertEquals(StreamEvent.STARTED, stream.nextEvent().kind);
+            assertEquals(StreamEvent.STARTED, stream.nextEvent().getKind());
             StreamEvent err = stream.nextEvent();
-            assertEquals(StreamEvent.STDERR, err.kind);
-            assertEquals("boom", new String(err.data, StandardCharsets.UTF_8));
+            assertEquals(StreamEvent.STDERR, err.getKind());
+            assertEquals("boom", new String(err.getData(), StandardCharsets.UTF_8));
             StreamEvent exit = stream.nextEvent();
-            assertEquals(StreamEvent.EXIT, exit.kind);
-            assertNull(exit.code);
+            assertEquals(StreamEvent.EXIT, exit.getKind());
+            assertNull(exit.getCode());
         }
     }
 

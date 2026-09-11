@@ -114,13 +114,13 @@ class ControllerHttpTest {
         List<Snapshot> snapshots = http.listSnapshots();
         assertEquals(1, snapshots.size());
         Snapshot s = snapshots.get(0);
-        assertEquals("base", s.tag);
-        assertEquals("ready", s.status);
-        assertTrue(s.bootable);
-        assertEquals(Long.valueOf(17), s.createdAtUnix);
-        assertEquals("", s.dir); // serde(default) default
-        assertNull(s.warning);
-        assertNull(s.provenance);
+        assertEquals("base", s.getTag());
+        assertEquals("ready", s.getStatus());
+        assertTrue(s.isBootable());
+        assertEquals(Long.valueOf(17), s.getCreatedAtUnix());
+        assertEquals("", s.getDir()); // serde(default) default
+        assertNull(s.getWarning());
+        assertNull(s.getProvenance());
     }
 
     @Test
@@ -130,7 +130,7 @@ class ControllerHttpTest {
         ControllerHttp http = new ControllerHttp(baseUrl, null, Duration.ofSeconds(5));
         Snapshot snapshot = http.snapshotInfo("base");
         assertNotNull(snapshot);
-        assertEquals("ready", snapshot.status);
+        assertEquals("ready", snapshot.getStatus());
     }
 
     @Test
@@ -141,7 +141,7 @@ class ControllerHttpTest {
         ControllerHttp http = new ControllerHttp(baseUrl, null, Duration.ofSeconds(5));
         Snapshot snapshot = http.snapshotInfo("base");
         assertNotNull(snapshot);
-        assertEquals("base", snapshot.tag);
+        assertEquals("base", snapshot.getTag());
     }
 
     @Test
@@ -206,8 +206,8 @@ class ControllerHttpTest {
         ControllerHttp http = new ControllerHttp(baseUrl, null, Duration.ofSeconds(5));
         List<SandboxInfo> created = http.createSandbox("base", 2, true, null, false, true, false);
         assertEquals(1, created.size());
-        assertEquals("sb-1", created.get(0).id);
-        assertEquals("127.0.0.1:7021", created.get(0).guestAddr);
+        assertEquals("sb-1", created.get(0).getId());
+        assertEquals("127.0.0.1:7021", created.get(0).getGuestAddr());
         assertEquals("{\"snapshot_tag\":\"base\",\"n\":2,\"per_child_netns\":true,"
                         + "\"memory_limit_mib\":null,\"prewarm\":false,\"live_fork\":true,\"hugepages\":false}",
                 lastCreateBody.get());
@@ -232,8 +232,8 @@ class ControllerHttpTest {
         flipToReady = true; // first poll "creating", second poll ready
         snapshotListBody.set("[{\"tag\":\"base\",\"status\":\"creating\",\"bootable\":false}]");
         Snapshot snapshot = new RfbClient(baseUrl, null, 5.0).waitSnapshot("base", 5);
-        assertEquals("base", snapshot.tag);
-        assertTrue(snapshot.bootable);
+        assertEquals("base", snapshot.getTag());
+        assertTrue(snapshot.isBootable());
     }
 
 
@@ -266,7 +266,7 @@ class ControllerHttpTest {
                 + "\"provenance\":{\"k\":[1,2],\"s\":\"v\"}}]");
         ControllerHttp http = new ControllerHttp(baseUrl, null, Duration.ofSeconds(5));
         Snapshot s = http.listSnapshots().get(0);
-        assertNotNull(s.provenance);
-        assertTrue(String.valueOf(s.provenance).contains("k"));
+        assertNotNull(s.getProvenance());
+        assertTrue(String.valueOf(s.getProvenance()).contains("k"));
     }
 }
