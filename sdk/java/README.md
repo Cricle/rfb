@@ -10,7 +10,7 @@ RFB 的 Java 外部语言 SDK，是 **Rust 基准实现（`rfb::client`）的镜
 
 - **wire 契约唯一依据**：[`../PROTOCOL.md`](../PROTOCOL.md)（帧格式、字段表、限制、校验规则、黄金测试向量）。
 - **公共 API 表面唯一依据**：[`../UNIFIED_API.md`](../UNIFIED_API.md)（四语言统一：Rust 基准，Java 为镜像移植）。
-- Java 17，唯一依赖 `com.fasterxml.jackson.core:jackson-databind 2.17.x`，HTTP 用 `java.net.http.HttpClient`，TCP 用原生 Socket。
+- **Java 8**（`maven.compiler.release=8`，产物 class 版本 52），唯一依赖 `com.fasterxml.jackson.core:jackson-databind 2.17.x`，HTTP 用 `HttpURLConnection`，TCP 用原生 Socket。测试模块（`tests/`）单独以 JDK 17 编译运行（仅测试代码需要）。
 
 ## 公共 API 全集（与 UNIFIED_API.md §1 一致）
 
@@ -33,7 +33,7 @@ mvn -q compile            # 主代码 io.github.cricle:rfb-sdk（src/main/java�
 mvn -q test               # 测试（tests/ 模块，JUnit 5，全部进程内 fake）
 ```
 
-`pom.xml` 为 parent/aggregator（`io.github.cricle:rfb-sdk-parent`），主代码源目录在其 `<build>` 中声明；`tests/pom.xml`（`io.github.cricle:rfb-sdk-tests`）以 `io.github.cricle:rfb-sdk` 依赖引用主代码。如需单独产出主 jar：把根 pom 的 `packaging` 改为 `jar` 并去掉 `<modules>`。
+`pom.xml` 产出主 jar（`io.github.cricle:rfb-sdk`，Java 8 target）；`tests/pom.xml`（`io.github.cricle:rfb-sdk-tests`，JDK 17）以 `<scope>test</scope>` 依赖主模块并在 surefire 下运行 JUnit 5 套件。发行流程见 `docs/RELEASE.md`（Maven Central 渠道）。
 
 ## 快速上手
 
@@ -142,7 +142,7 @@ mvn test
 
 ## 已知限制
 
-- 开发机无 JDK/Maven：代码经逐文件静态审查保证可编译性，但未实际编译运行；`testsRun = not run`。
+- 验证状态：主模块 `mvn compile` 以 `release=8` 编译通过（class 文件 major version 52）；测试模块 108 个 JUnit 5 用例全绿（WSL JDK 21 实测）。
 - ZBRT `Result`（kind 13，保留帧）未实现 legacy 兼容解析（Rust 基准可解析旧版单帧 Result）；收到时抛 `DecodeError`。
 - ZBRT 传输的 `stream` fail closed：`pty=true` 或非空 `env` 在发送任何帧前抛 `ValidationError`（与 Rust/C#/Python 基线一致，不再忽略；ZBRT v1 无这两个通道）；空 `args` 在两种传输下同样拒绝。
 - NDJSON 传输单响应行上限 1 MiB、结构化工具响应 50 KiB / 1000 条上限，超出抛错（与 Rust 客户端一致）。

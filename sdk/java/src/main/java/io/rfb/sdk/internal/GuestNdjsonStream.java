@@ -21,9 +21,11 @@ public final class GuestNdjsonStream {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
-    private boolean stopped = false;
-    private boolean terminal = false;
-    private boolean closed = false;
+    // volatile: close() is synchronized but nextEvent/sendInput/stop are not;
+    // the flags are the only cross-thread state a caller observes.
+    private volatile boolean stopped = false;
+    private volatile boolean terminal = false;
+    private volatile boolean closed = false;
 
     GuestNdjsonStream(Socket socket) throws IOException {
         this.socket = socket;

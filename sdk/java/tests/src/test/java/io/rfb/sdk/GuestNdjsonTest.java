@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -102,7 +103,7 @@ class GuestNdjsonTest {
         assertEquals(Integer.valueOf(3), result.exitCode);
         assertEquals("hi", result.stdoutText());
         assertEquals("boo", result.stderrText());
-        assertTrue(!result.timedOut);
+        assertFalse(result.timedOut);
     }
 
     @Test
@@ -120,7 +121,7 @@ class GuestNdjsonTest {
         Sandbox sandbox = sandbox((in, out) -> {
             JsonNode req = io.rfb.sdk.internal.Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8));
             assertEquals("exec", req.path("action").asText());
-            assertTrue(!req.has("stdin"));
+            assertFalse(req.has("stdin"));
             writeLines(out, "{\"out\":\"o\",\"exit_code\":0}");
         });
         ExecResult result = sandbox.exec(List.of("x"), null, 60.0, "abc".getBytes(StandardCharsets.UTF_8));
@@ -265,8 +266,8 @@ class GuestNdjsonTest {
         assertThrows(ValidationError.class, () -> sandbox.write("a\\b", new byte[0]));
         assertThrows(ValidationError.class, () -> sandbox.write("ok", new byte[Validation.MAX_GUEST_RESULT_BYTES + 1]));
         assertThrows(ValidationError.class, () -> sandbox.read("ok", 0L, 0));
-        // sanity: nothing was sent
-        assertNotNull(sandbox);
+        // fail-closed: no connection may have reached the fake guest
+        assertEquals(0, server.connectionCount(), "validation must precede any network traffic");
     }
 
     @Test

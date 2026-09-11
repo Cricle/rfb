@@ -15,7 +15,7 @@ import java.util.List;
  * RfbClient client = new RfbClient();
  * Snapshot snap = client.waitSnapshot("base");
  * Sandbox box = client.createSandbox("base").get(0);
- * ExecResult r = box.exec(java.util.List.of("echo", "hi"));
+ * ExecResult r = box.exec(java.util.Arrays.asList("echo", "hi"));
  * box.write("notes.txt", "hello".getBytes());
  * FileRead back = box.read("notes.txt");
  * box.delete();
@@ -89,6 +89,9 @@ public final class RfbClient {
      * transport-class errors).
      */
     public Snapshot waitSnapshot(String tag, double timeoutS) {
+        if (Double.isNaN(timeoutS) || Double.isInfinite(timeoutS) || timeoutS <= 0) {
+            throw new ValidationError("timeoutS must be a positive, finite number of seconds");
+        }
         long deadline = System.nanoTime() + (long) (timeoutS * 1_000_000_000L);
         while (true) {
             for (Snapshot s : controller.listSnapshots()) {

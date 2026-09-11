@@ -217,13 +217,13 @@ class ControllerHttpTest {
     void waitLoopReturnsWhenReadyAndFailsFastOnFailed() {
         // not ready → times out after the short budget
         snapshotListBody.set("[{\"tag\":\"base\",\"status\":\"creating\",\"bootable\":false}]");
-        ControllerHttp http = new ControllerHttp(baseUrl, null, Duration.ofSeconds(5));
-        assertThrows(RfbError.class, () -> pollUntilReady(http, 0.3));
+        RfbClient client = new RfbClient(baseUrl, null, 5.0);
+        assertThrows(RfbError.class, () -> client.waitSnapshot("base", 0.3));
 
         // failed → raises immediately (well under 1s)
         snapshotListBody.set("[{\"tag\":\"base\",\"status\":\"Failed\",\"bootable\":false}]");
         long start = System.nanoTime();
-        assertThrows(RfbError.class, () -> pollUntilReady(http, 5));
+        assertThrows(RfbError.class, () -> client.waitSnapshot("base", 5));
         assertTrue((System.nanoTime() - start) < 1_000_000_000L, "failed status must raise immediately");
     }
 
@@ -231,36 +231,11 @@ class ControllerHttpTest {
     void waitLoopReturnsSnapshotOnceReady() {
         flipToReady = true; // first poll "creating", second poll ready
         snapshotListBody.set("[{\"tag\":\"base\",\"status\":\"creating\",\"bootable\":false}]");
-        Snapshot snapshot = pollUntilReady(new ControllerHttp(baseUrl, null, Duration.ofSeconds(5)), 5);
+        Snapshot snapshot = new RfbClient(baseUrl, null, 5.0).waitSnapshot("base", 5);
         assertEquals("base", snapshot.tag);
         assertTrue(snapshot.bootable);
     }
 
-    /** Mirrors RfbClient.waitSnapshot's poll loop with a small poll interval for tests. */
-    private static Snapshot pollUntilReady(ControllerHttp http, double timeoutS) {
-        long deadline = System.nanoTime() + (long) (timeoutS * 1_000_000_000L);
-        while (true) {
-            for (Snapshot s : http.listSnapshots()) {
-                if (s.tag.equals("base")) {
-                    if (s.status.equalsIgnoreCase("failed")) {
-                        throw new RemoteError("forkd snapshot `base` is Failed");
-                    }
-                    if (s.status.equalsIgnoreCase("ready") && s.bootable) {
-                        return s;
-                    }
-                }
-            }
-            if (System.nanoTime() >= deadline) {
-                throw new RemoteError("forkd snapshot `base` did not become Ready before timeout");
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(e);
-            }
-        }
-    }
 
     @Test
     void snapshotArrayDecodeRejectsNonArray() {

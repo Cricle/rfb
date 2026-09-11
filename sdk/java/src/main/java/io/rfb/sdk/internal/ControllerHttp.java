@@ -137,8 +137,9 @@ public final class ControllerHttp {
         try {
             URL url = new URL(baseUrl + pathAndQuery);
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout((int) timeout.toMillis());
-            conn.setReadTimeout((int) timeout.toMillis());
+            int timeoutMs = (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
             conn.setRequestMethod(method);
             if (token != null) {
                 conn.setRequestProperty("Authorization", "Bearer " + token);
@@ -158,8 +159,10 @@ public final class ControllerHttp {
                 }
             }
             int status = conn.getResponseCode();
-            InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            return new HttpResult(status, readAll(stream));
+            try (InputStream stream =
+                    status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
+                return new HttpResult(status, readAll(stream));
+            }
         } catch (IOException e) {
             throw new TransportError("forkd request failed: " + e.getMessage(), e);
         } finally {
@@ -179,7 +182,6 @@ public final class ControllerHttp {
         while ((n = in.read(chunk)) > 0) {
             buffer.write(chunk, 0, n);
         }
-        in.close();
         return new String(buffer.toByteArray(), StandardCharsets.UTF_8);
     }
 

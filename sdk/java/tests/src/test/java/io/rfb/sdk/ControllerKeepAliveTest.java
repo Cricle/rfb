@@ -30,6 +30,11 @@ class ControllerKeepAliveTest {
         final ServerSocket serverSocket;
         final ExecutorService pool = Executors.newCachedThreadPool();
         final AtomicInteger accepts = new AtomicInteger(0);
+
+        /** Accepted sockets, closed by {@link #close()} so serve threads
+            blocked in read() cannot outlive the test. */
+        private final java.util.Set<Socket> live =
+                java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
         volatile boolean closed = false;
 
         FakeKeepAliveServer() throws IOException {
@@ -48,7 +53,14 @@ class ControllerKeepAliveTest {
                 try {
                     Socket socket = serverSocket.accept();
                     accepts.incrementAndGet();
-                    pool.submit(() -> serve(socket));
+                    live.add(socket);
+                    pool.submit(() -> {
+                        try {
+                            serve(socket);
+                        } finally {
+                            live.remove(socket);
+                        }
+                    });
                 } catch (IOException e) {
                     if (!closed) {
                         throw new RuntimeException(e);
@@ -99,6 +111,14 @@ class ControllerKeepAliveTest {
         @Override
         public void close() {
             closed = true;
+            for (Socket socket : live) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
+            live.clear();
             try {
                 serverSocket.close();
             } catch (IOException ignored) {

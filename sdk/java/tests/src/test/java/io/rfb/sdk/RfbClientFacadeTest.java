@@ -42,7 +42,7 @@ class RfbClientFacadeTest {
         controller = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         String base = "http://127.0.0.1:" + controller.getAddress().getPort();
         byte[] sandboxJson = ("[{\"id\":\"sb-1\",\"snapshot_tag\":\"base\","
-                + "\"guest_addr\":\"%ADDR%\",\"created_at_unix\":null,\"netns\":null,"
+                + "\"guest_addr\":\"127.0.0.1:1\",\"created_at_unix\":null,\"netns\":null,"
                 + "\"memory_limit_mib\":null,\"pid\":null,\"has_branched\":false,"
                 + "\"branch_count\":0}]").getBytes(StandardCharsets.UTF_8);
         controller.createContext("/v1/snapshots", ex -> respond(ex, 200,
@@ -72,12 +72,6 @@ class RfbClientFacadeTest {
         ex.sendResponseHeaders(status, body.length == 0 ? -1 : body.length);
         try (OutputStream out = ex.getResponseBody()) {
             out.write(body);
-        }
-    }
-
-    private static byte[] readBody(HttpExchange ex) throws IOException {
-        try (InputStream in = ex.getRequestBody()) {
-            return in.readAllBytes();
         }
     }
 

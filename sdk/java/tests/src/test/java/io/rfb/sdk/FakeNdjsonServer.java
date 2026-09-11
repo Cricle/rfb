@@ -42,6 +42,13 @@ final class FakeNdjsonServer implements AutoCloseable {
         return "127.0.0.1:" + serverSocket.getLocalPort();
     }
 
+    /** Accepted connection count (fail-closed tests assert 0: no traffic). */
+    int connectionCount() {
+        synchronized (sockets) {
+            return sockets.size();
+        }
+    }
+
     private void acceptLoop() {
         while (!closed) {
             try {

@@ -144,8 +144,8 @@ public final class ZbrtConnection implements AutoCloseable {
     /** Reader for one active Execute turn on this connection. */
     public final class ZbrtStreamSession {
         private final byte[] requestId;
-        private boolean stopped = false;
-        private boolean terminal = false;
+        private volatile boolean stopped = false;
+        private volatile boolean terminal = false;
 
         ZbrtStreamSession(byte[] requestId) {
             this.requestId = requestId;

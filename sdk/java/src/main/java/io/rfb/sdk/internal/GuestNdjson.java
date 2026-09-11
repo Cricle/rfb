@@ -64,8 +64,9 @@ public final class GuestNdjson {
         }
         Socket socket = new Socket();
         try {
-            socket.connect(address, (int) timeout.toMillis());
-            socket.setSoTimeout((int) timeout.toMillis());
+            int timeoutMs = (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
+            socket.connect(address, timeoutMs);
+            socket.setSoTimeout(timeoutMs);
             socket.setTcpNoDelay(true);
             return socket;
         } catch (IOException e) {
