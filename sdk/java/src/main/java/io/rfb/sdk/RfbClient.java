@@ -95,11 +95,11 @@ public final class RfbClient {
         long deadline = System.nanoTime() + (long) (timeoutS * 1_000_000_000L);
         while (true) {
             for (Snapshot s : controller.listSnapshots()) {
-                if (s.tag.equals(tag)) {
-                    if (s.status.equalsIgnoreCase("failed")) {
+                if (s.getTag().equals(tag)) {
+                    if (s.getStatus().equalsIgnoreCase("failed")) {
                         throw new RemoteError("forkd snapshot `" + tag + "` is Failed");
                     }
-                    if (s.status.equalsIgnoreCase("ready") && s.bootable) {
+                    if (s.getStatus().equalsIgnoreCase("ready") && s.isBootable()) {
                         return s;
                     }
                 }

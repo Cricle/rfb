@@ -85,13 +85,14 @@ int n = box.write("notes.txt", "data".getBytes(), false, null);
 
 try (GuestStream s = box.stream(List.of("tail", "-f", "x"))) {
     StreamEvent ev;
-    while ((ev = s.nextEvent()) != null && !"exit".equals(ev.kind)) {
+    while ((ev = s.nextEvent()) != null && !StreamEvent.EXIT.equals(ev.getKind())) {
         s.sendInput("ping\n");                              // 仅 NDJSON 传输支持
     }
 }
 ```
 
 两种传输下 `exec`/`eval`/`ls`/`find`/`grep`/`read`/`write`/`stream`/`ping` 的方法名与结果字段一致（eval 的 `output` 统一映射为 `ExecResult.stdout`）。
+DTO 取值统一走 getter（JavaBean 命名）：`ExecResult.getExitCode()/getStdout()/getStderr()/isTimedOut()`、`FileRead.getData()/isTruncated()/getTotalBytes()`、`StreamEvent.getKind()/getData()/getCode()`、`DirEntry.getName()/isDir()/getSize()`、`GrepMatch.getPath()/getLine()/getColumn()/getText()`；`byte[]` 访问器按值返回拷贝（构造与取值两侧均防御性复制），DTO 均实现 `equals`/`hashCode`。
 
 ### 3. 错误处理
 

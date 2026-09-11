@@ -34,7 +34,7 @@ public final class Sandbox {
         this.client = client;
         this.info = info;
         this.transport = transport;
-        this.guestAddress = GuestNdjson.parseAddress(info.guestAddr);
+        this.guestAddress = GuestNdjson.parseAddress(info.getGuestAddr());
         this.timeout = Duration.ofMillis((long) (client.getTimeoutS() * 1000));
     }
 
@@ -47,7 +47,7 @@ public final class Sandbox {
             throw new ValidationError("transport must be \"ndjson\" or \"zbrt\"");
         }
         for (SandboxInfo info : client.controller().listSandboxes()) {
-            if (info.id.equals(sandboxId)) {
+            if (info.getId().equals(sandboxId)) {
                 return new Sandbox(client, info, transport);
             }
         }
@@ -57,19 +57,19 @@ public final class Sandbox {
     // ---- properties ------------------------------------------------------
 
     public String id() {
-        return info.id;
+        return info.getId();
     }
 
     public String snapshotTag() {
-        return info.snapshotTag;
+        return info.getSnapshotTag();
     }
 
     public String guestAddr() {
-        return info.guestAddr;
+        return info.getGuestAddr();
     }
 
     public Long createdAtUnix() {
-        return info.createdAtUnix;
+        return info.getCreatedAtUnix();
     }
 
     public SandboxInfo info() {
@@ -414,7 +414,7 @@ public final class Sandbox {
 
     /** Delete this sandbox; both 2xx and 404 are success. */
     public void delete() {
-        client.deleteSandbox(info.id);
+        client.deleteSandbox(info.getId());
     }
 
     // ---- plumbing --------------------------------------------------------
