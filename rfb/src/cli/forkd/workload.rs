@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 
 /// Run the workload gate: multiple sandboxes, rounds of guest RPC, session
 /// reuse, and leak-free destroy. Returns sanitized aggregate counters only.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn workload(
     url: &str,
     tag: &str,

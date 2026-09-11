@@ -41,6 +41,10 @@ pub struct SnapshotOutput {
 /// Locate the official `forkd` CLI binary: `--forkd-bin`, `FORKD_BIN`,
 /// `resx/forkd/forkd`, or `forkd` on PATH. Assets resolved from `resx/` are
 /// cross-checked against `resx/SHA256SUMS`.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn resolve_forkd_bin(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     let candidate = if let Some(path) = explicit {
         if !path.is_file() {
@@ -368,6 +372,10 @@ pub fn sanitize_snapshot_info(raw: Value) -> Value {
 /// `forkd snapshot-info --json` and render a sanitized summary. With
 /// `--require-provenance` the command fails closed unless provenance is
 /// complete.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_info(args: &ForkdSnapshotInfoArgs) -> Result<SnapshotOutput, CliError> {
     let url = require_localhost(&args.url)?;
     let tag = require_snapshot_tag(&args.tag)?;
@@ -417,6 +425,10 @@ pub fn snapshot_info(args: &ForkdSnapshotInfoArgs) -> Result<SnapshotOutput, Cli
 /// gets passed to `forkd snapshot`, so the rw boot never pollutes the artifact
 /// image that `--rootfs`/`FORKD_ROOTFS` resolved to. The output reports both
 /// the artifact rootfs and the private copy path.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput, CliError> {
     let url = require_localhost(&args.url)?;
     let tag = require_snapshot_tag(&args.tag)?;
@@ -534,6 +546,10 @@ pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput,
 /// `rfb-cli forkd snapshot-delete`: delegate to `forkd rmi`. `--force` and
 /// `--cascade` mirror the official flags; by default the deletion is refused if
 /// it would orphan child snapshots.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_delete(args: &ForkdSnapshotDeleteArgs) -> Result<SnapshotOutput, CliError> {
     let url = require_localhost(&args.url)?;
     let tag = require_snapshot_tag(&args.tag)?;

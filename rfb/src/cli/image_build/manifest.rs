@@ -83,6 +83,10 @@ pub struct ImageManifestWire {
 
 impl ImageManifestWire {
     /// Convert to the core contract, applying profile validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn into_core(self) -> Result<ImageManifest, CliError> {
         let profile = self.profile.clone();
         if self.transport.trim().is_empty() {
@@ -185,6 +189,10 @@ fn validate_forkd_agent_manifest(
 
 impl StagingManifest {
     /// Convert the embedded image manifest (if present).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn core_image(&self) -> Result<Option<ImageManifest>, CliError> {
         self.image
             .clone()
@@ -194,6 +202,10 @@ impl StagingManifest {
 }
 
 /// Load and structurally validate a staging manifest.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn load(path: &Path) -> Result<StagingManifest, CliError> {
     let contents = fs::read_to_string(path)
         .map_err(|error| io(format!("read {}: {error}", path.display())))?;
@@ -202,6 +214,10 @@ pub fn load(path: &Path) -> Result<StagingManifest, CliError> {
 }
 
 /// Validate a staging manifest in-place (files, paths, hashes).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate(path: &Path) -> Result<StagingManifest, CliError> {
     let manifest = load(path)?;
     if manifest.format != "rfb-manifest/v1" && manifest.format != "rfb-cli-staging/v1" {
@@ -287,6 +303,10 @@ fn normalize_relative_path(relative: &str) -> Result<String, CliError> {
 }
 
 /// Join a root with a relative path, rejecting any traversal.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
     let candidate = Path::new(relative);
     if relative.is_empty()
@@ -305,6 +325,10 @@ pub fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
 }
 
 /// Compute the SHA-256 of a file.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn sha256(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();

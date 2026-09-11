@@ -215,6 +215,10 @@ fn parse_result(payload: &[u8], name: &str) -> Result<(i32, Vec<u8>, Vec<u8>), C
 /// Full ZBRT acceptance: echo/true/false, unsupported error, bounded deadline,
 /// 8 concurrent connections, malformed Execute, and optional 100-sample bench.
 /// Boots a real Firecracker VM (KVM) and never touches external state.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn verify(
     kernel: &Path,
     rootfs: &Path,

@@ -25,6 +25,10 @@ pub const GUEST_PORT: u32 = 5000;
 
 /// Run the ZeroBoot V1 guest service: bind the guest vsock port, and serve
 /// every accepted connection with a fresh workspace executor (Linux only).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
     crate::vsock::validate_endpoint(0, GUEST_PORT)?;

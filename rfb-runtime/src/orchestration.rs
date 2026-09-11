@@ -397,6 +397,10 @@ fn next_id() -> u128 {
 ///
 /// This is used for both `cancel` and `destroy` so a transiently failing
 /// cleanup never leaves a session stuck in a non-terminal state.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn cleanup_with_retry<F, Fut>(
     timeout_seconds: u64,
     max_retries: u32,

@@ -91,6 +91,10 @@ struct VmAction {
 
 impl FirecrackerVm {
     /// Boot a VM from a [`FirecrackerConfig`] with the given init path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn boot_config(config: &FirecrackerConfig, init_path: &str) -> Result<Self> {
         config
             .validate()
@@ -115,6 +119,10 @@ impl FirecrackerVm {
     }
 
     /// Boot a minimal VM (1 vCPU) with a given kernel/rootfs/init.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn boot(
         kernel_path: &str,
         rootfs_path: &str,
@@ -317,6 +325,10 @@ impl FirecrackerVm {
 
     /// Connect to the vsock Unix domain socket endpoint.
     /// Returns `None` if no vsock was configured at boot time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn vsock_connect(&self) -> Result<Option<UnixStream>> {
         if self.vsock_path.is_empty() {
             return Ok(None);
@@ -362,6 +374,10 @@ impl Drop for FirecrackerVm {
 
 /// Boot a Firecracker VM, wait for it to be ready, then snapshot it.
 /// Returns the paths to the snapshot files.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn create_template_snapshot(
     kernel_path: &str,
     rootfs_path: &str,

@@ -14,6 +14,10 @@ pub const CLEANABLE_PATTERNS: [&str; 3] = [".ext4", ".sha256", ".manifest.json"]
 
 /// Validate a cleanup target: absolute, under an `rfb-runtime` path, and not
 /// the filesystem root or the user's home directory.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate_target(target: &Path) -> Result<(), CliError> {
     if !target.is_absolute() {
         return Err(usage("cleanup target must be an absolute path"));
@@ -40,6 +44,10 @@ pub fn validate_target(target: &Path) -> Result<(), CliError> {
 }
 
 /// Discover cleanable artifacts (top-level files only) in a validated target.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn discover(target: &Path) -> Result<Vec<PathBuf>, CliError> {
     validate_target(target)?;
     let mut found = Vec::new();
@@ -69,6 +77,10 @@ fn fs_read_dir(path: &Path) -> Result<Vec<std::fs::DirEntry>, CliError> {
 
 /// Run a scoped cleanup. `dry_run` only lists; otherwise deletes discovered
 /// artifacts. Returns a JSON summary of what was found/deleted.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn cleanup(target: &Path, dry_run: bool, yes: bool) -> Result<Value, CliError> {
     let discovered = discover(target)?;
     if !dry_run && !yes {

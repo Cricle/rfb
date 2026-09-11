@@ -124,6 +124,10 @@ impl FrameCodec {
 
     /// Encode a value into a complete RFB1 frame (magic, opcode, flags,
     /// sequence, length, payload).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn encode<T: Serialize>(
         &self,
         message_type: MessageType,
@@ -155,6 +159,10 @@ impl FrameCodec {
     }
 
     /// Decode a frame from raw bytes, returning the header info and value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<(Frame, T), CodecError> {
         if bytes.len() < HEADER_LEN {
             return Err(CodecError::Truncated);
@@ -239,6 +247,10 @@ impl FrameCodec {
 /// assert_eq!(frame.sequence, 9);
 /// assert_eq!(value, "ready");
 /// ```
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn write_frame_blocking<W: Write, T: Serialize>(
     writer: &mut W,
     codec: &FrameCodec,
@@ -257,6 +269,10 @@ pub fn write_frame_blocking<W: Write, T: Serialize>(
 
 /// Read one length-delimited frame on a blocking transport, the non-async
 /// sibling of [`read_frame`].
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn read_frame_blocking<R: Read, T: DeserializeOwned>(
     reader: &mut R,
     codec: &FrameCodec,
@@ -278,6 +294,10 @@ pub fn read_frame_blocking<R: Read, T: DeserializeOwned>(
 }
 
 /// Write one length-delimited frame on an async transport.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     codec: &FrameCodec,
@@ -293,6 +313,10 @@ pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: Serialize>(
 }
 
 /// Read one length-delimited frame on an async transport.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     codec: &FrameCodec,

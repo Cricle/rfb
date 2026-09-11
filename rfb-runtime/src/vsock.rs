@@ -11,6 +11,10 @@ use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 pub const DEFAULT_PORT: u32 = 5000;
 
 /// Validate the production RFB1 guest endpoint.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate_endpoint(_cid: u32, port: u32) -> io::Result<()> {
     if port != DEFAULT_PORT {
         return Err(io::Error::new(
@@ -22,17 +26,29 @@ pub fn validate_endpoint(_cid: u32, port: u32) -> io::Result<()> {
 }
 
 /// Bind a guest vsock listener on a port.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn bind_guest(port: u32) -> io::Result<VsockListener> {
     validate_endpoint(VMADDR_CID_ANY, port)?;
     VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
 }
 
 /// Accept the next guest vsock connection.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn accept(listener: &VsockListener) -> io::Result<VsockStream> {
     listener.accept().await.map(|(stream, _)| stream)
 }
 
 /// Connect to a guest vsock endpoint with a bounded wait.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn connect(cid: u32, port: u32, wait: Duration) -> io::Result<VsockStream> {
     validate_endpoint(cid, port)?;
     timeout(wait, VsockStream::connect(VsockAddr::new(cid, port)))
@@ -41,6 +57,10 @@ pub async fn connect(cid: u32, port: u32, wait: Duration) -> io::Result<VsockStr
 }
 
 /// Read up to `buf.len()` bytes with a bounded wait.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_with_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -52,6 +72,10 @@ pub async fn read_with_timeout<R: AsyncRead + Unpin>(
 }
 
 /// Write all bytes with a bounded wait.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn write_all_with_timeout<W: AsyncWrite + Unpin>(
     writer: &mut W,
     buf: &[u8],

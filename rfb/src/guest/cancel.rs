@@ -25,6 +25,10 @@ impl CancelRequest {
         }
     }
     /// Validate the optional cancel id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         if let Some(id) = &self.id {
             validate_cancel_id(id)?;

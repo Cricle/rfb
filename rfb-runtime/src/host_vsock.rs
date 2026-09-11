@@ -81,6 +81,10 @@ pub enum VsockEndpointError {
 
 impl VsockEndpoint {
     /// Create an endpoint after validating its CID, port, and absolute UDS path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn new(
         host_uds: impl Into<PathBuf>,
         guest_cid: u32,
@@ -105,12 +109,20 @@ impl VsockEndpoint {
     }
 
     /// Capture the current filesystem identity of the relay socket for pinning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn capture_identity(&mut self) -> Result<(), VsockEndpointError> {
         self.identity = Some(read_identity(&self.host_uds)?);
         Ok(())
     }
 
     /// Verify that the relay still exists and matches the pinned identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate_current(&self) -> Result<(), VsockEndpointError> {
         let current = read_identity(&self.host_uds)?;
         if let Some(identity) = self.identity {
@@ -188,6 +200,10 @@ impl VsockClient {
 
     /// Dial the relay UDS, speak the `CONNECT <guest-port>` preamble, and validate
     /// the `OK <host-port>` response, all bounded by `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn connect(
         endpoint: VsockEndpoint,
         codec: FrameCodec,
@@ -217,6 +233,10 @@ impl VsockClient {
     }
 
     /// Write one control message as a length-delimited RFB1 frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn send_control(
         &mut self,
         message: &ControlMessage,
@@ -241,6 +261,10 @@ impl VsockClient {
     }
 
     /// Read one length-delimited RFB1 frame, bounded by the session timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn recv(&mut self) -> Result<(Frame, RuntimeMessage), VsockClientError> {
         let deadline = Instant::now()
             .checked_add(self.timeout)
@@ -328,6 +352,10 @@ impl SharedHostSession {
 #[cfg(unix)]
 impl SharedHostSession {
     /// Shut down the shared negotiated connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn shutdown(&self) -> Result<(), VsockClientError> {
         self.0.lock().await.shutdown().await
     }
@@ -420,6 +448,10 @@ impl SharedHostSession {
     }
 
     /// Execute a command in the guest workspace on the shared connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec(
         &self,
         guest_cwd: &str,
@@ -441,6 +473,10 @@ impl SharedHostSession {
     }
 
     /// Shared-session eval is deliberately fail-closed until negotiated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval(
         &self,
         _cwd: &str,
@@ -451,6 +487,10 @@ impl SharedHostSession {
 
     /// Run a whitelisted structured guest tool (`ls`, `find`, `grep`) on the
     /// shared connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn execute_tool(
         &self,
         tool: &str,
@@ -473,6 +513,10 @@ impl SharedHostSession {
     }
 
     /// Read a guest workspace file over the shared connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn read_workspace_file(
         &self,
         path: &str,
@@ -529,6 +573,10 @@ impl SharedHostSession {
     }
 
     /// Write a guest workspace file over the shared connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn write_workspace_file(
         &self,
         path: &str,
@@ -614,6 +662,10 @@ impl HostClient {
     }
 
     /// Connect and negotiate Hello plus Capabilities exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn connect(&self) -> Result<HostSession, VsockClientError> {
         let mut client =
             VsockClient::connect(self.endpoint.clone(), self.codec.clone(), self.timeout).await?;
@@ -706,6 +758,10 @@ impl HostSession {
     }
 
     /// Send one control request using the supplied sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn send(
         &mut self,
         message: &ControlMessage,
@@ -726,6 +782,10 @@ impl HostSession {
     }
 
     /// Receive one response, bounded by the configured session timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn recv(&mut self) -> Result<(Frame, RuntimeMessage), VsockClientError> {
         if self.poisoned {
             return Err(VsockClientError::Desync(POISON_MESSAGE.into()));
@@ -742,6 +802,10 @@ impl HostSession {
     }
 
     /// Request orderly shutdown and validate its acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn shutdown(&mut self) -> Result<(), VsockClientError> {
         let sequence = self.next_sequence();
         self.send(&ControlMessage::Shutdown, sequence).await?;
@@ -947,6 +1011,10 @@ impl VsockGuestClient {
 
     /// Execute a command in the guest workspace. `args` must be non-empty and
     /// `guest_cwd` must be a relative workspace path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec(
         &self,
         guest_cwd: &str,
@@ -963,6 +1031,10 @@ impl VsockGuestClient {
 
     /// Evaluate code in the guest. Always unsupported over the RFB1 wire
     /// protocol; services use the structured exec surface instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval(
         &self,
         _guest_cwd: &str,
@@ -972,6 +1044,10 @@ impl VsockGuestClient {
     }
 
     /// Run a whitelisted structured guest tool (`ls`, `find`, `grep`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn execute_tool(
         &self,
         tool: &str,
@@ -994,6 +1070,10 @@ impl VsockGuestClient {
     }
 
     /// Read a workspace file with a strict size limit and a relative-path check.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn read_workspace_file(
         &self,
         path: &str,
@@ -1053,6 +1133,10 @@ impl VsockGuestClient {
     }
 
     /// Write a workspace file (bounded at 16 MiB, workspace-relative path).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn write_workspace_file(
         &self,
         path: &str,

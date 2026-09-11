@@ -18,6 +18,10 @@ struct SnapshotCreate {
 impl FirecrackerVm {
     /// Pause the VM and create a snapshot, polling until both files are stable
     /// and non-empty (partial snapshots fail).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn snapshot(&mut self) -> Result<(String, String)> {
         let snapshot_path = Path::new(&self.snapshot_dir).join("vmstate");
         let mem_path = Path::new(&self.snapshot_dir).join("mem");

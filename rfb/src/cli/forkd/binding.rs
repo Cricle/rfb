@@ -286,6 +286,10 @@ fn validate_binding(
 }
 /// Load and validate a snapshot binding record from disk, checking the schema,
 /// tag, record hash, and (when given) the artifact identity match.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn load_snapshot_binding(
     path: &Path,
     tag: &str,
@@ -354,6 +358,10 @@ fn host_observed_provenance(artifact: &ArtifactManifest) -> Option<(Value, Optio
 /// Bind a forkd snapshot to the given artifact: locates a ready/bootable
 /// snapshot, cross-checks provenance digests against the artifact manifest,
 /// and writes the binding record to `output` (when provided).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn snapshot_bind(
     url: &str,
     tag: &str,

@@ -250,6 +250,10 @@ impl RuntimeService {
     /// Returns the executor on success, or the rejection response.
     /// Dispatch a typed filesystem operation to the active workspace executor.
     /// Fails closed while a turn has taken the executor out to a worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn filesystem_rpc(&mut self, op: u8, path: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         if self.executor.is_none() {
             return Err("turn in progress; filesystem RPC unavailable".into());
@@ -261,6 +265,10 @@ impl RuntimeService {
     ///
     /// The request identity is validated and duplicate/completed turns are
     /// rejected before the executor is removed from the service.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn spawn_turn(
         &mut self,
         turn: &SessionRequest,

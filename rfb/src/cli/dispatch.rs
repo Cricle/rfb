@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 /// Run the parsed top-level command.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn run(cli: crate::cli::commands::Cli) -> Result<(), CliError> {
     match cli.command {
         CommandLine::Doctor => doctor(cli.json),

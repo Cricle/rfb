@@ -14,6 +14,10 @@ use rfb_runtime::host_vsock::VsockEndpoint;
 use rfb_runtime::session::{ControlMessage, RuntimeMessage};
 
 /// Connect to the vsock UDS relay and complete the `CONNECT <port>` handshake.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn connect_vsock_uds(uds: &Path, port: u16, timeout: Duration) -> Result<UnixStream, CliError> {
     let mut endpoint = VsockEndpoint::new(uds, 3, port as u32)
         .map_err(|error| validation(format!("invalid vsock endpoint: {error}")))?;
@@ -60,6 +64,10 @@ pub fn connect_vsock_uds(uds: &Path, port: u16, timeout: Duration) -> Result<Uni
 
 /// Exchange one RFB1 frame (write request, read response, validate sequence /
 /// payload). Uses the runtime codec so the wire format is always in sync.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn exchange(
     stream: &mut UnixStream,
     codec: &FrameCodec,

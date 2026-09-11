@@ -18,6 +18,10 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 /// Connect to a Firecracker vsock UDS backend and complete its text handshake.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn connect_firecracker_uds(
     uds_path: impl AsRef<std::path::Path>,
@@ -56,6 +60,10 @@ pub async fn connect_firecracker_uds(
 }
 
 /// Write one typed ZBRT frame with a bounded I/O timeout.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn write_frame(
     stream: &mut UnixStream,
@@ -77,6 +85,10 @@ pub async fn write_frame(
 }
 
 /// Read one complete typed ZBRT frame with a bounded I/O timeout.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn read_frame(stream: &mut UnixStream, io_timeout: Duration) -> io::Result<Frame> {
     timeout(io_timeout, async {
@@ -100,6 +112,10 @@ pub async fn read_frame(stream: &mut UnixStream, io_timeout: Duration) -> io::Re
 }
 
 /// Send a typed ZBRT Execute frame and decode one response frame.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn execute_frame(
     stream: &mut UnixStream,
@@ -112,6 +128,10 @@ pub async fn execute_frame(
 }
 
 /// Send one complete request and read exactly the echoed response.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn round_trip<S>(
     stream: &mut S,
@@ -129,6 +149,10 @@ where
 }
 
 /// Connect directly to a Linux AF_VSOCK endpoint.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn connect_vsock(
     cid: u32,

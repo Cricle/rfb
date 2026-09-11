@@ -4,6 +4,10 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 
 /// Boot as PID 1 with console attached (Linux).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub fn init_pid1() -> std::io::Result<()> {
     init_pid1_with_console(true)
@@ -11,6 +15,10 @@ pub fn init_pid1() -> std::io::Result<()> {
 
 /// Boot as PID 1: mount proc/sys/dev, attach the console when requested, and
 /// chdir into the workspace. No-op when not running as PID 1.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub fn init_pid1_with_console(attach_console: bool) -> std::io::Result<()> {
     if std::process::id() != 1 {

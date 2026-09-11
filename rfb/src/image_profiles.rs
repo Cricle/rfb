@@ -82,6 +82,10 @@ pub fn image_manifest_profile(profile: &str) -> Option<ImageManifestProfile> {
 /// assert!(validate_image_manifest_profile(&image, "rfb-runtime-rfb1-vsock").is_ok());
 /// assert!(validate_image_manifest_profile(&image, "unknown").is_err());
 /// ```
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate_image_manifest_profile(image: &ImageManifest, name: &str) -> Result<(), String> {
     let profile =
         image_manifest_profile(name).ok_or_else(|| format!("unknown image profile: {name}"))?;

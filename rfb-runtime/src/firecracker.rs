@@ -28,6 +28,10 @@ pub struct FirecrackerConfig {
 impl FirecrackerConfig {
     /// Build a config from `RFB_FIRECRACKER_*` environment overrides on top of
     /// the defaults, then validate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn from_environment() -> anyhow::Result<Self> {
         let mut config = Self::default();
         if let Ok(value) = std::env::var("RFB_FIRECRACKER_API_SOCKET") {
@@ -163,6 +167,10 @@ pub enum FirecrackerConfigError {
 
 impl FirecrackerConfig {
     /// Validate the config against Firecracker's accepted ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), FirecrackerConfigError> {
         if !(32..=65_536).contains(&self.memory_mb) {
             return Err(FirecrackerConfigError::Memory);
@@ -184,6 +192,10 @@ impl FirecrackerConfig {
 
     /// Produce the ordered Firecracker API requests for booting this VM
     /// (machine config, boot source, rootfs, vsock, start).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn api_requests(&self) -> Result<Vec<FirecrackerApiRequest>, FirecrackerConfigError> {
         self.validate()?;
         Ok(vec![

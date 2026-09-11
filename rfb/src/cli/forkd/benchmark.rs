@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 /// Real forkd microbenchmark: N iterations of create/ping/health/stream/exec/
 /// cleanup with sanitized quantiles. Guest payloads are never logged.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn benchmark(
     url: &str,
     tag: &str,

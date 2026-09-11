@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use std::{path::Path, process::Command};
 
 /// Read the rootfs protocol marker and entrypoint stat (contract gate).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn inspect_rootfs(image: &Path) -> Result<Value, CliError> {
     let marker = match run_debugfs(image, "cat /etc/rfb-runtime/protocol-version", true) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_owned(),
@@ -27,6 +31,10 @@ pub fn inspect_rootfs(image: &Path) -> Result<Value, CliError> {
 /// Validate a kernel ELF (ELF64, little-endian, x86_64, with a loadable
 /// segment) via `readelf` and compute its SHA-256 digest. Converges the former
 /// `check-kernel.sh` gate into the CLI.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn check_kernel(path: &Path) -> Result<Value, CliError> {
     if !path.is_file() {
         return Err(validation(format!(
@@ -95,6 +103,10 @@ pub fn check_kernel(path: &Path) -> Result<Value, CliError> {
 /// CLI layer); `rustpython`/`mlua` embed the interpreters.
 /// This replaces `image/build-static.sh` while keeping package/build outputs
 /// explicit and avoiding any package installation.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn build_static_runtime(
     root: &Path,
     target: &str,
@@ -211,6 +223,10 @@ pub(super) fn is_dynamically_linked(path: &Path) -> Result<bool, CliError> {
 }
 
 /// Run a debugfs request against an image, optionally capturing stdout.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn run_debugfs(image: &Path, request: &str, capture_stdout: bool) -> Result<Vec<u8>, CliError> {
     // Keep inspection commands read-only. Only image mutation commands need
     // debugfs write mode; this prevents a validation/inspection path from

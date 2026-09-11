@@ -18,6 +18,10 @@ pub enum GuestTransport {
 }
 
 /// Start the reusable guest RFB1 entrypoint.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn run(transport: GuestTransport) -> io::Result<()> {
     #[cfg(feature = "forkd")]
     if let GuestTransport::ForkdAgent = transport {
@@ -43,6 +47,10 @@ pub async fn run(transport: GuestTransport) -> io::Result<()> {
 }
 
 /// Load the configured image environment without starting a transport.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn load_environment() -> io::Result<()> {
     crate::environment_loader::load_image_environment()
 }

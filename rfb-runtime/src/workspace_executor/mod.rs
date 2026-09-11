@@ -33,6 +33,10 @@ pub struct WorkspaceGuestExecutor {
 
 impl WorkspaceGuestExecutor {
     /// Create an executor rooted at `root` (created if missing), with limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn new(root: impl Into<PathBuf>, limits: RuntimeLimits) -> Result<Self, String> {
         limits.validate().map_err(str::to_owned)?;
         let root = root.into();

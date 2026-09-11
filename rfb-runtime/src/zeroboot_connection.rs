@@ -100,6 +100,10 @@ const TERMINATED_RETENTION: usize = 64;
 /// Serve one already-accepted ZBRT connection with its own [`RuntimeService`]
 /// (workspace executor). Generic over the stream so tests can use in-memory
 /// transports and the vsock listener can hand real split stream halves.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn serve<R, W>(
     reader: R,
     writer: W,

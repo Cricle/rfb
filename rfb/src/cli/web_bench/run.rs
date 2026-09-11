@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 
 /// Run the full web bench and return the sanitized summary. Blocks (exit 3)
 /// on any precondition the script used to treat as BLOCKED.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn bench(args: WebBenchArgs) -> Result<Value, CliError> {
     let base_url = require_localhost(&args.base_url)?;
     let forkd_url = require_localhost(&args.forkd_url)?;

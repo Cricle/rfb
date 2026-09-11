@@ -43,6 +43,10 @@ impl PathPolicy {
     }
 
     /// Resolve a workspace-relative path, rejecting escapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn workspace_path(&self, relative: impl AsRef<Path>) -> Result<PathBuf, PolicyError> {
         self.safe_join(&self.workspace_root, relative.as_ref())
     }
@@ -55,6 +59,10 @@ impl PathPolicy {
     /// assert_eq!(policy.host_read_path(0, "README").unwrap(), std::path::PathBuf::from("/sources/README"));
     /// assert!(matches!(policy.host_read_path(1, "README"), Err(PolicyError::NotAllowed)));
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn host_read_path(
         &self,
         root_index: usize,
@@ -68,6 +76,10 @@ impl PathPolicy {
     }
 
     /// Host paths are always read-only; any write is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn can_write_host(&self, _path: impl AsRef<Path>) -> Result<(), PolicyError> {
         Err(PolicyError::ReadOnly)
     }

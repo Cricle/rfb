@@ -129,6 +129,10 @@ fn resolve(name_path: &str) -> Result<(&'static Skill, &'static str), CliError> 
 }
 
 /// `skills read <name>[/<path>]`: resolve one file's content.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn read(name_path: &str) -> Result<SkillContent, CliError> {
     let (skill, path) = resolve(name_path)?;
     let content = skill
@@ -146,6 +150,10 @@ pub fn read(name_path: &str) -> Result<SkillContent, CliError> {
 }
 
 /// Serialize a [`SkillContent`] as a JSON envelope (used by `read --json`).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn content_json(content: &SkillContent) -> Result<String, CliError> {
     serde_json::to_string_pretty(&json!({
         "ok": true,

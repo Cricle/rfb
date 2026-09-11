@@ -78,6 +78,10 @@ impl SandboxExecuteAdapter {
         )
     }
     /// Execute an `ExecuteArgs` JSON value against the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn execute(&self, arguments: Value) -> Result<ToolOutput, ToolExecutionError> {
         let a: ExecuteArgs = decode(arguments)?;
         // The bash/execute tool speaks a shell-string contract: the command is

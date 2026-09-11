@@ -83,6 +83,10 @@ pub fn capability_text(caps: &HostCapabilities, tools: &Value) -> String {
 }
 
 /// Validate an architecture from CLI arguments against the current host.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn require_arch(arch: &str) -> Result<(), CliError> {
     let caps = detect();
     if arch != caps.arch {
@@ -97,6 +101,10 @@ pub fn require_arch(arch: &str) -> Result<(), CliError> {
 /// Require a real VM-capable Linux/WSL host (KVM + x86_64). Missing VM
 /// prerequisites carry the documented exit-12 contract (`EXIT_NOVM`), not the
 /// usage exit code — acceptance gates and CI assert on it.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn require_vm_host() -> Result<HostCapabilities, CliError> {
     let caps = detect();
     if !matches!(caps.kind, HostKind::Linux | HostKind::Wsl) {
@@ -116,6 +124,10 @@ pub fn require_vm_host() -> Result<HostCapabilities, CliError> {
 /// Run the read-only preflight gate. `require_vm` makes blocked prerequisites
 /// a hard error carrying the documented `EXIT_NOVM=12` contract; otherwise the
 /// caller reports SKIP.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn preflight(require_vm: bool) -> Result<HostCapabilities, CliError> {
     let caps = detect();
     if !matches!(caps.kind, HostKind::Linux | HostKind::Wsl) {

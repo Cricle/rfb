@@ -51,6 +51,10 @@ pub const fn capability_name(capability: Capability) -> Option<&'static str> {
 }
 
 /// Build the typed V1 Execute payload from the public sandbox contract.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn execute_request(spec: &ExecSpec, timeout: Duration) -> Result<Execute> {
     spec.validate().map_err(|e| Error::Backend(e.to_string()))?;
     let mut argv = Vec::with_capacity(spec.args.len() + 1);
@@ -250,6 +254,10 @@ impl ZeroBootSession {
     /// Firecracker publishes the relay socket before the guest binds its vsock
     /// listener, so this retries transient EOF/refusal until `connect_timeout`
     /// elapses, then negotiates capabilities with a Hello exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn open(
         uds_path: impl AsRef<std::path::Path>,
         port: u32,
@@ -281,6 +289,10 @@ impl ZeroBootSession {
 
     /// Wrap an already-connected relay stream and negotiate capabilities.
     /// Used by the provider after booting a VM and by mock-guest tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn from_stream(
         stream: tokio::net::UnixStream,
         io_timeout: Duration,
@@ -354,6 +366,10 @@ impl ZeroBootSession {
     /// Run one command, consuming Output frames until Exit and returning the
     /// captured streams. A legacy single-frame `Result` payload (used by older
     /// ZeroBoot rootfs images) is accepted for backward compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec(&self, request: Execute) -> std::result::Result<ExecResult, SessionError> {
         // Hold the turn lock for the whole command: a concurrent exec or
         // stream queues here instead of failing against the guest's
@@ -430,6 +446,10 @@ impl ZeroBootSession {
     }
 
     /// Round-trip a ZBRT Health request and return the guest's report.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn health(&self) -> std::result::Result<crate::guest::Health, SessionError> {
         let frame = self
             .exchange(
@@ -457,6 +477,10 @@ impl ZeroBootSession {
 
     /// Request cancellation of an in-flight request. Fails closed unless the
     /// guest advertises cancellation and answers `CancelAck`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn cancel(&self, reason: Option<String>) -> std::result::Result<(), SessionError> {
         let frame = self
             .exchange(
@@ -477,6 +501,10 @@ impl ZeroBootSession {
 
     /// Route one filesystem RPC. `op` is a host-defined ZBRT Fs opcode; the
     /// returned bytes are the guest's `FsResult` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn fs(
         &self,
         op: u8,
@@ -508,6 +536,10 @@ impl ZeroBootSession {
     /// Every frame wait (output, terminal, and `stop` drain) is bounded by a
     /// single absolute deadline derived from the request's timeout, so a stuck
     /// guest can never hang a stream consumer forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stream(self: &Arc<Self>, request: Execute) -> std::result::Result<ZeroBootStream, SessionError> {
         if !self.supports("stream") {
             return Err(SessionError::Protocol(

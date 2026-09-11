@@ -8,6 +8,10 @@ use crate::cli::error::{validation, CliError};
 ///
 /// Parses with `Url` so userinfo tricks like
 /// `http://127.0.0.1:8889@attacker.com/` resolve to their real host.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
     let trimmed = base_url.trim().trim_end_matches('/').to_owned();
     let parsed: url::Url = url::Url::parse(&trimmed).map_err(|e| {
@@ -39,6 +43,10 @@ pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
 /// Validate a snapshot tag against the forkd naming constraint. `.` and `..`
 /// are rejected: tags are joined into the snapshots root as directory names,
 /// so the dot entries would escape it.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn require_snapshot_tag(tag: &str) -> Result<&str, CliError> {
     let ok = !tag.is_empty()
         && tag.len() <= 128

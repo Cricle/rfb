@@ -63,6 +63,10 @@ fn container_path() -> String {
 }
 
 /// Run the forkd NDJSON guest agent on the given TCP address.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn run(addr: &str) -> io::Result<()> {
     std::fs::create_dir_all(transport::workspace_root())?;
     let listener = TcpListener::bind(addr).await?;

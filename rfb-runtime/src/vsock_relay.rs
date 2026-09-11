@@ -53,6 +53,10 @@ impl std::fmt::Display for RelayHandshakeError {
 /// number — the format real Firecracker emits. Anything else (including a
 /// bare `OK\n`) is a rejection; older handshakes that accepted it were never
 /// verified against a real Firecracker relay.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn parse_relay_response(line: &[u8]) -> Result<u32, RelayHandshakeError> {
     if line.len() > RELAY_MAX_LINE_BYTES {
         return Err(RelayHandshakeError::TooLong);
@@ -71,6 +75,10 @@ pub fn parse_relay_response(line: &[u8]) -> Result<u32, RelayHandshakeError> {
 ///
 /// Every I/O step is bounded by the same absolute `deadline`, so a slow-drip
 /// peer cannot extend the handshake indefinitely.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn perform_relay_handshake<S>(
     stream: &mut S,
     guest_port: u32,

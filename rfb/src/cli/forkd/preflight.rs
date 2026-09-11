@@ -14,6 +14,10 @@ use std::time::Duration;
 /// Build a forkd controller client from `FORKD_URL`/`FORKD_TOKEN` with a
 /// strict loopback check. `require_vm` gates the "controller must respond"
 /// expectation that acceptance/benchmark commands need.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn client_from_env(timeout: Duration) -> Result<ForkdClient, CliError> {
     let url = std::env::var("FORKD_URL").unwrap_or_else(|_| "http://127.0.0.1:8889".into());
     client_from_url_env(&url, timeout)
@@ -82,6 +86,10 @@ pub struct PreflightCheck {
 
 /// Run the read-only preflight gate. Collects platform/tool/forkd checks the
 /// same way the legacy `preflight.sh` did, but never mutates any state.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn preflight_checks(url: &str, tag: &str) -> Result<Vec<PreflightCheck>, CliError> {
     let mut checks: Vec<PreflightCheck> = Vec::new();
     let mut add = |name: &str, blocked: bool, reason: &str| {
@@ -231,6 +239,10 @@ pub async fn preflight_checks(url: &str, tag: &str) -> Result<Vec<PreflightCheck
 
 /// Read-only preflight against the controller: reachable + requested snapshot
 /// is `ready` and `bootable`. Never mutates controller or guest state.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn preflight(url: &str, tag: &str, require_vm: bool) -> Result<Value, CliError> {
     let checks = preflight_checks(url, tag).await?;
     let blocked = checks.iter().any(|check| check.blocked);

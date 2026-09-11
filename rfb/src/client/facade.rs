@@ -33,6 +33,10 @@ impl RfbClient {
     ///
     /// `token` becomes a `Authorization: Bearer <token>` header on every
     /// request when set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn new(
         base_url: impl Into<String>,
         token: Option<String>,
@@ -47,6 +51,10 @@ impl RfbClient {
     /// Create a client from the environment: `FORKD_URL`
     /// (default `http://127.0.0.1:8889`), `FORKD_TOKEN` (non-empty enables the
     /// bearer header), 10 second default timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn from_env() -> Result<Self, RfbError> {
         Ok(Self {
             http: crate::controller::ForkdClient::from_env()?,
@@ -55,12 +63,20 @@ impl RfbClient {
     }
 
     /// `GET /v1/snapshots`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>, RfbError> {
         Ok(self.http.list_snapshots().await?)
     }
 
     /// Snapshot detail with the `/info` → legacy endpoint fallback chain;
     /// both endpoints returning 404 yields `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn snapshot(&self, tag: &str) -> Result<Option<Snapshot>, RfbError> {
         Ok(self.http.snapshot_info(tag).await?)
     }
@@ -68,6 +84,10 @@ impl RfbClient {
     /// Poll `list_snapshots` every 100 ms until `tag` is `ready` and
     /// `bootable`. A `failed` status raises [`RfbError::Remote`] immediately;
     /// the deadline raises [`RfbError::Transport`] (timed out).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn wait_snapshot(&self, tag: &str, timeout_s: u64) -> Result<Snapshot, RfbError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s);
         loop {
@@ -92,6 +112,10 @@ impl RfbClient {
 
     /// `POST /v1/sandboxes` with [`CreateOptions`]; returns one [`Sandbox`]
     /// facade per created sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn create_sandbox(
         &self,
         snapshot_tag: &str,
@@ -114,6 +138,10 @@ impl RfbClient {
     }
 
     /// Convenience: create exactly one sandbox with default options.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn create_sandbox1(&self, snapshot_tag: &str) -> Result<Sandbox, RfbError> {
         self.create_sandbox(snapshot_tag, CreateOptions::default())
             .await?
@@ -123,6 +151,10 @@ impl RfbClient {
     }
 
     /// `GET /v1/sandboxes` — the live sandbox pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, RfbError> {
         Ok(self
             .http
@@ -144,17 +176,29 @@ impl RfbClient {
     /// [`Sandbox`] (attached as-is) or an id `&str` (resolved through
     /// `list_sandboxes`). Uses the default transport; see
     /// [`connect_id_with`](Self::connect_id_with) for an explicit choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn connect(&self, sandbox_or_id: impl ConnectTarget) -> Result<Sandbox, RfbError> {
         sandbox_or_id.connect_to(self).await
     }
 
     /// Attach by sandbox id: validates the id, resolves the sandbox through
     /// `list_sandboxes`, and returns a facade with the default transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn connect_id(&self, id: &str) -> Result<Sandbox, RfbError> {
         self.connect_id_with(id, GuestTransport::default()).await
     }
 
     /// Attach by sandbox id with an explicit [`GuestTransport`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn connect_id_with(
         &self,
         id: &str,
@@ -170,12 +214,20 @@ impl RfbClient {
     }
 
     /// `POST /v1/sandboxes/{id}/ping`; returns the controller JSON value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn ping_sandbox(&self, id: &str) -> Result<Value, RfbError> {
         validation::sandbox_id(id)?;
         Ok(self.http.ping(id).await?)
     }
 
     /// `DELETE /v1/sandboxes/{id}`; 2xx and 404 are both success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn delete_sandbox(&self, id: &str) -> Result<(), RfbError> {
         validation::sandbox_id(id)?;
         Ok(self.http.delete_sandbox(id).await?)
@@ -280,6 +332,10 @@ impl Sandbox {
 
     /// Probe the guest. NDJSON: `ping` action (`pong` flag). ZBRT: `Health` →
     /// `HealthAck` healthy flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn ping(&self) -> Result<bool, RfbError> {
         self.ops().ping().await
     }
@@ -288,6 +344,10 @@ impl Sandbox {
     /// is delivered on the ZBRT transport (NDJSON `exec` carries no stdin
     /// field on the wire and ignores it); `timeout_s` is ceil-ed to whole
     /// seconds for NDJSON and milli-seconds for ZBRT.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec(
         &self,
         args: &[impl AsRef<str>],
@@ -307,6 +367,10 @@ impl Sandbox {
     /// Evaluate code. The eval `output` maps to `ExecResult::stdout` on both
     /// transports. `cwd=None` uses the guest default; `timeout_s=None` means
     /// no explicit deadline (NDJSON omits the key, ZBRT sends 0).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval(
         &self,
         code: &str,
@@ -325,12 +389,20 @@ impl Sandbox {
     }
 
     /// `ls` a guest directory; defaults to the workspace root.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn ls(&self, path: &str) -> Result<Vec<DirEntry>, RfbError> {
         validation::fs_path(path)?;
         self.ops().ls(path).await
     }
 
     /// Find guest paths whose file name matches `pattern`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn find(&self, path: &str, pattern: &str) -> Result<Vec<String>, RfbError> {
         validation::fs_path(path)?;
         validation::pattern(pattern)?;
@@ -338,6 +410,10 @@ impl Sandbox {
     }
 
     /// Grep guest file contents; returns typed matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn grep(&self, path: &str, pattern: &str) -> Result<Vec<GrepMatch>, RfbError> {
         validation::fs_path(path)?;
         validation::pattern(pattern)?;
@@ -346,6 +422,10 @@ impl Sandbox {
 
     /// Read a guest file, optionally from `offset` with a `max_bytes` cap
     /// (1..=51200).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn read(
         &self,
         path: &str,
@@ -365,6 +445,10 @@ impl Sandbox {
 
     /// Write (or append to) a guest file; returns bytes written. The payload
     /// is capped at 51200 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn write(
         &self,
         path: &str,
@@ -383,6 +467,10 @@ impl Sandbox {
 
     /// Start an interactive stream. NDJSON supports `pty`/`env`; over ZBRT a
     /// requested `pty` or non-empty `env` is rejected locally (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stream(
         &self,
         args: &[impl AsRef<str>],
@@ -402,6 +490,10 @@ impl Sandbox {
 
     /// Delete the sandbox (`DELETE /v1/sandboxes/{id}`); 2xx and 404 are both
     /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn delete(&self) -> Result<(), RfbError> {
         Ok(self.http.delete_sandbox(&self.info.id).await?)
     }
@@ -688,6 +780,10 @@ enum StreamInner {
 
 impl GuestStream {
     /// Next event; `Ok(None)` on clean close.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, RfbError> {
         if self.exited {
             return Ok(None);
@@ -721,6 +817,10 @@ impl GuestStream {
 
     /// Send text to the guest's stdin. Raises [`RfbError::Remote`] after the
     /// stream has terminated; unsupported outright over ZBRT (see README).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn send_input(&mut self, text: impl Into<String>) -> Result<(), RfbError> {
         if self.exited {
             return Err(RfbError::Remote(
@@ -735,6 +835,10 @@ impl GuestStream {
     }
 
     /// Ask the guest to terminate the stream. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stop(&mut self) -> Result<(), RfbError> {
         match &mut self.inner {
             StreamInner::Ndjson(inner) => Ok(inner.stop().await?),

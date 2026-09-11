@@ -11,6 +11,10 @@ use crate::cli::image_build::{build_rootfs, build_static_runtime, check_kernel, 
 use serde_json::{json, Value};
 
 /// Run the full build pipeline and return a JSON report of every stage.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn build_all(args: &BuildAllArgs) -> Result<Value, CliError> {
     let features = args.features.trim();
     if features.is_empty() {

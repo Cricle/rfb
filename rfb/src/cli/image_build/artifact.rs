@@ -155,6 +155,10 @@ fn check_file(path: &str, digest: &str, label: &str, require_local: bool) -> Res
 }
 impl ArtifactManifest {
     /// Construct a manifest for a kernel artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn for_kernel(path: &Path, digest: &str) -> Result<Self, CliError> {
         Ok(Self {
             schema: "rfb-artifact/v1".into(),
@@ -180,6 +184,10 @@ impl ArtifactManifest {
     }
 
     /// Construct a manifest for a statically packaged runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn for_static_runtime(
         path: &Path,
         digest: &str,
@@ -236,6 +244,10 @@ impl ArtifactManifest {
     }
 
     /// Construct a manifest for a root filesystem artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn for_rootfs(
         output: &Path,
         digest: &str,
@@ -275,6 +287,10 @@ impl ArtifactManifest {
 
     /// Schema-level validation: structure, digest format, and non-empty
     /// required fields. Suitable for custom/opaque image manifests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn for_image(
         path: &Path,
         digest: &str,
@@ -332,6 +348,10 @@ impl ArtifactManifest {
 
     /// Validate only portable manifest structure and contract metadata.
     /// Local paths are intentionally optional for manifests moved between hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate_schema(&self) -> Result<(), CliError> {
         if self.schema != "rfb-artifact/v1" {
             return Err(validation("unsupported artifact schema"));
@@ -383,6 +403,10 @@ impl ArtifactManifest {
     }
 
     /// Verify every declared local file and reject missing paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn verify_local_files(&self) -> Result<(), CliError> {
         if let Some(kernel) = &self.kernel {
             check_file(&kernel.path, &kernel.sha256, "kernel", true)?;
@@ -398,6 +422,10 @@ impl ArtifactManifest {
 
     /// Full contract validation on top of `validate_schema`: the backend must
     /// match its declared transport/protocol/guest port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), CliError> {
         self.validate_schema()?;
         if !matches!(
@@ -480,6 +508,10 @@ impl ArtifactManifest {
         Ok(())
     }
     /// Load and schema-validate a manifest from a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn load(path: &Path) -> Result<Self, CliError> {
         let text = fs::read_to_string(path).map_err(|e| io(e.to_string()))?;
         let m: Self = serde_json::from_str(&text)
@@ -489,6 +521,10 @@ impl ArtifactManifest {
     }
 
     /// Load a manifest and perform full local validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn load_local(path: &Path) -> Result<Self, CliError> {
         let manifest = Self::load(path)?;
         manifest.validate()?;
@@ -496,6 +532,10 @@ impl ArtifactManifest {
     }
 
     /// Write this manifest beside `artifact` and return the sidecar path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn write_sidecar(&self, artifact: &Path) -> Result<PathBuf, CliError> {
         let p = PathBuf::from(format!("{}.artifact.json", artifact.display()));
         let data = serde_json::to_string_pretty(self).map_err(|e| io(e.to_string()))? + "\n";

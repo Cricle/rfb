@@ -16,6 +16,10 @@ pub const GUEST_READY_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// The address is validated as a real `SocketAddr` before any traffic is sent;
 /// forkd must always report a usable host:port for the guest listener.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn wait_for_guest_ready(address: &str, deadline: Duration) -> Result<Value, CliError> {
     if address.trim().is_empty() {
         return Err(validation("sandbox returned an empty guest address"));
@@ -43,6 +47,10 @@ pub async fn wait_for_guest_ready(address: &str, deadline: Duration) -> Result<V
 }
 
 /// Create `n` sandboxes from a bootable snapshot. Returns the parsed response.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn create_sandbox(
     url: &str,
     tag: &str,
@@ -68,6 +76,10 @@ pub async fn create_sandbox(
 
 /// Destroy a sandbox, reconciling a transport anomaly by confirming against the
 /// live sandbox list (some controllers close an empty 204 before curl/reply).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn destroy_sandbox(url: &str, sandbox_id: &str) -> Result<(), CliError> {
     let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
         .map_err(|error| validation(error.to_string()))?;
@@ -86,6 +98,10 @@ pub async fn destroy_sandbox(url: &str, sandbox_id: &str) -> Result<(), CliError
 }
 
 /// List live sandboxes (used for destroy reconciliation and orphan checks).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn list_sandboxes(url: &str) -> Result<Vec<SandboxInfo>, CliError> {
     let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
         .map_err(|error| validation(error.to_string()))?;
@@ -96,6 +112,10 @@ pub async fn list_sandboxes(url: &str) -> Result<Vec<SandboxInfo>, CliError> {
 }
 
 /// Ping a sandbox via the controller.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn ping_sandbox(url: &str, sandbox_id: &str) -> Result<Value, CliError> {
     let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
         .map_err(|error| validation(error.to_string()))?;
@@ -107,6 +127,10 @@ pub async fn ping_sandbox(url: &str, sandbox_id: &str) -> Result<Value, CliError
 
 /// Execute a single NDJSON guest RPC against the guest address returned by
 /// forkd. `terminal` stops reading at the `exit_code` frame (exec/stream).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn guest_call(address: &str, action: Value, terminal: bool) -> Result<Value, CliError> {
     let client = ForkdGuestClient::new(address.to_owned());
     if terminal {

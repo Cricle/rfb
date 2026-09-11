@@ -15,6 +15,10 @@ use serde_json::{json, Value};
 /// structured filesystem RPCs and negative path validation, then destroy.
 /// Provenance requirements are validated by the dispatcher
 /// (`--snapshot-binding` + `--artifact-manifest`) before this runs.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value, CliError> {
     // Preflight is part of the gate: without a bootable snapshot the gate is a
     // hard BLOCKED when `require_vm` is set. Missing VM prerequisites carry the

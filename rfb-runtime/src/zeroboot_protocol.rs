@@ -9,7 +9,7 @@
 //! host/provider types in the `rfb` crate re-export these items
 //! (`rfb::protocol`) so both crates share a single implementation without a
 //! `rfb` <-> `rfb-runtime` dependency cycle.
-#![allow(missing_docs)]
+#![allow(missing_docs, clippy::missing_errors_doc)]
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::time::Duration;
@@ -17,6 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Read one complete ZBRT frame from an async transport, bounded by
 /// [`MAX_PAYLOAD`].
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
@@ -33,6 +37,10 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
 }
 
 /// Write one complete ZBRT frame to an async transport.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn write_frame_async<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &Frame,
@@ -81,6 +89,10 @@ impl HostSession {
         Self::default()
     }
     /// Negotiate the intersection of host and guest capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn negotiate_capabilities(
         &mut self,
         hello: Hello,

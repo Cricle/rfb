@@ -31,6 +31,10 @@ use rfb_runtime::session::{ControlMessage, RuntimeMessage};
 
 /// Full RFB1 acceptance: boot a real VM, validate the rootfs contract, then
 /// run HelloAck / Capabilities / ShutdownAck over the vsock relay.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn acceptance(
     kernel: &Path,
     rootfs: &Path,

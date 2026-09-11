@@ -53,6 +53,10 @@ impl RuntimeLimits {
     /// limits.channel_capacity = 0;
     /// assert_eq!(limits.validate(), Err("invalid channel_capacity"));
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_frame_bytes == 0 || self.max_frame_bytes > 64 * 1024 * 1024 {
             return Err("invalid max_frame_bytes");

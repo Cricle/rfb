@@ -73,6 +73,10 @@ impl RigPortableTools {
         })
     }
     /// Invoke a capability directly with JSON arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn invoke(
         &self,
         c: RigCapability,

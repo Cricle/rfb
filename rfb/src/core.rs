@@ -159,6 +159,10 @@ impl ImageManifest {
     }
 
     /// Validate required fields and nested resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.image_ref.trim().is_empty() {
             return Err(ManifestError::EmptyImageRef);
@@ -210,6 +214,10 @@ pub struct Resources {
 
 impl Resources {
     /// Validate that any present limit is non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.cpus == Some(0)
             || self.memory_bytes == Some(0)
@@ -306,6 +314,10 @@ pub struct SandboxSpec {
 
 impl SandboxSpec {
     /// Validate resources and, when present, the image manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.resources.validate()?;
         if let Some(i) = &self.image {
@@ -358,6 +370,10 @@ impl ExecSpec {
     }
 
     /// Validate the command, timeout, and working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.command.trim().is_empty() {
             return Err(ContractError::EmptyCommand);

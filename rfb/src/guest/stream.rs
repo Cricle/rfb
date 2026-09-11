@@ -70,6 +70,10 @@ impl StreamSpec {
         }
     }
     /// Validate command, timeout, working directory, and environment keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.command.trim().is_empty() {
             return Err(ContractError::EmptyCommand);

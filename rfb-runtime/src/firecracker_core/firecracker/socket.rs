@@ -69,6 +69,10 @@ pub fn readiness_error(
 
 /// Read a complete HTTP response (headers + content-length body) from the
 /// Firecracker API socket with hard size limits.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn read_http_response(stream: &mut impl Read) -> Result<Vec<u8>> {
     const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
     const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
@@ -160,6 +164,10 @@ pub fn read_http_response(stream: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 /// Parse a Firecracker API response, failing on a non-2xx status line.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn parse_api_response(response: &[u8], method: &str, path: &str) -> Result<String> {
     let resp = String::from_utf8_lossy(response);
     let status_line = resp.lines().next().unwrap_or_default();

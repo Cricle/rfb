@@ -123,11 +123,19 @@ pub struct ForkdClient {
 }
 impl ForkdClient {
     /// Construct a client from the standard FORKD_* environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn from_env() -> Result<Self, ForkdClientError> {
         Self::new(ForkdConfig::from_env())
     }
 
         /// Construct a forkd client from the given configuration.
+        ///
+        /// # Errors
+        ///
+        /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn new(config: ForkdConfig) -> Result<Self, ForkdClientError> {
         let controller = controller::ForkdClient::new(
             config.base_url.clone(),
@@ -140,14 +148,26 @@ impl ForkdClient {
         })
     }
     /// Validate a sandbox identifier's character syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate_sandbox_id(id: &str) -> Result<(), ForkdClientError> {
         controller::ForkdClient::validate_sandbox_id(id)
     }
     /// Validate that a string parses as a guest TCP address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate_guest_address(a: &str) -> Result<(), ForkdClientError> {
         controller::ForkdClient::validate_guest_address(a)
     }
     /// Create a single forkd sandbox and return a handle to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn create(
         &self,
         req: &CreateSandboxRequest<'_>,
@@ -164,6 +184,10 @@ impl ForkdClient {
         })
     }
     /// Create sandboxes and return their raw metadata from the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn create_sandbox(
         &self,
         req: &CreateSandboxRequest<'_>,
@@ -171,6 +195,10 @@ impl ForkdClient {
         self.controller.create_sandbox(req).await
     }
     /// Wait until the named snapshot reaches a ready/bootable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn wait_for_snapshot_ready(
         &self,
         tag: &str,
@@ -179,23 +207,43 @@ impl ForkdClient {
         self.controller.wait_for_snapshot_ready(tag, timeout).await
     }
     /// List live sandboxes from the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>, ForkdClientError> {
         self.controller.list_sandboxes().await
     }
     /// Ping a sandbox by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn ping(&self, sandbox_id: &str) -> Result<serde_json::Value, ForkdClientError> {
         self.controller.ping(sandbox_id).await
     }
     /// Delete a sandbox by id (idempotent on 404).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), ForkdClientError> {
         self.controller.delete_sandbox(sandbox_id).await
     }
     /// Fetch detailed snapshot metadata, falling back for older controllers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn snapshot_info(&self, tag: &str) -> Result<Option<SnapshotInfo>, ForkdClientError> {
         self.controller.snapshot_info(tag).await
     }
 
     /// Whether the named snapshot exists and is ready/bootable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn snapshot_ready(&self, tag: &str) -> Result<bool, ForkdClientError> {
         self.controller.snapshot_ready(tag).await
     }

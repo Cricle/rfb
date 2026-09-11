@@ -65,6 +65,10 @@ impl SandboxBackendConfig {
     /// Read [`BACKEND_ENV`] and load the selected backend's own environment
     /// configuration (`RFB_FIRECRACKER_*`-style paths for zeroboot, `FORKD_*`
     /// for forkd).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn from_environment() -> Result<Self, ProviderError> {
         let unavailable = |message: String| ProviderError::Unavailable(message);
         let name = std::env::var(BACKEND_ENV)

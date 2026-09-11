@@ -42,6 +42,10 @@ impl LsRequest {
         }
     }
     /// Validate the path and result cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_fs_path(&self.path)?;
         validate_limit(self.max_results, MAX_GUEST_RESULTS)?;
@@ -91,6 +95,10 @@ impl FindRequest {
         }
     }
     /// Validate path, pattern, and result cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_fs_path(&self.path)?;
         validate_pattern(&self.pattern)?;
@@ -161,6 +169,10 @@ impl GrepRequest {
         }
     }
     /// Validate path, pattern, and both caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_fs_path(&self.path)?;
         validate_pattern(&self.pattern)?;

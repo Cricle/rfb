@@ -28,6 +28,10 @@ impl ReadRequest {
         }
     }
     /// Validate the path and, when set, the byte cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_guest_file_path(&self.path)?;
         if let Some(max_bytes) = self.max_bytes {
@@ -86,6 +90,10 @@ impl WriteRequest {
         }
     }
     /// Validate the path and payload size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_guest_file_path(&self.path)?;
         validate_payload_size(self.data.len(), super::limits::MAX_GUEST_RESULT_BYTES)?;

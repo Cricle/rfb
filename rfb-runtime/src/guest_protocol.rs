@@ -8,6 +8,10 @@ use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Write one host-to-guest control message as a length-delimited frame.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn write_control_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     codec: &FrameCodec,
@@ -29,6 +33,10 @@ pub async fn write_control_message<W: AsyncWrite + Unpin>(
 
 /// Write one control message over a blocking transport (e.g. vsock or Unix
 /// stream). This is the synchronous counterpart of [`write_control_message`].
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub fn write_control_message_blocking<W: Write>(
     writer: &mut W,
@@ -51,6 +59,10 @@ pub fn write_control_message_blocking<W: Write>(
 
 /// Read one runtime message over a blocking transport (e.g. vsock or Unix
 /// stream). This is the synchronous counterpart of [`read_runtime_message`].
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub fn read_runtime_message_blocking_with_sequence<R: Read>(
     reader: &mut R,
@@ -74,6 +86,10 @@ pub fn read_runtime_message_blocking_with_sequence<R: Read>(
 
 /// Read one guest-to-host runtime message over a blocking transport (Linux
 /// vsock / Unix stream) and return just the message.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(target_os = "linux")]
 pub fn read_runtime_message_blocking<R: Read>(
     reader: &mut R,
@@ -83,6 +99,10 @@ pub fn read_runtime_message_blocking<R: Read>(
 }
 
 /// Read and validate one guest-to-host runtime message frame.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_runtime_message_with_sequence<R: AsyncRead + Unpin>(
     reader: &mut R,
     codec: &FrameCodec,
@@ -105,6 +125,10 @@ pub async fn read_runtime_message_with_sequence<R: AsyncRead + Unpin>(
 
 /// Read one guest-to-host runtime message over an async transport and return
 /// just the message (discarding the sequence).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_runtime_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     codec: &FrameCodec,
@@ -137,6 +161,10 @@ pub enum GuestProtocolError {
 
 /// Decode a buffer of length-delimited guest frames into sequenced messages,
 /// rejecting unexpected message types.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn decode_guest_messages_with_sequence(
     codec: &FrameCodec,
     bytes: &[u8],
@@ -178,6 +206,10 @@ pub fn decode_guest_messages_with_sequence(
 }
 
 /// Decode a buffer of guest frames, discarding sequence numbers.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn decode_guest_messages(
     codec: &FrameCodec,
     bytes: &[u8],

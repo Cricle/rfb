@@ -14,6 +14,10 @@ use std::{fs, io::Write, path::Path, process::Command};
 use tempfile::NamedTempFile;
 
 /// Initialize a new staging directory + manifest.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn init(directory: &Path, size: u64, force: bool) -> Result<Value, CliError> {
     if size == 0 || !size.is_multiple_of(4096) {
         return Err(validation("--size must be a non-zero multiple of 4096"));
@@ -43,6 +47,10 @@ pub fn init(directory: &Path, size: u64, force: bool) -> Result<Value, CliError>
 }
 
 /// Dry-run or real ext4 build from a validated manifest.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn build(
     manifest_path: &Path,
     output: Option<&Path>,
@@ -252,6 +260,10 @@ pub const LUA_LIB_DIR: &str = "/usr/lib/lua/5.4";
 /// setup`/`image build-rootfs` path). Creates the ext4 with a fixed 0755
 /// entrypoint, protocol marker, and (for rfb-vsock) the executor environment.
 /// `force` must be set to overwrite an existing output.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn build_rootfs(
     runtime_bin: &Path,
     output: &Path,

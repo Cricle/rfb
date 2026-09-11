@@ -43,6 +43,10 @@ pub fn firecracker_version_ok(firecracker: &str) -> bool {
 
 /// Validate the guest rootfs contract (protocol marker + entrypoint) with
 /// debugfs, mirroring the script's `cat`/`stat` gates.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate_rootfs_contract(image: &Path) -> Result<(), CliError> {
     if !image.is_file() {
         return Err(validation(format!(
@@ -142,6 +146,10 @@ impl Drop for BootChildGuard {
 
 /// Start a Firecracker VM with the given kernel/rootfs and vsock relay, and wait
 /// for the UDS to appear.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError> {
     let BootOptions {
         firecracker,
@@ -253,6 +261,10 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
 }
 
 /// Boot a Firecracker VM for the RFB1 runtime (init=/sbin/rfb-runtime vsock).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn boot_firecracker(
     firecracker: &str,
     kernel: &Path,

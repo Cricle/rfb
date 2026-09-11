@@ -33,6 +33,10 @@ impl EvalRequest {
         }
     }
     /// Validate code, timeout, and working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.code.trim().is_empty() {
             return Err(ContractError::EmptyCode);

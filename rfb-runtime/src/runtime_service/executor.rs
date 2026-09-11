@@ -8,13 +8,29 @@ use std::sync::Arc;
 /// the runtime service owns identity, sequencing, lifecycle, and protocol safety.
 pub trait GuestExecutor: Send {
     /// Start a turn and return its events (or an error).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn start_turn(&mut self, request: &SessionRequest) -> Result<Vec<GuestEvent>, String>;
     /// Cancel an in-flight turn for the given identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn cancel(&mut self, session_id: &str, request_id: &str) -> Result<(), String>;
     /// Shut down this executor, releasing any child processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn shutdown(&mut self) -> Result<(), String>;
 
     /// Read a structured workspace file. Unsupported by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn read_workspace_file(
         &mut self,
         _request: &crate::session::FileReadRequest,
@@ -22,6 +38,10 @@ pub trait GuestExecutor: Send {
         Err("structured file RPC is not supported by this executor".into())
     }
     /// Write a structured workspace file. Unsupported by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn write_workspace_file(
         &mut self,
         _request: &crate::session::FileWriteRequest,
@@ -30,6 +50,10 @@ pub trait GuestExecutor: Send {
     }
 
     /// Handle a typed filesystem RPC and return its JSON result.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     fn filesystem_rpc(&mut self, _op: u8, _path: &str, _data: &[u8]) -> Result<Vec<u8>, String> {
         Err("filesystem RPC is not supported by this executor".into())
     }

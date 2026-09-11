@@ -76,6 +76,10 @@ impl ForkdGuestClient {
     /// The collected set is capped (aggregate bytes + line count) so a
     /// hostile or broken guest streaming non-terminal lines cannot grow host
     /// memory without bound; the loop otherwise ends only on a terminal key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn request(&self, action: Value) -> Result<Vec<Value>, ForkdGuestError> {
         const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
         const MAX_RESPONSE_LINES: usize = 65_536;
@@ -127,6 +131,10 @@ impl ForkdGuestClient {
     }
 
     /// Start a stream on one TCP connection. `cwd` is an opaque guest path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stream(
         &self,
         args: Vec<String>,
@@ -159,6 +167,10 @@ impl ForkdGuestClient {
     }
 
     /// Ping the guest and return its response value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn ping(&self) -> Result<Value, ForkdGuestError> {
         self.request(serde_json::json!({"action":"ping"}))
             .await?
@@ -167,6 +179,10 @@ impl ForkdGuestClient {
     }
 
     /// Execute one of the structured, read-only guest filesystem RPCs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn execute_tool(&self, tool: &str, args: Value) -> Result<Value, ForkdGuestError> {
         let request = match tool {
             "ls" => {
@@ -227,6 +243,10 @@ impl ForkdGuestClient {
     }
 
     /// Execute a command in the guest root directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec(
         &self,
         args: Vec<String>,
@@ -237,6 +257,10 @@ impl ForkdGuestClient {
 
     /// Execute a command in a path interpreted by the guest runtime.
     /// `guest_cwd` is opaque and is never converted to a host path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn exec_in(
         &self,
         guest_cwd: &str,
@@ -252,11 +276,19 @@ impl ForkdGuestClient {
     }
 
     /// Evaluate code in the guest root directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval(&self, code: impl Into<String>) -> Result<Value, ForkdGuestError> {
         self.eval_in("/", code).await
     }
 
     /// Evaluate code in a guest working directory. `guest_cwd` remains opaque.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval_in(
         &self,
         guest_cwd: &str,
@@ -270,6 +302,10 @@ impl ForkdGuestClient {
 
     /// Send the typed eval request while preserving its wire-level fields.
     /// RFB durations are milliseconds, whereas forkd's eval timeout is seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn eval_request(
         &self,
         request: crate::guest::EvalRequest,
@@ -297,6 +333,10 @@ impl ForkdGuestClient {
 
 impl ForkdGuestStream {
     /// Read the next protocol event. A terminal exit event is returned normally.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn next_event(&mut self) -> Result<Option<Value>, ForkdGuestError> {
         let value = read_json_line(&mut self.reader, self.timeout).await?;
         if let Some(ref value) = value {
@@ -309,6 +349,10 @@ impl ForkdGuestStream {
     }
 
     /// Send input to the running guest stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn send_input(&mut self, input: impl Into<String>) -> Result<(), ForkdGuestError> {
         if self.terminal || self.stopped {
             return Err(ForkdGuestError::Remote(
@@ -324,6 +368,10 @@ impl ForkdGuestStream {
     }
 
     /// Ask the guest stream to terminate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stop(&mut self) -> Result<(), ForkdGuestError> {
         if self.terminal || self.stopped {
             return Ok(());
