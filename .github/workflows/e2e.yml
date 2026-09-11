@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload sanitized logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forkd-e2e-logs-${{ github.run_id }}
           path: ${{ runner.temp }}/forkd-e2e-logs/
