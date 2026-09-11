@@ -44,7 +44,7 @@
     "directory": "sdk/nodejs"
   },
   "devDependencies": {
-    "@types/node": "^22.14.0",
+    "@types/node": "^26.5.0",
     "typescript": "^7.0.2"
   },
   "sideEffects": false
