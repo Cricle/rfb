@@ -382,7 +382,7 @@ impl ZeroBootSession {
             + EXEC_DEADLINE_MARGIN;
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         self.inflight.lock().await.insert(request_id, tx);
-        {
+        let write_result = {
             let mut writer = self.writer.lock().await;
             write_frame_async(
                 &mut *writer,
@@ -394,7 +394,13 @@ impl ZeroBootSession {
                 },
             )
             .await
-            .map_err(map_io_error)?;
+            .map_err(map_io_error)
+        };
+        if let Err(error) = write_result {
+            // The request never reached the wire; do not leak the inflight
+            // entry (and its channel) for the rest of the session.
+            self.inflight.lock().await.remove(&request_id);
+            return Err(error);
         }
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -408,15 +414,30 @@ impl ZeroBootSession {
             }
             match frame.kind {
                 Kind::Output => {
-                    let output = Output::decode(&frame.payload).map_err(protocol_error)?;
-                    if output.stream == 0 {
-                        stdout.extend_from_slice(&output.data);
-                    } else {
-                        stderr.extend_from_slice(&output.data);
+                    let output = match Output::decode(&frame.payload) {
+                        Ok(output) => output,
+                        Err(error) => break Err(protocol_error(error)),
+                    };
+                    match output.stream {
+                        0 => stdout.extend_from_slice(&output.data),
+                        1 => stderr.extend_from_slice(&output.data),
+                        other => {
+                            break Err(SessionError::Protocol(format!(
+                                "unknown output stream {other}"
+                            )))
+                        }
+                    }
+                    if stdout.len().saturating_add(stderr.len()) > MAX_EXEC_OUTPUT_BYTES {
+                        break Err(SessionError::Protocol(
+                            "guest output exceeded the 16 MiB limit".into(),
+                        ));
                     }
                 }
                 Kind::Exit => {
-                    let exit = Exit::decode(&frame.payload).map_err(protocol_error)?;
+                    let exit = match Exit::decode(&frame.payload) {
+                        Ok(exit) => exit,
+                        Err(error) => break Err(protocol_error(error)),
+                    };
                     break Ok(ExecResult {
                         status: Some(exit.code),
                         stdout,
@@ -425,7 +446,10 @@ impl ZeroBootSession {
                     });
                 }
                 Kind::Result => {
-                    let (code, out, err) = parse_legacy_result(&frame.payload)?;
+                    let (code, out, err) = match parse_legacy_result(&frame.payload) {
+                        Ok(parsed) => parsed,
+                        Err(error) => break Err(error),
+                    };
                     break Ok(ExecResult {
                         status: Some(code),
                         stdout: out,
@@ -557,7 +581,7 @@ impl ZeroBootSession {
         let turn_guard = self.turn_lock.clone().lock_owned().await;
         let (tx, rx) = mpsc::unbounded_channel::<Frame>();
         self.inflight.lock().await.insert(request_id, tx);
-        {
+        let write_result = {
             let mut writer = self.writer.lock().await;
             write_frame_async(
                 &mut *writer,
@@ -569,7 +593,13 @@ impl ZeroBootSession {
                 },
             )
             .await
-            .map_err(map_io_error)?;
+            .map_err(map_io_error)
+        };
+        if let Err(error) = write_result {
+            // The stream request never reached the wire; drop the inflight
+            // entry so it cannot outlive the failed call.
+            self.inflight.lock().await.remove(&request_id);
+            return Err(error);
         }
         Ok(ZeroBootStream {
             session: self.clone(),
@@ -577,6 +607,7 @@ impl ZeroBootSession {
             rx,
             deadline,
             terminated: false,
+            pending: std::collections::VecDeque::new(),
             _turn_guard: Some(turn_guard),
         })
     }
@@ -771,6 +802,9 @@ pub struct ZeroBootStream {
     /// and the `stop` drain). Derived from the Execute request's timeout.
     deadline: tokio::time::Instant,
     terminated: bool,
+    /// Events decoded but not yet delivered (legacy `Result` frames expand to
+    /// stdout/stderr chunks plus a terminal Exit).
+    pending: std::collections::VecDeque<StreamEvent>,
     /// Held while this stream occupies the guest's single turn. Released as
     /// soon as the terminal frame discharges the turn (or on drop, which
     /// frees the queue but leaves the guest turn active until the next
@@ -802,6 +836,9 @@ impl GuestStream for ZeroBootStream {
         &'a mut self,
     ) -> BoxFuture<'a, std::result::Result<Option<StreamEvent>, SandboxError>> {
         Box::pin(async move {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
             if self.terminated {
                 return Ok(None);
             }
@@ -833,10 +870,16 @@ impl GuestStream for ZeroBootStream {
                     let output = Output::decode(&frame.payload).map_err(|e| {
                         SandboxError::Transport(format!("invalid Output frame: {e}"))
                     })?;
-                    let event = if output.stream == 0 {
-                        StreamEvent::Stdout { data: output.data }
-                    } else {
-                        StreamEvent::Stderr { data: output.data }
+                    let event = match output.stream {
+                        0 => StreamEvent::Stdout { data: output.data },
+                        1 => StreamEvent::Stderr { data: output.data },
+                        other => {
+                            self.discharge();
+                            self.unregister();
+                            return Err(SandboxError::Transport(format!(
+                                "unknown output stream id {other}"
+                            )));
+                        }
                     };
                     Ok(Some(event))
                 }
@@ -853,17 +896,21 @@ impl GuestStream for ZeroBootStream {
                 Kind::Result => {
                     let (code, out, err) = parse_legacy_result(&frame.payload)
                         .map_err(|e| SandboxError::Transport(e.to_string()))?;
+                    self.discharge();
                     self.unregister();
                     // Emit the captured streams first (stdout has wire
-                    // priority), then the terminal Exit on the next call.
+                    // priority), then the terminal Exit. These are queued
+                    // because unregister() drops the frame sender: reading
+                    // them from the channel would report a clean end before
+                    // the exit code is delivered.
                     if !out.is_empty() {
-                        return Ok(Some(StreamEvent::Stdout { data: out }));
+                        self.pending.push_back(StreamEvent::Stdout { data: out });
                     }
                     if !err.is_empty() {
-                        return Ok(Some(StreamEvent::Stderr { data: err }));
+                        self.pending.push_back(StreamEvent::Stderr { data: err });
                     }
-                    self.discharge();
-                    Ok(Some(StreamEvent::Exit { code: Some(code) }))
+                    self.pending.push_back(StreamEvent::Exit { code: Some(code) });
+                    Ok(self.pending.pop_front())
                 }
                 Kind::Error => {
                     let error = remote_error(&frame.payload);
@@ -992,6 +1039,10 @@ const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const EXEC_DEADLINE_MARGIN: Duration = Duration::from_secs(15);
+/// Aggregate cap on one exec turn's captured output (mirrors the NDJSON/ZBRT
+/// response caps).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const MAX_EXEC_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn protocol_error<E: fmt::Display>(error: E) -> SessionError {

@@ -28,11 +28,13 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(());
     }
     // Establish the deadline before spawning so the complete request, not just
-    // child execution after spawn, is bounded by the caller's timeout.
+    // child execution after spawn, is bounded by the caller's timeout. An
+    // overflowing timeout (an absurd u64 of seconds) saturates to "no explicit
+    // deadline" instead of panicking on Instant + Duration.
     let deadline = request
         .get("timeout")
         .and_then(Value::as_u64)
-        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+        .and_then(|seconds| tokio::time::Instant::now().checked_add(Duration::from_secs(seconds)));
     if let Some(kind) = builtin(request) {
         // Keep the same request validation and wire lifecycle without creating
         // a process (shell-free rootfs images may lack /bin/echo).

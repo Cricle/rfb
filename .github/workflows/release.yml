@@ -90,7 +90,8 @@ jobs:
             dist/rfb-cli-linux-x64
             dist/SHA256SUMS
           generate_release_notes: true
-      # CLI 二进制供 pypi / nuget job 打包（rfb-cli / Rfb.Cli）。
+      # CLI 二进制供 npm / nuget job 打包（rfb-cli / Rfb.Cli；两者都是
+      # 仅清单 + 二进制的包，不含任何包装代码）。
       - name: Upload CLI binary artifact
         uses: actions/upload-artifact@v7
         with:
@@ -100,7 +101,7 @@ jobs:
           retention-days: 1
 
   pypi:
-    name: Publish rfb-sdk + rfb-cli to PyPI
+    name: Publish rfb-sdk to PyPI
     needs: crates
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -125,7 +126,7 @@ jobs:
             bash scripts/ci-annotate.sh release-pypi "$log" 3000
             exit "$rc"
           fi
-      # 重跑保护：PyPI 上该版本已存在时跳过发布（twine 对重复文件会报错失败）。
+      # 重跑保护：PyPI 上该版本已存在时跳过发布（重复版本发布会报错失败）。
       - name: Skip publish if version already on PyPI (rfb-sdk)
         id: pypi_guard
         run: |
@@ -144,59 +145,6 @@ jobs:
         with:
           packages-dir: sdk/python/dist
           password: ${{ secrets.PYPI_KEY }}
-
-      # rfb-cli：二进制 wheel（仅 linux-x64，无任何 Python 包装代码）。
-      - name: Download CLI binary
-        uses: actions/download-artifact@v8
-        with:
-          name: rfb-cli-linux-x64
-          path: dist-cli/raw
-      - name: Build rfb-cli wheel
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade build wheel
-          mkdir -p sdk/python-cli/rfb_cli/_bin dist-cli
-          cp dist-cli/raw/rfb-cli sdk/python-cli/rfb_cli/_bin/rfb-cli
-          chmod +x sdk/python-cli/rfb_cli/_bin/rfb-cli
-          python -m build --wheel sdk/python-cli
-          wheel_file=$(ls sdk/python-cli/dist/*.whl)
-          # --remove：不带它 wheel tags 会同时留下原 py3-none-any wheel，
-          # 而 any-wheel 会把 linux-x64 二进制装到 mac/Windows 上（实测
-          # PyPI 0.0.1 曾同时出现两个文件）。
-          python -m wheel tags --remove --platform-tag manylinux_2_39_x86_64 "$wheel_file"
-          mv sdk/python-cli/dist/*.whl dist-cli/
-      - name: Skip publish if version already on PyPI (rfb-cli)
-        id: pypi_cli_guard
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          code=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/rfb-cli/${VERSION}/json" || true)
-          if [ "$code" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "rfb-cli ${VERSION} 已在 PyPI 上，跳过重复发布"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Publish rfb-cli to PyPI
-        if: steps.pypi_cli_guard.outputs.exists != 'true'
-        env:
-          PYPI_KEY: ${{ secrets.PYPI_KEY }}
-        run: |
-          set -uo pipefail
-          # 用 twine 而非 pypa action：上传失败的原因（403 token 范围 /
-          # 400 元数据）必须以 ::error:: 注解带出，否则无法排障。
-          python -m pip install --upgrade twine
-          log=/tmp/release-py-cli.log
-          set +e
-          python -m twine upload --verbose --non-interactive \
-            -u __token__ -p "$PYPI_KEY" dist-cli/*.whl 2>&1 | tee "$log"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::twine upload rfb-cli 失败 rc=$rc（尾部见注解）"
-            bash scripts/ci-annotate.sh release-py-cli "$log" 2000
-            exit "$rc"
-          fi
 
   maven:
     name: Publish rfb-sdk to Maven Central

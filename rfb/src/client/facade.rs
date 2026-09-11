@@ -560,8 +560,10 @@ impl GuestOps {
                 // the source (see README known limitations). Whole seconds are
                 // sent as milliseconds; `None` sends 0 (no explicit deadline).
                 let argv = vec!["eval".to_owned(), code.to_owned()];
+                // Clamp like `exec` instead of reporting "no deadline" for an
+                // overflowing timeout (PROTOCOL.md §3.2 documents clamping).
                 let timeout_ms = secs
-                    .and_then(|s| u32::try_from(s.saturating_mul(1000)).ok())
+                    .map(|s| u32::try_from(s.saturating_mul(1000)).unwrap_or(u32::MAX))
                     .unwrap_or(0);
                 guest
                     .exec(argv, cwd.map(str::to_owned), Vec::new(), timeout_ms)

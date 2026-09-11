@@ -204,14 +204,20 @@ pub async fn workload(
         }
     }
 
-    // Orphan check.
+    // Orphan check. A list failure must fail the gate: reporting PASS without
+    // orphans evidence would claim the documented orphan=0 result blindly.
     let orphans: Vec<String> = match list_sandboxes(url).await {
         Ok(remaining) => remaining
             .iter()
             .filter(|s| created.contains(&s.id))
             .map(|s| s.id.clone())
             .collect(),
-        Err(_) => vec![],
+        Err(error) => {
+            return Err(external(format!(
+                "WORKLOAD_RFB FAIL orphan check failed: {}",
+                error.message
+            )));
+        }
     };
     let total_ops: usize = op_count.values().sum();
     if failed || !orphans.is_empty() {

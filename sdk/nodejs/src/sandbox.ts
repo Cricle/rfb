@@ -99,15 +99,37 @@ function firstOf(value: Record<string, unknown>, current: string, legacy: string
 function valueBytes(value: unknown): Buffer {
   if (value === undefined || value === null) return Buffer.alloc(0);
   if (typeof value === 'string') return Buffer.from(value, 'utf8');
-  if (Array.isArray(value)) return Buffer.from(value as number[]);
+  if (Array.isArray(value)) {
+    // Reject anything that is not a u8 instead of Buffer.from's silent coercion
+    // (matches the Rust baseline's strict decode).
+    const bytes = Buffer.alloc(value.length);
+    for (let i = 0; i < value.length; i += 1) {
+      const item = value[i];
+      if (typeof item !== 'number' || !Number.isInteger(item) || item < 0 || item > 0xff) {
+        throw new DecodeError('expected a byte array or string');
+      }
+      bytes[i] = item;
+    }
+    return bytes;
+  }
   throw new DecodeError('expected a byte array or string');
+}
+
+/** Current-key-first lookup that distinguishes "absent" from "explicit null". */
+function streamBytes(
+  record: Record<string, unknown>,
+  current: string,
+  legacy: string,
+): Buffer | null {
+  const key = current in record ? current : legacy in record ? legacy : null;
+  if (key === null) return null;
+  return valueBytes(record[key]);
 }
 
 function fileReadFromJson(payload: Buffer): FileRead {
   const node = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
-  const data = Array.isArray(node.data) ? Buffer.from(node.data as number[]) : Buffer.alloc(0);
   return {
-    data,
+    data: valueBytes(node.data),
     truncated: node.truncated === true,
     totalBytes: typeof node.total_bytes === 'number' ? node.total_bytes : null,
   };
@@ -327,21 +349,29 @@ export class Sandbox {
   /** Interactive stream over the sandbox transport. */
   async stream(args: readonly string[], options: StreamOptions = {}): Promise<GuestStream> {
     validation.argv(args);
-    const cwd = options.cwd ?? '/workspace';
-    validation.filePath(cwd);
+    const cwd = options.cwd ?? null;
+    if (cwd !== null) validation.filePath(cwd);
+    const pty = options.pty ?? null;
+    const env = options.env ?? null;
     if (this.transport === TRANSPORT_ZBRT) {
       // Fail closed: ZBRT v1 has neither a pty nor an env channel.
-      if (options.pty === true) {
+      if (pty === true) {
         throw new ValidationError('pty is not supported over the ZBRT transport');
       }
-      if (options.env !== null && options.env !== undefined && Object.keys(options.env).length > 0) {
+      if (env !== null && Object.keys(env).length > 0) {
         throw new ValidationError('env is not supported over the ZBRT transport');
       }
       const conn = await this.#zbrt();
       const session = await conn.openStreamSession(args, cwd, Buffer.alloc(0), 0);
       return new ZbrtGuestStream(conn, session);
     }
-    return new NdjsonGuestStream(this.guestAddr, args, cwd, this.#guestTimeoutMs);
+    // PROTOCOL.md §2.2: optional keys are sent only when requested; the
+    // default cwd is the guest's own (UNIFIED_API.md §5).
+    const action: Record<string, unknown> = { action: 'stream', args: [...args] };
+    if (cwd !== null) action.cwd = cwd;
+    if (pty !== null) action.pty = pty;
+    if (env !== null) action.env = env;
+    return new NdjsonGuestStream(this.guestAddr, action, this.#guestTimeoutMs);
   }
 
   /** Delete the sandbox via the controller (2xx and 404 are both success). */
@@ -390,7 +420,7 @@ export class Sandbox {
 
 const FS_ACTIONS: readonly string[] = ['ls', 'find', 'grep', 'read', 'write'];
 
-/** NDJSON interactive stream: started → out/err → exit, with send_input/stop. */
+/** NDJSON interactive stream: started → stdout/stderr → exit (PROTOCOL.md §2.5). */
 class NdjsonGuestStream implements GuestStream {
   #socket: net.Socket | null = null;
   #buffer = Buffer.alloc(0);
@@ -399,16 +429,16 @@ class NdjsonGuestStream implements GuestStream {
   // be woken or all but one hang forever.
   #waiters: (() => void)[] = [];
   #closed = false;
+  #terminal = false;
+  #stopped = false;
   #failure: RfbError | null = null;
   readonly #address: string;
-  readonly #args: readonly string[];
-  readonly #cwd: string;
+  readonly #action: Record<string, unknown>;
   readonly #timeoutMs: number;
 
-  constructor(address: string, args: readonly string[], cwd: string, timeoutMs: number) {
+  constructor(address: string, action: Record<string, unknown>, timeoutMs: number) {
     this.#address = address;
-    this.#args = args;
-    this.#cwd = cwd;
+    this.#action = action;
     this.#timeoutMs = timeoutMs;
   }
 
@@ -427,12 +457,17 @@ class NdjsonGuestStream implements GuestStream {
 
   /** Send one stdin payload to the child (NDJSON only). */
   async sendInput(text: string): Promise<void> {
+    if (this.#terminal || this.#stopped || this.#closed) {
+      throw new RemoteError('guest stream is no longer running');
+    }
     if (this.#socket === null) await this.#connect();
     this.#socket?.write(Buffer.from(JSON.stringify({ in: text }) + '\n', 'utf8'));
   }
 
   /** Idempotent stop: terminates the child; the exit frame follows. */
   async stop(): Promise<void> {
+    if (this.#stopped || this.#terminal || this.#closed) return;
+    this.#stopped = true;
     if (this.#socket === null) await this.#connect();
     this.#socket?.write(Buffer.from(JSON.stringify({ action: 'stop' }) + '\n', 'utf8'));
   }
@@ -440,15 +475,14 @@ class NdjsonGuestStream implements GuestStream {
   async #connect(): Promise<void> {
     const { host, port } = parseAddress(this.#address);
     const socket = net.createConnection({ host, port });
+    this.#socket = socket;
     socket.setTimeout(this.#timeoutMs);
     socket.setNoDelay(true);
     socket.on('error', (error) => {
       this.#fail(new TransportError(`stream error: ${error.message}`));
-      socket.destroy();
     });
     socket.on('timeout', () => {
       this.#fail(new TransportError('stream timed out'));
-      socket.destroy();
     });
     socket.on('data', (chunk: Buffer) => {
       this.#buffer = Buffer.concat([this.#buffer, chunk]);
@@ -457,8 +491,12 @@ class NdjsonGuestStream implements GuestStream {
     socket.on('close', () => {
       this.#closed = true;
       this.#pump();
+      if (!this.#terminal && this.#failure === null && this.#buffer.length > 0) {
+        // The Rust baseline rejects a stream that ends mid-line.
+        this.#fail(new DecodeError('guest stream ended with an unterminated line'));
+      }
     });
-    socket.write(Buffer.from(JSON.stringify({ action: 'stream', args: this.#args, cwd: this.#cwd }) + '\n', 'utf8'));
+    socket.write(Buffer.from(JSON.stringify(this.#action) + '\n', 'utf8'));
   }
 
   #pump(): void {
@@ -478,32 +516,55 @@ class NdjsonGuestStream implements GuestStream {
         this.#fail(new DecodeError(`invalid stream JSON: ${(error as Error).message}`));
         return;
       }
-      const record = value as Record<string, unknown> & { error?: unknown; stream?: unknown; started?: unknown; out?: unknown; err?: unknown; exit_code?: unknown; done?: unknown };
-      if (value && typeof value.error === 'string') {
+      if (typeof value.error === 'string') {
         this.#fail(new RemoteError(value.error));
         return;
       }
-      if (record.stream === 'started' || record.started === true) {
+      // PROTOCOL.md §2.5 order: started → exit_code → done → output keys.
+      if (value.started === true || value.stream === 'started' || value.event === 'started') {
         this.#pending.push({ kind: 'started', data: Buffer.alloc(0), code: null });
-      } else if (typeof record.out === 'string' || Array.isArray(record.out)) {
-        this.#pending.push({ kind: 'stdout', data: Buffer.from(record.out as string | number[]), code: null });
-      } else if (typeof record.err === 'string' || Array.isArray(record.err)) {
-        this.#pending.push({ kind: 'stderr', data: Buffer.from(record.err as string | number[]), code: null });
-      } else if (typeof record.exit_code === 'number' || record.exit_code === null) {
+      } else if ('exit_code' in value) {
+        this.#terminal = true;
+        const code = value.exit_code;
         this.#pending.push({
           kind: 'exit',
           data: Buffer.alloc(0),
-          code: typeof record.exit_code === 'number' ? record.exit_code : null,
+          code: typeof code === 'number' && Number.isInteger(code) ? code : null,
         });
-      } else if (record.done === true) {
+      } else if (value.done === true) {
+        this.#terminal = true;
         this.#pending.push({ kind: 'exit', data: Buffer.alloc(0), code: null });
+      } else {
+        try {
+          const stdout = streamBytes(value, 'stdout', 'out');
+          const stderr = streamBytes(value, 'stderr', 'err');
+          if (stdout !== null) {
+            this.#pending.push({ kind: 'stdout', data: stdout, code: null });
+          } else if (stderr !== null) {
+            this.#pending.push({ kind: 'stderr', data: stderr, code: null });
+          }
+          // Unrecognized event keys are ignored so future frame additions do
+          // not break existing clients.
+        } catch (error) {
+          this.#fail(error as RfbError);
+          return;
+        }
       }
+      if (this.#terminal) this.#socket?.destroy();
       this.#wake();
     }
+    if (this.#buffer.length > validation.MAX_LINE_BYTES) {
+      this.#fail(new DecodeError(`guest stream line exceeded ${validation.MAX_LINE_BYTES} bytes`));
+      return;
+    }
+    this.#wake();
   }
 
   #fail(error: RfbError): void {
-    if (this.#failure === null) this.#failure = error;
+    if (this.#failure === null) {
+      this.#failure = error;
+      this.#socket?.destroy();
+    }
     this.#wake();
   }
 

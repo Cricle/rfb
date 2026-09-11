@@ -413,11 +413,17 @@ class _ZbrtGuestClient:
             return self._timeout_s
         return max(self._timeout_s, float(timeout_s) + 5.0)
 
-    def _read_reply(self, sock):
+    def _read_reply(self, sock, request_id: bytes):
         frame = read_frame(sock)
         if frame is None:
             raise TransportError("zbrt connection closed before reply")
-        return frame
+        kind, reply_id, payload = frame
+        if reply_id != request_id:
+            # PROTOCOL.md §3.4: a reply whose request_id does not match the
+            # request is a decode failure (a stale/mismatched frame must never
+            # be accepted as this request's answer).
+            raise DecodeError("zbrt reply request id mismatch")
+        return kind, reply_id, payload
 
     def _exec(self, argv, cwd, timeout_s, stdin) -> tuple:
         read_timeout = self._effective_timeout(timeout_s)
@@ -436,7 +442,7 @@ class _ZbrtGuestClient:
             stdout = bytearray()
             stderr = bytearray()
             while True:
-                kind, _rid, payload = self._read_reply(sock)
+                kind, _rid, payload = self._read_reply(sock, request_id)
                 if kind == KIND_OUTPUT:
                     stream, data = decode_output(payload)
                     if stream == STREAM_STDOUT:
@@ -468,8 +474,9 @@ class _ZbrtGuestClient:
     def ping(self) -> bool:
         sock = self._connect(self._timeout_s)
         try:
-            write_frame(sock, KIND_HEALTH, new_request_id(), encode_health(True, None))
-            kind, _rid, payload = self._read_reply(sock)
+            request_id = new_request_id()
+            write_frame(sock, KIND_HEALTH, request_id, encode_health(True, None))
+            kind, _rid, payload = self._read_reply(sock, request_id)
             if kind == KIND_ERROR:
                 raise RemoteError(decode_error(payload)[1])
             if kind != KIND_HEALTH_ACK:
@@ -483,8 +490,9 @@ class _ZbrtGuestClient:
         sock = self._connect(self._timeout_s)
         try:
             data = json.dumps(args, separators=(",", ":")).encode("utf-8")
-            write_frame(sock, KIND_FS, new_request_id(), encode_fs(op, path, data))
-            kind, _rid, payload = self._read_reply(sock)
+            request_id = new_request_id()
+            write_frame(sock, KIND_FS, request_id, encode_fs(op, path, data))
+            kind, _rid, payload = self._read_reply(sock, request_id)
             if kind == KIND_ERROR:
                 raise RemoteError(decode_error(payload)[1])
             if kind != KIND_FS_RESULT:
@@ -531,7 +539,9 @@ class _ZbrtStream:
             self._terminal = True
             self._close()
             return None
-        kind, _rid, payload = frame
+        kind, reply_id, payload = frame
+        if reply_id != self._request_id:
+            raise DecodeError("zbrt reply request id mismatch")
         if kind == KIND_OUTPUT:
             stream, data = decode_output(payload)
             if stream == STREAM_STDOUT:
@@ -562,10 +572,13 @@ class _ZbrtStream:
         if self._terminal or self._stopped or self._closed:
             return
         self._stopped = True
+        # The Cancel frame header reuses the id of the request being cancelled
+        # so the CancelAck routes back to this turn and passes the id check
+        # (Rust baseline: client/zbrt.rs ZbrtStream::stop).
         write_frame(
             self._sock,
             KIND_CANCEL,
-            new_request_id(),
+            self._request_id,
             encode_cancel("stop", self._request_id),
         )
         while True:
@@ -574,7 +587,9 @@ class _ZbrtStream:
                 self._terminal = True
                 self._close()
                 return
-            kind, _rid, payload = frame
+            kind, reply_id, payload = frame
+            if reply_id != self._request_id:
+                raise DecodeError("zbrt reply request id mismatch")
             if kind == KIND_CANCEL_ACK:
                 return
             if kind == KIND_OUTPUT:

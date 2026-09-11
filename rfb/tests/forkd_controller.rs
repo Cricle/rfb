@@ -105,6 +105,33 @@ async fn snapshot_info_prefers_info_endpoint() {
 }
 
 #[tokio::test]
+async fn snapshot_info_percent_encodes_tag_segments() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for encoded in ["v1.2%2Frc%201", "..%2Fx"] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let n = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.starts_with(&format!("GET /v1/snapshots/{encoded}/info HTTP/1.1")));
+            let body = r#"{"tag":"x","status":"ready","bootable":true}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let client = ForkdClient::new(ForkdConfig {
+        base_url: format!("http://{address}"),
+        timeout: Duration::from_secs(1),
+        ..ForkdConfig::default()
+    })
+    .unwrap();
+    assert!(client.snapshot_info("v1.2/rc 1").await.unwrap().is_some());
+    assert!(client.snapshot_info("../x").await.unwrap().is_some());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_info_falls_back_to_legacy_endpoint_on_not_found() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();

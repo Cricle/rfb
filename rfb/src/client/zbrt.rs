@@ -27,6 +27,10 @@ pub(super) struct ZbrtGuest {
     pub(super) timeout: Duration,
 }
 
+/// Aggregate cap on one exec turn's captured output (mirrors the NDJSON
+/// response cap so a chatty guest cannot grow host memory without bound).
+const MAX_EXEC_BYTES: usize = 16 * 1024 * 1024;
+
 fn io_error(message: &'static str) -> RfbError {
     RfbError::Transport(io::Error::new(io::ErrorKind::InvalidData, message))
 }
@@ -56,13 +60,25 @@ impl ZbrtGuest {
         *uuid::Uuid::new_v4().as_bytes()
     }
 
+    /// Classify a frame codec/I-O failure: codec faults (bad
+    /// magic/version/flags, unknown kind, oversize payload, trailing bytes) are
+    /// decode failures (UNIFIED_API.md §7); genuine I/O faults (EOF mid-frame,
+    /// reset) stay transport failures.
+    fn frame_error(error: io::Error) -> RfbError {
+        if error.kind() == io::ErrorKind::InvalidData {
+            decode_error(format!("zbrt frame rejected: {error}"))
+        } else {
+            RfbError::Transport(error)
+        }
+    }
+
     async fn write_frame<W: AsyncWrite + Unpin>(
         writer: &mut W,
         frame: &Frame,
     ) -> Result<(), RfbError> {
         write_frame_async(writer, frame)
             .await
-            .map_err(RfbError::Transport)
+            .map_err(Self::frame_error)
     }
 
     async fn read_frame<R: AsyncRead + Unpin>(
@@ -72,7 +88,7 @@ impl ZbrtGuest {
         tokio::time::timeout(timeout, read_frame_async(reader))
             .await
             .map_err(|_| transport_timeout("zbrt read timeout"))?
-            .map_err(RfbError::Transport)
+            .map_err(Self::frame_error)
     }
 
     fn check_id(frame: &Frame, request_id: [u8; 16]) -> Result<(), RfbError> {
@@ -109,6 +125,7 @@ impl ZbrtGuest {
         Self::write_frame(&mut stream, &request).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut total = 0usize;
         loop {
             let frame = Self::read_frame(&mut stream, self.timeout).await?;
             Self::check_id(&frame, request_id)?;
@@ -116,6 +133,12 @@ impl ZbrtGuest {
                 Kind::Output => {
                     let output = Output::decode(&frame.payload)
                         .map_err(|_| decode_error("invalid Output payload"))?;
+                    total = total.saturating_add(output.data.len());
+                    if total > MAX_EXEC_BYTES {
+                        return Err(RfbError::Remote(
+                            "guest output exceeded the 16 MiB limit".to_owned(),
+                        ));
+                    }
                     match output.stream {
                         0 => stdout.extend(output.data),
                         1 => stderr.extend(output.data),

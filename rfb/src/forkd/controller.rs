@@ -30,6 +30,25 @@ pub struct ForkdClient {
     token: Option<String>,
 }
 
+/// Percent-encode one URL path segment (PROTOCOL.md §1.1: snapshot tags are
+/// encoded verbatim into the path). Mirrors `urllib.parse.quote(tag, safe="")`
+/// in the Python SDK: unreserved characters pass through, everything else
+/// (including `/`, `?`, `#`, space, `%`) is escaped. A literal `.`/`..` tag is
+/// still normalized away by the WHATWG URL parser, exactly as in the other
+/// SDKs.
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Metadata describing a forkd snapshot.
 pub struct SnapshotInfo {
@@ -167,7 +186,9 @@ impl ForkdClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token,
+            // A blank token must not produce `Authorization: Bearer `
+            // (UNIFIED_API.md §2: the header is sent only for a non-empty token).
+            token: token.filter(|value| !value.trim().is_empty()),
         })
     }
 
@@ -239,6 +260,7 @@ impl ForkdClient {
     /// A 404 from both endpoints is treated as unsupported detail and returns
     /// `None`.
     pub async fn snapshot_info(&self, tag: &str) -> Result<Option<SnapshotInfo>, ForkdClientError> {
+        let tag = encode_path_segment(tag);
         let preferred = self
             .request(
                 self.client

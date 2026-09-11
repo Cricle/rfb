@@ -114,6 +114,7 @@ class SandboxInfo:
 
     @classmethod
     def from_json(cls, value: dict) -> "SandboxInfo":
+        branch_count = value.get("branch_count")
         return cls(
             id=value.get("id", ""),
             snapshot_tag=value.get("snapshot_tag", ""),
@@ -123,5 +124,8 @@ class SandboxInfo:
             memory_limit_mib=value.get("memory_limit_mib"),
             pid=value.get("pid"),
             has_branched=bool(value.get("has_branched", False)),
-            branch_count=int(value.get("branch_count", 0)),
+            # A null/non-integer branch_count must not raise from int().
+            branch_count=branch_count
+            if isinstance(branch_count, int) and not isinstance(branch_count, bool)
+            else 0,
         )

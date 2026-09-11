@@ -160,7 +160,11 @@ pub fn build(
             &format!("cat {}", debugfs_quote(&destination)),
             true,
         )?;
-        if actual.len() as u64 != file.size || sha256_bytes(&actual) != file.sha256 {
+        // manifest::validate accepts non-lowercase hex, so compare
+        // case-insensitively here too (artifact.rs does the same).
+        if actual.len() as u64 != file.size
+            || !sha256_bytes(&actual).eq_ignore_ascii_case(&file.sha256)
+        {
             return Err(external(format!(
                 "debugfs verification failed for {}",
                 file.path
@@ -171,7 +175,7 @@ pub fn build(
     let digest = sha256(&output_path).map_err(|error| io(error.to_string()))?;
     if let Some(expected) = image.digest.as_deref() {
         let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-        if expected != digest {
+        if !digest.eq_ignore_ascii_case(expected) {
             return Err(external(format!(
                 "image digest mismatch: expected {expected}, got sha256:{digest}"
             )));

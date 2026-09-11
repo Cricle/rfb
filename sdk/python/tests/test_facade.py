@@ -74,6 +74,20 @@ class FacadeMixin:
         client = RfbClient(base_url=self.controller.url)
         self.assertEqual(client.timeout_s, 10.0)
 
+    def test_non_finite_or_non_positive_timeouts_are_rejected(self):
+        # UNIFIED_API.md §2/§7: an invalid timeout is a local ValidationError,
+        # never a raw ValueError and never an unbounded poll loop.
+        for bad in (0, -1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValidationError):
+                RfbClient(base_url=self.controller.url, timeout_s=bad)
+            with self.assertRaises(ValidationError):
+                self.client.wait_snapshot("base", timeout_s=bad)
+        sandbox = self._sandbox()
+        with self.assertRaises(ValidationError):
+            sandbox.exec(["echo"], timeout_s=float("nan"))
+        with self.assertRaises(ValidationError):
+            sandbox.eval("1", timeout_s=float("inf"))
+
     def test_create_sandbox_returns_sandboxes(self):
         sandboxes = self.client.create_sandbox(
             "base", n=2, memory_limit_mib=512, per_child_netns=True, transport=self.transport

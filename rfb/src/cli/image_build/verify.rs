@@ -232,11 +232,12 @@ pub fn run_debugfs(image: &Path, request: &str, capture_stdout: bool) -> Result<
     // debugfs write mode; this prevents a validation/inspection path from
     // opening an image writable.
     let mut command = Command::new("debugfs");
-    if request
-        .split_whitespace()
-        .next()
-        .is_some_and(|op| matches!(op, "mkdir" | "write" | "set_inode_field" | "ln"))
-    {
+    if request.split_whitespace().next().is_some_and(|op| {
+        matches!(
+            op,
+            "mkdir" | "write" | "set_inode_field" | "ln" | "rm" | "unlink"
+        )
+    }) {
         command.arg("-w");
     }
     let output = command

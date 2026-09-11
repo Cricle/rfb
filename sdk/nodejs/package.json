@@ -18,7 +18,10 @@
   },
   "files": [
     "dist/",
-    "README.md"
+    "!dist/test",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "engines": {
     "node": ">=18"
@@ -27,7 +30,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "build:test": "tsc -p tsconfig.tests.json",
-    "test": "npm run clean && npm run build:test && node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js",
+    "test": "npm run clean && npm run build:test && node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js && node dist/test/ndjson-stream.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

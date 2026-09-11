@@ -35,8 +35,9 @@ pub(super) fn exec_result(value: &Value) -> Result<ExecResult, RfbError> {
             // Clamp, never wrap: an out-of-range wire code maps to -1.
             .map(|code| i32::try_from(code).unwrap_or(-1))
             .unwrap_or(-1),
-        stdout: value_bytes(value.get("out").or_else(|| value.get("stdout")))?,
-        stderr: value_bytes(value.get("err").or_else(|| value.get("stderr")))?,
+        // UNIFIED_API.md §4: the current keys win when both are present.
+        stdout: value_bytes(value.get("stdout").or_else(|| value.get("out")))?,
+        stderr: value_bytes(value.get("stderr").or_else(|| value.get("err")))?,
         timed_out: value
             .get("timed_out")
             .and_then(Value::as_bool)
@@ -53,7 +54,7 @@ pub(super) fn eval_result(value: &Value) -> Result<ExecResult, RfbError> {
             .and_then(Value::as_i64)
             .map(|code| i32::try_from(code).unwrap_or(0))
             .unwrap_or(0),
-        stdout: value_bytes(value.get("out").or_else(|| value.get("output")))?,
+        stdout: value_bytes(value.get("output").or_else(|| value.get("out")))?,
         stderr: Vec::new(),
         timed_out: value
             .get("timed_out")

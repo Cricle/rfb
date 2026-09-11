@@ -31,7 +31,12 @@ pub(super) fn validate_fs_path(path: &str) -> Result<(), ContractError> {
     if path.is_empty()
         || path.len() > MAX_GUEST_PATH_BYTES
         || path.as_bytes().contains(&0)
-        || (path.starts_with('/') && !path.starts_with("/workspace"))
+        // An absolute fs path must be /workspace itself or a child of it —
+        // "/workspacefoo" is NOT inside the workspace (mirrors the client-side
+        // validator in rfb/src/client/validation.rs).
+        || (path.starts_with('/')
+            && path != "/workspace"
+            && !path.starts_with("/workspace/"))
         || path.starts_with('\\')
         || path.contains('\\')
         || path.split('/').any(|component| component == "..")

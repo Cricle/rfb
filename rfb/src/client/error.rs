@@ -58,7 +58,7 @@ impl From<crate::forkd_guest::ForkdGuestError> for RfbError {
         match error {
             crate::forkd_guest::ForkdGuestError::Io(err) => RfbError::Transport(err),
             crate::forkd_guest::ForkdGuestError::TooLarge => {
-                RfbError::decode("guest response exceeded the 1 MiB line limit")
+                RfbError::decode("guest response exceeded a size limit")
             }
             crate::forkd_guest::ForkdGuestError::Json(err) => {
                 RfbError::decode_with(err.to_string(), err)
@@ -68,7 +68,10 @@ impl From<crate::forkd_guest::ForkdGuestError> for RfbError {
                 RfbError::Validation("invalid guest path".to_owned())
             }
             crate::forkd_guest::ForkdGuestError::LimitExceeded => {
-                RfbError::Validation("guest result limit exceeded".to_owned())
+                // A response-side contract violation, not a pre-send local
+                // rejection: Validation is documented as fail-closed with zero
+                // network traffic (UNIFIED_API.md §7).
+                RfbError::decode("guest result count exceeded the limit")
             }
             crate::forkd_guest::ForkdGuestError::UnsupportedGuestRpc(tool) => {
                 RfbError::Remote(format!("unsupported guest RPC: {tool}"))

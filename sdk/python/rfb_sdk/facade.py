@@ -19,6 +19,7 @@ from .models import DirEntry, ExecResult, FileRead, GrepMatch, SandboxInfo, Snap
 from .validation import (
     MAX_GUEST_RESULTS,
     MAX_GUEST_RESULT_BYTES,
+    MAX_ZBRT_PAYLOAD_BYTES,
     validate_argv,
     validate_eval_code,
     validate_eval_timeout,
@@ -28,7 +29,9 @@ from .validation import (
     validate_pattern,
     validate_payload_size,
     validate_sandbox_id,
+    validate_timeout,
     validate_transport,
+    validate_zbrt_args,
 )
 
 DEFAULT_EXEC_TIMEOUT_S = 60.0
@@ -95,6 +98,7 @@ class RfbClient:
             base_url = os.environ.get("FORKD_URL") or DEFAULT_BASE_URL
         if token is None:
             token = os.environ.get("FORKD_TOKEN")
+        validate_timeout(timeout_s, "client timeout")
         self.base_url = base_url
         self.timeout_s = timeout_s
         self._controller = _ForkdController(base_url, token, timeout_s)
@@ -112,6 +116,8 @@ class RfbClient:
 
     def wait_snapshot(self, tag: str, timeout_s: int = DEFAULT_WAIT_TIMEOUT_S) -> Snapshot:
         """Block until `tag` is ready+bootable; raise on failed or timeout."""
+        # A NaN deadline would never compare satisfied: validate fail-closed.
+        validate_timeout(timeout_s, "wait snapshot timeout")
         deadline = time.monotonic() + timeout_s
         while True:
             for item in self._controller.list_snapshots():
@@ -256,9 +262,13 @@ class Sandbox:
     def exec(self, args, cwd: str = "/", timeout_s: float = DEFAULT_EXEC_TIMEOUT_S, stdin=b""):
         validate_argv(args)
         validate_guest_cwd(cwd)
+        if timeout_s is not None:
+            validate_timeout(timeout_s, "exec timeout")
         stdin = stdin.encode("utf-8") if isinstance(stdin, str) else bytes(stdin)
         guest = self._guest()
         if self._transport == "zbrt":
+            validate_zbrt_args(args)
+            validate_payload_size(len(stdin), MAX_ZBRT_PAYLOAD_BYTES)
             return _zbrt_exec_result(guest.exec(args, cwd, timeout_s, stdin))
         value = guest.exec(cwd, args, timeout_s)
         # Rust baseline (ndjson::exec_result): a missing or non-integer
@@ -285,7 +295,9 @@ class Sandbox:
         value = guest.eval(code, cwd, timeout_s)
         status = value.get("status")
         return ExecResult(
-            exit_code=int(status) if status is not None else 0,
+            # Rust baseline (ndjson::eval_result): a missing or non-integer
+            # status falls back to 0.
+            exit_code=status if isinstance(status, int) and not isinstance(status, bool) else 0,
             # Legacy guests emit out instead of output; accept both.
             stdout=_as_bytes(_first_of(value, "output", "out")),
             stderr=b"",
@@ -307,7 +319,10 @@ class Sandbox:
         value = self._fs_call(
             FS_OP_FIND, "find", path, {"pattern": pattern, "max_results": MAX_GUEST_RESULTS}
         )
-        return _require_list(value, "matches", "find")
+        matches = _require_list(value, "matches", "find")
+        if not all(isinstance(item, str) for item in matches):
+            raise DecodeError("find matches must be strings")
+        return matches
 
     def grep(self, path: str = ".", *, pattern: str) -> list:
         validate_fs_path(path)
@@ -351,9 +366,10 @@ class Sandbox:
             path,
             {"data": list(data), "append": append, "mode": mode},
         )
-        if "bytes_written" not in value:
+        written = value.get("bytes_written")
+        if not isinstance(written, int) or isinstance(written, bool):
             raise DecodeError("write result is missing 'bytes_written'")
-        return int(value["bytes_written"])
+        return written
 
     # -- stream / lifecycle ---------------------------------------------------
 
@@ -374,6 +390,7 @@ class Sandbox:
                 raise ValidationError(
                     "env is not supported over the ZBRT transport"
                 )
+            validate_zbrt_args(args)
             inner = guest.open_stream(args, cwd)
         else:
             inner = guest.stream(args, cwd, pty, env)

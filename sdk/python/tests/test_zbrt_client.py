@@ -28,6 +28,18 @@ class ZbrtClientTests(unittest.TestCase):
     def test_ping_health_ack(self):
         self.assertTrue(self.client.ping())
 
+    def test_reply_with_mismatched_request_id_is_decode_error(self):
+        # PROTOCOL.md §3.4: replies must echo the request id.
+        self.server.mismatch_reply_id = True
+        with self.assertRaises(DecodeError):
+            self.client.ping()
+
+    def test_stream_frame_with_mismatched_request_id_is_decode_error(self):
+        self.server.mismatch_reply_id = True
+        stream = self.client.open_stream(["cat"], "/")
+        with self.assertRaises(DecodeError):
+            stream.next_event()
+
     def test_exec_collects_output_then_exit(self):
         code, stdout, stderr = self.client.exec(["echo", "hi"], "/", 10, b"")
         self.assertEqual(code, 0)

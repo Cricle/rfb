@@ -133,7 +133,7 @@ pub enum ForkdCommand {
 #[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub enum Rfb1Command {
-    /// Run RFB1 StartTurn/full-protocol acceptance against a real Firecracker v1.16.1 VM.
+    /// Run RFB1 StartTurn/full-protocol acceptance against a real Firecracker v1.12.x VM.
     Acceptance(Rfb1AcceptanceArgs),
 }
 
