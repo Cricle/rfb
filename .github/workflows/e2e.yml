@@ -32,7 +32,7 @@ jobs:
       FORKD_BIN: ${{ github.workspace }}/resx/forkd/forkd
       FORKD_KERNEL: ${{ github.workspace }}/resx/kernel/vmlinux-arcbox-0.0.24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 第 0 步：fail fast —— 没有 /dev/kvm 就不要浪费构建时间。
       # GitHub 托管 runner 通常已带 /dev/kvm 且对 runner 用户可读写；
