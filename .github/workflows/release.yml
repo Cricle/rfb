@@ -158,12 +158,14 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+      # Trusted publishing（OIDC）：不传 `password` 且 job 具有 id-token: write
+      # 时，action 自动走 OIDC 交换（无需长期 PYPI_KEY）；attestations 默认开启
+      # （PEP 740）。该 action 没有 trusted-publishing 输入。
       - name: Publish rfb-sdk to PyPI
         if: steps.pypi_guard.outputs.exists != 'true'
         uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
         with:
           packages-dir: sdk/python/dist
-          trusted-publishing: true
 
   maven:
     name: Publish rfb-sdk to Maven Central
