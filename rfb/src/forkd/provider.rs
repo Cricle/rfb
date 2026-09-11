@@ -107,6 +107,7 @@ impl ForkdConfig {
         c
     }
     /// Set the guest profile and resolve its capabilities.
+    #[must_use]
     pub fn with_guest_profile(mut self, profile: ForkdGuestProfile) -> Self {
         self.guest_profile = profile;
         self.guest_capabilities = profile.capabilities();

@@ -29,7 +29,8 @@ class Reader {
 
   u8(): number {
     this.#need(1);
-    return this.#buffer[this.#pos++];
+    // `#need` above guarantees at least one readable byte.
+    return this.#buffer[this.#pos++]!;
   }
 
   flag(): boolean {

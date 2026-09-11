@@ -13,7 +13,8 @@
     "./errors": {
       "types": "./dist/errors.d.ts",
       "default": "./dist/errors.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",
@@ -23,9 +24,11 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js",
-    "prepublishOnly": "npm test"
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.tests.json",
+    "test": "npm run clean && npm run build:test && node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "rfb",
@@ -37,10 +40,12 @@
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Cricle/rfb"
+    "url": "https://github.com/Cricle/rfb",
+    "directory": "sdk/nodejs"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
     "typescript": "^5.5.0"
-  }
+  },
+  "sideEffects": false
 }

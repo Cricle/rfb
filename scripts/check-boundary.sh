@@ -9,7 +9,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Do not match ordinary words such as "expires".
 token="$(printf 'x%s' "$(printf 'p%s' i)")"
 violations=$(grep -RIniE --exclude-dir=target --exclude-dir=.git --exclude-dir=dist \
-  "(^|[^[:alnum:]_])${token}([^[:alnum:]_]|$)" . 2>/dev/null || true)
+  "(^|[^[:alnum:]_])${token}([^[:alnum:]_]|$)" "$ROOT_DIR" 2>/dev/null || true)
 if [[ -n "$violations" ]]; then
   printf '%s\n' "$violations" >&2
   printf 'RFB boundary violation: forbidden application-layer reference found\n' >&2

@@ -13,7 +13,7 @@ pub fn init_pid1() -> std::io::Result<()> {
 /// chdir into the workspace. No-op when not running as PID 1.
 #[cfg(target_os = "linux")]
 pub fn init_pid1_with_console(attach_console: bool) -> std::io::Result<()> {
-    if unsafe { libc::getpid() } != 1 {
+    if std::process::id() != 1 {
         return Ok(());
     }
     for path in ["/proc", "/sys", "/dev", "/run", "/tmp", "/workspace"] {
@@ -34,6 +34,8 @@ pub fn init_pid1_with_console(attach_console: bool) -> std::io::Result<()> {
             .open("/dev/ttyS0")?;
         let fd = tty.as_raw_fd();
         for target in [0, 1, 2] {
+            // SAFETY: `fd` is a live owned descriptor (tty is in scope) and
+            // targets are the standard fds 0..=2; dup2 is async-signal-safe.
             if unsafe { libc::dup2(fd, target) } < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -52,6 +54,8 @@ fn mount_if_needed(source: &str, target: &str, fstype: &str) -> std::io::Result<
         )
     })?;
     if fs::metadata(target).is_ok()
+        // SAFETY: every pointer is either null (allowed for mount(2)) or a
+        // NUL-terminated CString that outlives the call.
         && unsafe {
             libc::mount(
                 std::ptr::null(),
@@ -74,6 +78,8 @@ fn mount_if_needed(source: &str, target: &str, fstype: &str) -> std::io::Result<
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "mount type contains NUL")
     })?;
     let target = target_c;
+    // SAFETY: all three pointers come from live CStrings; flags/data are
+    // plain values, so the kernel only reads the provided buffers.
     let rc = unsafe {
         libc::mount(
             source.as_ptr(),
@@ -100,6 +106,8 @@ fn mount_workspace_tmpfs() -> std::io::Result<()> {
         crate::resources::WORKSPACE_TMPFS_BYTES / (1024 * 1024)
     ))
     .expect("static options");
+    // SAFETY: pointers reference live CStrings held until after the call;
+    // the options pointer is a valid NUL-terminated C string cast to c_void.
     let rc = unsafe {
         libc::mount(
             source.as_ptr(),

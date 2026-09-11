@@ -59,7 +59,7 @@ All four suites (Python / C# / Java / Node.js) are exercised end-to-end in CI on
 
 By default `rfb-sdk` enables no backend. `forkd` enables the TCP/NDJSON forkd client, `zeroboot` enables ZBRT, and `cli` enables every backend plus the `rfb-cli` binary. `rfb-runtime` defaults to `core`; `guest` adds the guest/vsock side, `host-vsock` the host side, `forkd` the guest forkd agent, `firecracker` the Linux/KVM controller, and `cli` everything the CLI needs.
 
-`tokio-vsock`, KVM ioctls, and the Firecracker controller are Linux-only. Windows builds core/CLI (no Linux KVM/vsock); macOS builds everything that does not require a Linux backend. Real-VM acceptance needs Linux/WSL, KVM, and matching Firecracker, kernel, and rootfs assets. MSRV is Rust 1.82 (edition 2021).
+`tokio-vsock`, KVM ioctls, and the Firecracker controller are Linux-only. Windows builds core/CLI (no Linux KVM/vsock); macOS builds everything that does not require a Linux backend. Real-VM acceptance needs Linux/WSL, KVM, and matching Firecracker, kernel, and rootfs assets. MSRV is Rust 1.90 (edition 2021), tracked by `Cargo.lock`.
 
 ## Quick start
 

@@ -34,7 +34,8 @@ pub(super) fn exec_result(value: &Value) -> Result<ExecResult, RfbError> {
         exit_code: value
             .get("exit_code")
             .and_then(Value::as_i64)
-            .map(|code| code as i32)
+            // Clamp, never wrap: an out-of-range wire code maps to -1.
+            .map(|code| i32::try_from(code).unwrap_or(-1))
             .unwrap_or(-1),
         stdout: value_bytes(value.get("out").or_else(|| value.get("stdout")))?,
         stderr: value_bytes(value.get("err").or_else(|| value.get("stderr")))?,
@@ -52,7 +53,7 @@ pub(super) fn eval_result(value: &Value) -> Result<ExecResult, RfbError> {
             .get("exit_code")
             .or_else(|| value.get("status"))
             .and_then(Value::as_i64)
-            .map(|code| code as i32)
+            .map(|code| i32::try_from(code).unwrap_or(0))
             .unwrap_or(0),
         stdout: value_bytes(value.get("out").or_else(|| value.get("output")))?,
         stderr: Vec::new(),
@@ -85,7 +86,7 @@ pub(super) fn stream_event(value: Value) -> Result<Option<StreamEvent>, RfbError
         return Ok(Some(StreamEvent {
             kind: StreamEventKind::Exit,
             data: Vec::new(),
-            code: Some(code as i32),
+            code: Some(i32::try_from(code).unwrap_or(-1)),
         }));
     }
     if value.get("done").and_then(Value::as_bool) == Some(true) {

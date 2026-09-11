@@ -37,12 +37,14 @@ impl BootArgs {
 
     /// Trust the CPU RNG (`random.trust_cpu=on`) so the guest does not block
     /// on entropy during early boot.
+    #[must_use]
     pub fn random_trust_cpu(mut self) -> Self {
         self.parts.push("random.trust_cpu=on".into());
         self
     }
 
     /// Mount `device` (usually `/dev/vda`) as read-write root.
+    #[must_use]
     pub fn root_rw(mut self, device: &str) -> Self {
         self.parts.push(format!("root={device}"));
         self.parts.push("rw".into());
@@ -50,6 +52,7 @@ impl BootArgs {
     }
 
     /// Guest entrypoint binary (`init=<path>`).
+    #[must_use]
     pub fn init(mut self, path: &str) -> Self {
         self.parts.push(format!("init={path}"));
         self
@@ -57,6 +60,7 @@ impl BootArgs {
 
     /// Append the trailing `vsock` token. The RFB1 guest runtime reads it
     /// from `/proc/cmdline` (it never appears in argv) to select vsock mode.
+    #[must_use]
     pub fn vsock(mut self) -> Self {
         self.parts.push("vsock".into());
         self

@@ -2,6 +2,7 @@
 name = "rfb-runtime"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "Runtime components for RFB sandbox services"
@@ -12,7 +13,7 @@ async-trait = "0.1"
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
-tokio = { version = "1", optional = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zstd = "0.13"
 thiserror = "2"
 libc = { version = "0.2", optional = true }
@@ -52,7 +53,8 @@ serde_json = "1"
 
 [features]
 default = ["core"]
-core = ["dep:tokio"]
+# tokio 是 codec 的硬依赖（无 feature 也要编译），故 core 不再承载它。
+core = []
 guest = ["core", "dep:anyhow", "dep:libc", "dep:serde_json", "dep:tokio-vsock"]
 host-vsock = ["core", "dep:serde_json", "dep:uuid"]
 forkd = ["guest"]

@@ -317,8 +317,9 @@ impl ZbrtStream {
         }
     }
 
-    /// ZBRT v1 carries stdin only inside `Execute`; injection is unsupported.
-    pub(super) async fn send_input(&self) -> Result<(), RfbError> {
+    // ZBRT v1 carries stdin only inside `Execute`; injection is unsupported.
+    // (Not `async`: no await on this path — callers still await the Result.)
+    pub(super) fn send_input(&self) -> Result<(), RfbError> {
         if self.terminal {
             return Err(RfbError::Remote(
                 "guest stream is no longer running".to_owned(),

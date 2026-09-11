@@ -57,6 +57,8 @@ pub fn prepare_process(command: &mut Command, piped: bool) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
+    // SAFETY: the closure runs post-fork/pre-exec and only calls the
+    // async-signal-safe `setpgid(0, 0)` to give the child its own group.
     unsafe {
         command.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -183,8 +185,14 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
 pub async fn terminate_id(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+        // Kill the process GROUP (negative pid). Guard the cast: uids above
+        // i32::MAX would wrap and target a different group.
+        if let Ok(group) = i32::try_from(pid) {
+            // SAFETY: kill(-pgid, SIGKILL) with a validated positive pgid;
+            // no memory is shared with the kernel for this call.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
         }
     }
     #[cfg(not(unix))]

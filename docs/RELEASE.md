@@ -71,7 +71,7 @@ Central 校验签名时使用。私钥备份见仓库外的运维文档。
 
 | 组件 | 支持范围 | 说明 |
 |---|---|---|
-| Rust crate | Rust 1.82+（edition 2021） | MSRV 由 CI 验证 |
+| Rust crate | Rust 1.90+（edition 2021，`rust-version` 已在各 Cargo.toml 声明） | CI 用 stable 构建；MSRV 由 Cargo.lock 依赖下限决定 |
 | Java SDK（io.github.cricle:rfb-sdk） | **Java 8+**（8/11/16/17/21…） | 内部值类型为 Java 8 兼容手写类（原 record 已降级）；HTTP 层用 HttpURLConnection（无 java.net.http 依赖） |
 | C# SDK（Rfb.Sdk） | netstandard2.0 / 2.1 / net8.0 | System.Text.Json 经条件包引用；`init`/record 经 IsExternalInit polyfill；.NET 5+ API 均在 `#if NET5_0_OR_GREATER` 内 |
 | Python SDK（rfb-sdk） | Python 3（`requires-python = ">=3"`） | 纯 stdlib + Jackson 无关；tests 用 unittest |

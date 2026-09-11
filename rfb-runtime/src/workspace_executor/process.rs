@@ -31,6 +31,8 @@ impl WorkspaceGuestExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
+        // SAFETY: the closure runs post-fork/pre-exec and only calls the
+        // async-signal-safe `setpgid(0, 0)` to give the child its own group.
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
@@ -317,7 +319,12 @@ fn terminate_and_reap(child: &mut std::process::Child, pid: u32) {
 
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+    // Negative pid targets the process group; guard the cast so uids above
+    // i32::MAX cannot wrap into a different group.
+    if let Ok(group) = i32::try_from(pid) {
+        // SAFETY: kill(-pgid, SIGKILL) with a validated positive pgid.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
     }
 }

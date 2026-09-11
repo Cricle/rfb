@@ -5,7 +5,8 @@
  */
 import { HttpStatusError, RemoteError, TransportError, ValidationError } from './errors.js';
 import * as validation from './validation.js';
-import { Sandbox, SandboxInfo, TRANSPORT_NDJSON, TRANSPORT_ZBRT } from './sandbox.js';
+import { Sandbox, TRANSPORT_NDJSON, TRANSPORT_ZBRT } from './sandbox.js';
+import type { SandboxInfo } from './sandbox.js';
 
 const DEFAULT_URL = 'http://127.0.0.1:8889';
 const DEFAULT_TIMEOUT_S = 10.0;
@@ -94,7 +95,7 @@ export class RfbClient {
           ...(this.token !== null ? { Authorization: `Bearer ${this.token}` } : {}),
           ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: body === undefined ? null : JSON.stringify(body),
         signal: controller.signal,
       });
     } catch (error) {
@@ -246,4 +247,7 @@ export class RfbClient {
   }
 }
 
-export { Sandbox };
+// Public surface: errors and sandbox value types must be importable from the
+// package root (README/quickstart use `import { RfbClient, RfbError }`).
+export * from './errors.js';
+export * from './sandbox.js';

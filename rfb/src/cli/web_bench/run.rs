@@ -106,7 +106,13 @@ pub async fn bench(args: WebBenchArgs) -> Result<Value, CliError> {
     });
 
     let report = args.report.clone().unwrap_or_else(default_report_path);
-    write_report(&report, &summary)?;
+    // write_report/git_head perform blocking fs/process work; move them off
+    // the async runtime.
+    let report_owned = report.clone();
+    let summary_owned = summary.clone();
+    tokio::task::spawn_blocking(move || write_report(&report_owned, &summary_owned))
+        .await
+        .map_err(|error| crate::cli::error::io(format!("report task failed: {error}")))??;
     Ok(summary)
 }
 
@@ -136,7 +142,11 @@ async fn run_level(
     let (resource_tx, mut resource_rx) = tokio::sync::mpsc::channel::<ResourceSample>(512);
     let sampler = tokio::spawn(async move {
         loop {
-            if let Some(sample) = sample_pid(pid) {
+            // sample_pid does blocking /proc reads; the CLI runs on a
+            // current_thread runtime, so inline work here would stall every
+            // in-flight benchmark turn (and skew the measurement).
+            let sampled = tokio::task::spawn_blocking(move || sample_pid(pid)).await;
+            if let Ok(Some(sample)) = sampled {
                 if resource_tx.send(sample).await.is_err() {
                     break;
                 }

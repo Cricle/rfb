@@ -6,6 +6,7 @@ import net from 'node:net';
 import type { RfbError } from './errors.js';
 import { DecodeError, RemoteError, TransportError, ValidationError } from './errors.js';
 import { parseAddress, request as ndjsonRequest } from './ndjson.js';
+import type { NdjsonExchange } from './ndjson.js';
 import * as validation from './validation.js';
 import { ZbrtConnection } from './zbrt-connection.js';
 
@@ -355,12 +356,12 @@ export class Sandbox {
     return conn;
   }
 
-  async #guestRequest(action: Record<string, unknown>): Promise<{ last: any }> {
+  async #guestRequest(action: Record<string, unknown>): Promise<NdjsonExchange> {
     const { host, port } = parseAddress(this.guestAddr);
     return ndjsonRequest(host, port, this.#guestTimeoutMs, action);
   }
 
-  async #fsRequest(op: number, path: string, args: Record<string, unknown>): Promise<{ last: any }> {
+  async #fsRequest(op: number, path: string, args: Record<string, unknown>): Promise<NdjsonExchange> {
     const action = { action: FS_ACTIONS[op], path, ...args };
     return this.#guestRequest(action);
   }
@@ -394,7 +395,9 @@ class NdjsonGuestStream implements GuestStream {
   #socket: net.Socket | null = null;
   #buffer = Buffer.alloc(0);
   #pending: StreamEvent[] = [];
-  #notify: (() => void) | null = null;
+  // Waiter queue (not a single slot): concurrent nextEvent callers must all
+  // be woken or all but one hang forever.
+  #waiters: (() => void)[] = [];
   #closed = false;
   #failure: RfbError | null = null;
   readonly #address: string;
@@ -417,7 +420,7 @@ class NdjsonGuestStream implements GuestStream {
       if (this.#failure !== null) throw this.#failure;
       if (this.#closed) return null;
       await new Promise<void>((resolve) => {
-        this.#notify = resolve;
+        this.#waiters.push(resolve);
       });
     }
   }
@@ -439,10 +442,14 @@ class NdjsonGuestStream implements GuestStream {
     const socket = net.createConnection({ host, port });
     socket.setTimeout(this.#timeoutMs);
     socket.setNoDelay(true);
-    socket.on('error', (error) =>
-      this.#fail(new TransportError(`stream error: ${error.message}`)),
-    );
-    socket.on('timeout', () => this.#fail(new TransportError('stream timed out')));
+    socket.on('error', (error) => {
+      this.#fail(new TransportError(`stream error: ${error.message}`));
+      socket.destroy();
+    });
+    socket.on('timeout', () => {
+      this.#fail(new TransportError('stream timed out'));
+      socket.destroy();
+    });
     socket.on('data', (chunk: Buffer) => {
       this.#buffer = Buffer.concat([this.#buffer, chunk]);
       this.#pump();
@@ -501,9 +508,8 @@ class NdjsonGuestStream implements GuestStream {
   }
 
   #wake(): void {
-    const n = this.#notify;
-    this.#notify = null;
-    n?.();
+    const ready = this.#waiters.splice(0);
+    for (const resolve of ready) resolve();
   }
 }
 
@@ -519,8 +525,14 @@ class ZbrtGuestStream implements GuestStream {
 
   async nextEvent(): Promise<StreamEvent | null> {
     const event = await this.#session.nextEvent();
-    if (event === null) return null;
+    if (event === null) {
+      // Session over: release the transport socket instead of leaking it
+      // until GC/process exit.
+      this.#conn.close();
+      return null;
+    }
     if (event.code !== null) {
+      this.#conn.close();
       return { kind: 'exit', data: Buffer.alloc(0), code: event.code };
     }
     return {

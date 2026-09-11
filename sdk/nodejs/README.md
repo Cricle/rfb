@@ -55,7 +55,7 @@ Transports are selected per sandbox: `createSandbox(tag, { transport: 'ndjson' }
 
 ```bash
 npm install
-npm test     # build (tsc) + node --test over dist/test
+npm test     # tsc build + the four node:test suites run directly
 ```
 
 The test suite covers validation fail-closed rules, ZBRT golden vectors and

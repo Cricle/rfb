@@ -6,8 +6,13 @@
     "outDir": "dist",
     "rootDir": "src",
     "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
     "strict": true,
-    "noUncheckedIndexedAccess": false,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -17,5 +22,8 @@
   },
   "include": [
     "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/test"
   ]
 }

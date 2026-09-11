@@ -258,6 +258,7 @@ impl Sandbox {
     }
 
     /// Return a copy of this facade with a different guest transport.
+    #[must_use]
     pub fn with_transport(mut self, transport: GuestTransport) -> Self {
         self.transport = transport;
         self
@@ -729,7 +730,7 @@ impl GuestStream {
         match &mut self.inner {
             StreamInner::Ndjson(inner) => Ok(inner.send_input(text).await?),
             #[cfg(feature = "zeroboot")]
-            StreamInner::Zbrt(inner) => inner.send_input().await,
+            StreamInner::Zbrt(inner) => inner.send_input(),
         }
     }
 

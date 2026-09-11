@@ -1,4 +1,4 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { ZbrtFrame, decode } from '../zbrt-frame.js';
@@ -66,7 +66,6 @@ describe('zbrt-codec', () => {
 
 describe('zbrt-frame', () => {
   const requestId = Buffer.alloc(16, 0xab);
-  afterEach(() => {});
 
   it('encodes correct header', () => {
     const payload = Buffer.from('test');
@@ -89,7 +88,7 @@ describe('zbrt-frame', () => {
   it('roundtrips through decode', () => {
     const payload = Buffer.from('data');
     const frame = new ZbrtFrame(4, 0, requestId, payload);
-    const decoded = (ZbrtFrame as { decode(bytes: Buffer): ZbrtFrame }).decode(frame.encode());
+    const decoded = ZbrtFrame.decode(frame.encode());
     assert.equal(decoded.kind, 4);
     assert.deepEqual(decoded.requestId, requestId);
     assert.deepEqual(decoded.payload, payload);

@@ -26,7 +26,7 @@ async fn main() -> io::Result<()> {
     let forkd_agent = mode.as_deref() == Some("forkd-agent")
         || std::env::var("RFB_RUNTIME_MODE").ok().as_deref() == Some("forkd-agent")
         || (init_script == "forkd-init.sh" && forkd_init_file)
-        || (forkd_init_file && unsafe { libc::getpid() } == 1);
+        || (forkd_init_file && std::process::id() == 1);
     #[cfg(feature = "zeroboot")]
     let zeroboot_mode = mode.as_deref() == Some("zeroboot")
         || std::env::var("RFB_RUNTIME_MODE").ok().as_deref() == Some("zeroboot")

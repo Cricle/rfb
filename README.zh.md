@@ -59,7 +59,7 @@ crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Lin
 
 默认 `rfb-sdk` 不启用任何后端：`forkd` 启用 TCP/NDJSON forkd 客户端，`zeroboot` 启用 ZBRT，`cli` 启用全部后端及 `rfb-cli`。`rfb-runtime` 默认启用 `core`：`guest` 为 guest/vsock，`host-vsock` 为宿主 vsock，`forkd` 为 guest forkd agent，`firecracker` 为 Linux/KVM 控制器，`cli` 启用 CLI 所需全部功能。
 
-`tokio-vsock`、KVM ioctl 与 Firecracker 控制器仅 Linux 提供；Windows 可编译 core/CLI（无 Linux KVM/vsock），macOS 可编译不依赖 Linux 后端的部分。真实 VM 验收需要 Linux/WSL、KVM、匹配的 Firecracker、kernel 和 rootfs。MSRV 为 Rust 1.82（edition 2021）。
+`tokio-vsock`、KVM ioctl 与 Firecracker 控制器仅 Linux 提供；Windows 可编译 core/CLI（无 Linux KVM/vsock），macOS 可编译不依赖 Linux 后端的部分。真实 VM 验收需要 Linux/WSL、KVM、匹配的 Firecracker、kernel 和 rootfs。MSRV 为 Rust 1.90（edition 2021），由 Cargo.lock 依赖下限决定。
 
 ## 快速开始
 

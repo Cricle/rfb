@@ -34,7 +34,6 @@ die12() { printf '[run-real] PREREQ-MISSING: %s\n' "$*" >&2; exit 12; }
 # ---- 定位工作区：脚本位于 rfb 工作区内的 crate tests 目录（rfb/rfb/tests）。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CRATE_DIR="$WORKSPACE/rfb"
 CLI_BIN="$WORKSPACE/target/debug/rfb-cli"
 FORKD_BIN_DEFAULT="$WORKSPACE/resx/forkd/forkd"
 CONTROLLER_BIN="$WORKSPACE/resx/forkd/forkd-controller"
@@ -74,7 +73,12 @@ cleanup() {
   fi
   log "cleanup 完成"
 }
-trap cleanup EXIT INT TERM
+# INT/TERM 必须显式退出：bash 在中断后继续执行脚本，未退出的处理器
+# 会让被中断的运行继续走完并以 0 退出（破坏退出码契约）。EXIT 处理器
+# 仍负责清理。
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---- 第 0 步：前置条件检查（缺失一律 exit 12）。
 command -v uname >/dev/null 2>&1 || die12 "uname 不可用"

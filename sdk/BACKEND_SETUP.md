@@ -17,7 +17,7 @@ forkd controller（沙箱生命周期：快照/创建/销毁）
 ## 1. 前提条件
 
 - **WSL2 或真实 Linux**（x86_64）。不要用 Windows `.exe` 当 Linux 服务；没有 Linux 二进制就先在 WSL 里构建。
-- Rust toolchain（MSRV 1.82+）。
+- Rust toolchain（MSRV 1.90+，见各 crate 的 rust-version）。
 - 需要 VM 后端时：`/dev/kvm` 可用，且匹配的 Firecracker、kernel、rootfs（仓库已带 `firecracker-v1.16.1-x86_64.tgz` 与 `vmlinux-arcbox-0.0.24`）。
 - 创建 TAP 网卡需要 root（`ip tuntap`）；若 `cni0` 已占用 `10.42.0.1/24`，先记录现状再临时挪址，结束后恢复。
 

@@ -99,7 +99,8 @@ function checkHeaderMagic(header: Buffer): void {
 
 function decodeHeaderAndPayload(header: Buffer, payload: Buffer): ZbrtFrame {
   checkHeaderMagic(header);
-  const kind = checkKind(header[5]);
+  // Header length is validated before this is called (HEADER_LEN bytes).
+  const kind = checkKind(header[5]!);
   const flags = header.readUInt16BE(6);
   if (flags !== 0) {
     throw new DecodeError(`unsupported frame flags: ${flags}`);
@@ -141,12 +142,14 @@ export function frameReader(stream: {
   const pending: ZbrtFrame[] = [];
   let failure: Error | null = null;
   let done = false;
-  let notify: (() => void) | null = null;
+  // A queue of waiters, not a single slot: concurrent next() callers (e.g. a
+  // stream reader and a cancel round-trip) must all be woken; a single-slot
+  // resolver loses every wake-up but the last and hangs the others.
+  const waiters: (() => void)[] = [];
 
   const wake = () => {
-    const n = notify;
-    notify = null;
-    n?.();
+    const ready = waiters.splice(0);
+    for (const resolve of ready) resolve();
   };
 
   stream.on('data', (chunk: Buffer) => {
@@ -196,7 +199,7 @@ export function frameReader(stream: {
           return null;
         }
         await new Promise<void>((resolve) => {
-          notify = resolve;
+          waiters.push(resolve);
         });
       }
     },

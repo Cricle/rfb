@@ -60,7 +60,9 @@ OUT_DIR="${E2E_OUT_DIR:-$(mktemp -d /tmp/rfb-sdk-e2e.XXXXXX)}"
 mkdir -p "$OUT_DIR"
 TMP_DIRS=()
 cleanup() {
-  for d in "${TMP_DIRS[@]:-}"; do
+  # bash >= 4.4（Debian 12 = 5.2）下空数组配 set -u 直接展开即可；
+  # `:-` 反而会注入一个空元素。
+  for d in "${TMP_DIRS[@]}"; do
     rm -rf "$d" 2>/dev/null || true
   done
   # 只有使用默认临时目录时才清理；显式指定的 E2E_OUT_DIR 保留给调用方
@@ -69,6 +71,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 log "仓库根：$REPO_ROOT (WSL=$IS_WSL)"
 log "输出目录：$OUT_DIR"
@@ -194,11 +198,14 @@ else
       && (cd "$SDK_DIR/java/tests" && mvn -B -ntp test); } \
       2>&1 | tee "$OUT_DIR/maven.log"; then
     # surefire 结果计数：0 个测试执行视为失败，防止“空转 PASS”。
+    # 计数管道对空输入必须容忍（set -e + pipefail 下 grep 无匹配即非零，
+    # 会让脚本在到达汇总前直接退出）。
     SUREFIRE_DIR="$SDK_DIR/java/tests/target/surefire-reports"
     TESTS_RUN=0
     if [ -d "$SUREFIRE_DIR" ]; then
-      TESTS_RUN=$(grep -hoE 'Tests run: [0-9]+' "$SUREFIRE_DIR"/*.txt 2>/dev/null \
-        | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}')
+      TESTS_RUN=$( { grep -hoE 'Tests run: [0-9]+' "$SUREFIRE_DIR"/*.txt 2>/dev/null || true; } \
+        | { grep -oE '[0-9]+' || true; } \
+        | awk '{s += $1} END {print s + 0}')
     fi
     if [ "${TESTS_RUN:-0}" -gt 0 ]; then
       log "Java surefire 实际执行测试数：$TESTS_RUN"
@@ -229,7 +236,8 @@ else
   if (cd "$SDK_DIR/nodejs" && npm install --no-audit --no-fund && npm test) \
       2>&1 | tee "$OUT_DIR/node.log"; then
     # 防空跑：统计各文件摘要里的 "tests N"，总数为 0 视为失败。
-    node_tests=$(grep -oE "tests [0-9]+" "$OUT_DIR/node.log" \
+    # 同样容忍空输入（见 Java 套件的计数说明）。
+    node_tests=$( { grep -oE "tests [0-9]+" "$OUT_DIR/node.log" || true; } \
       | awk '{s += $2} END {print s + 0}')
     if [ "${node_tests:-0}" -gt 0 ]; then
       SUMMARY+=("node   : PASS ($node_tests tests)")

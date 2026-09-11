@@ -8,7 +8,7 @@ use std::io;
 pub fn boot_environment(attach_console: bool) -> io::Result<()> {
     rfb_runtime::guest::init_pid1_with_console(attach_console)?;
     #[cfg(target_os = "linux")]
-    if !attach_console && unsafe { libc::getpid() } == 1 {
+    if !attach_console && std::process::id() == 1 {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
         stdout
