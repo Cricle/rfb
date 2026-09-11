@@ -65,10 +65,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::release.sh 失败 rc=$rc（尾部见注解）"
-            tail -c 3000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-crates '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-crates "$log" 3000
             exit "$rc"
           fi
       - name: Build CLI
@@ -125,10 +122,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::python -m build 失败 rc=$rc（尾部见注解）"
-            tail -c 3000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-pypi '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-pypi "$log" 3000
             exit "$rc"
           fi
       # 重跑保护：PyPI 上该版本已存在时跳过发布（twine 对重复文件会报错失败）。
@@ -200,10 +194,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::twine upload rfb-cli 失败 rc=$rc（尾部见注解）"
-            tail -c 2000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-py-cli '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-py-cli "$log" 2000
             exit "$rc"
           fi
 
@@ -310,10 +301,8 @@ jobs:
               grep -E "\[ERROR\]" "$log" | head -30 || true
               echo "== tail =="
               tail -c 2000 "$log"
-            } | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-maven '{print "::warning title="t"-"NR"::"$0}'
+            } > /tmp/maven-diag.txt 2>&1
+            bash scripts/ci-annotate.sh release-maven /tmp/maven-diag.txt 0
             exit "$rc"
           fi
 
@@ -383,10 +372,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::dotnet nuget push 失败 rc=$rc（尾部见注解）"
-            tail -c 2000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-nuget '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-nuget "$log" 2000
             exit "$rc"
           fi
 
@@ -434,10 +420,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::npm publish rfb-sdk 失败 rc=$rc（尾部见注解）"
-            tail -c 2000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-npm-sdk '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-npm-sdk "$log" 2000
             exit "$rc"
           fi
 
@@ -498,9 +481,6 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::npm publish rfb-cli 失败 rc=$rc（尾部见注解）"
-            tail -c 2000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=release-npm-cli '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh release-npm-cli "$log" 2000
             exit "$rc"
           fi

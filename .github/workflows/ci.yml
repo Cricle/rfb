@@ -47,10 +47,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::cargo fmt 失败 rc=$rc（diff 尾部见注解）"
-            tail -c 2000 "$log" | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=ci-fmt '{print "::error title="t"-"NR"::"$0}'
+            bash scripts/ci-annotate.sh ci-fmt "$log" 2000
             exit "$rc"
           fi
       - name: Clippy
@@ -63,10 +60,8 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "::error::clippy 失败 rc=$rc（error 行见注解）"
-            grep -E "^error" "$log" | head -20 | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=ci-clippy '{print "::error title="t"-"NR"::"$0}'
+            grep -E "^error" "$log" | head -20 > /tmp/clippy-errs.txt || true
+            bash scripts/ci-annotate.sh ci-clippy /tmp/clippy-errs.txt 0
             exit "$rc"
           fi
       # 失败现场要能被公开 API 读到（日志下载需 token）：失败时把 FAILED
@@ -94,10 +89,7 @@ jobs:
             tail -c 1500 "$log"
           } > /tmp/test-diag.txt 2>&1
           echo "::error::cargo test 失败 rc=$rc（详情见注解）"
-          tr '\r\n' '::' < /tmp/test-diag.txt \
-            | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-            | LC_ALL=C fold -w 700 \
-            | awk -v t=ci-test '{print "::error title="t"-"NR"::"$0}'
+          bash scripts/ci-annotate.sh ci-test /tmp/test-diag.txt 0
           exit "$rc"
       - name: Documentation
         run: |
@@ -114,14 +106,12 @@ jobs:
               grep -E '^error' "$log" | head -20 || true
               echo "== tail =="
               tail -c 1500 "$log"
-            } | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t=ci-doc '{print "::error title="t"-"NR"::"$0}'
+            } > /tmp/doc-diag.txt 2>&1
+            bash scripts/ci-annotate.sh ci-doc /tmp/doc-diag.txt 0
             exit "$rc"
           fi
 
-  # SDK 全量验证：干净 debian:12 容器里从零装工具链，跑 Python/C#/Java 三套件
+  # SDK 全量验证：干净 debian:12 容器里从零装工具链，跑 Python/C#/Java/Node 四套件
   # 的 build + tests（脚本内聚，见 sdk/e2e/debian-e2e.sh）。
   # 显式 shell: bash：debian:12 没有 which 命令，runner 探测 bash 失败会回退到
   # sh（dash），而 dash 不支持 `set -o pipefail`，会立即以 exit 2 秒退。
@@ -144,6 +134,7 @@ jobs:
           set -euo pipefail
           # 失败现场要能被公开 API 读到（日志下载需 token）：把诊断与 apt
           # 输出拆成 ::error:: 注解带出来。
+          # 本步骤先于 actions/checkout，仓库脚本尚不可用：保持内联实现。
           emit_diag() {
             local f="$1" t="$2" data
             data=$(LC_ALL=C tr '\r\n' '::' < "$f" | LC_ALL=C tr -d '%')
@@ -202,13 +193,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          emit_file() {
-            tail -c "$3" "$1" 2>/dev/null \
-              | tr '\r\n' '::' \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
-          }
+          emit_file() { bash scripts/ci-annotate.sh "$2" "$1" "$3"; }
           log=/tmp/debian-e2e-full.log
           set +e
           bash sdk/e2e/debian-e2e.sh 2>&1 | tee "$log"

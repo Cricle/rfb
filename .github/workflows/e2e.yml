@@ -145,19 +145,7 @@ jobs:
           done
           # 失败现场要能被公开 API 读到（日志下载需 token）：把 controller
           # stdout 与 audit 日志拆成 ::error:: 注解带出来。
-          emit_diag() {
-            local f="$1" t="$2" data
-            if [ ! -f "$f" ]; then
-              echo "::error title=$t::(文件不存在: $f)"
-              return 0
-            fi
-            data=$(LC_ALL=C tr '\r\n' '::' < "$f" | LC_ALL=C tr -d '%')
-            local n=${#data} i=0 c=1
-            while [ "$i" -lt "$n" ]; do
-              echo "::error title=$t-$c::${data:i:700}"
-              i=$((i+700)); c=$((c+1))
-            done
-          }
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           emit_diag "$RUN_DIR/controller/stdout.log" ctrl-stdout
           emit_diag "$RUN_DIR/controller/audit.log" ctrl-audit
           echo "--- controller stdout ---"
@@ -203,12 +191,7 @@ jobs:
           echo "::error::快照 $TAG 900s 内未进入 ready+bootable 状态"
           # 失败现场要能被公开 API 读到（日志下载需 token）：把快照列表、
           # snapshot-create 输出、快照目录与 audit 日志尾部拆成注解带出。
-          emit_diag() {
-            tr '\r\n' '::' < "$1" 2>/dev/null \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
-          }
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           curl -sS "$FORKD_URL/v1/snapshots" > /tmp/snaps.json 2>&1 || true
           emit_diag /tmp/snaps.json snaps
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
@@ -250,12 +233,7 @@ jobs:
           export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
           # 失败现场要能被公开 API 读到（日志下载需 token）：把 FAILED 测试、
           # panic 与日志尾部拆成 ::error:: 注解带出。
-          emit_diag() {
-            tr '\r\n' '::' < "$1" 2>/dev/null \
-              | LC_ALL=C tr -d '%\000-\010\013\014\016-\037' \
-              | LC_ALL=C fold -w 700 \
-              | awk -v t="$2" '{print "::error title="t"-"NR"::"$0}'
-          }
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log=/tmp/real-e2e.log
           set +e
           cargo test -p rfb-sdk --features cli --test forkd_real_e2e \
