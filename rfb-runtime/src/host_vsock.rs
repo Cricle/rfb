@@ -369,7 +369,7 @@ impl SharedHostSession {
         let mut session = self.0.lock().await;
         let sequence = session.next_sequence();
         let deadline = Instant::now()
-            .checked_add(self.timeout)
+            .checked_add(session.timeout())
             .ok_or(VsockClientError::Timeout)?;
         let session_id = format!("rfb-web-{}", Uuid::now_v7());
         let request_id = format!("rfb-web-{}", Uuid::now_v7());
@@ -756,6 +756,11 @@ fn is_stream_timeout(error: &VsockClientError) -> bool {
 
 #[cfg(unix)]
 impl HostSession {
+    /// Returns the per-request timeout for this session.
+    pub fn timeout(&self) -> Duration {
+        self.client.timeout
+    }
+
     /// Allocate the next request sequence number.
     pub fn next_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
