@@ -44,6 +44,8 @@ rfb-cli forkd snapshot-info --tag my-snap
 ```bash
 rfb-cli forkd sandbox-create --tag my-snap
 # 输出 JSON 包含 sandbox id 和 guest_addr
+# 共享 tap 同时只允许一个存活沙箱；要并发多个请加 --per-child-netns
+rfb-cli forkd sandbox-create --tag my-snap --per-child-netns
 ```
 
 ### 4. 在沙箱内执行命令

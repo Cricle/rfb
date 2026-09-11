@@ -328,12 +328,12 @@ jobs:
           sample idle
           start=$(date +%s.%N)
           for i in $(seq 1 "$N"); do
-            ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --json \
+            ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --per-child-netns --json \
               > "$RUN_DIR/burst-$i.json" 2>&1 &
           done
           wait || true
           end=$(date +%s.%N)
-          created=$( { grep -l '"id"' "$RUN_DIR"/burst-*.json 2>/dev/null || true; } | wc -l)
+          created=$( { grep -l '"guest_addr"' "$RUN_DIR"/burst-*.json 2>/dev/null || true; } | wc -l)
           python3 -c '
           import sys
           n, created, start, end = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
@@ -345,7 +345,13 @@ jobs:
           sleep 3
           sample steady
           for f in "$RUN_DIR"/burst-*.json; do
-            sid=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$f" 2>/dev/null || true)
+            sid=$(python3 -c '
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          if isinstance(data, list) and data:
+              data = data[0]
+          print(data.get("id", "") if isinstance(data, dict) else "")
+          ' "$f" 2>/dev/null || true)
             [ -n "$sid" ] || continue
             ./target/release/rfb-cli forkd sandbox-destroy "$sid" --json > /dev/null || true
           done

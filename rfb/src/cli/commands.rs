@@ -580,6 +580,10 @@ pub struct ForkdSandboxArgs {
     /// Snapshot tag to create the sandbox from (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
+    /// Give the sandbox its own network namespace. Required for concurrent
+    /// sandboxes: the shared host tap admits only one live sandbox at a time.
+    #[arg(long)]
+    pub per_child_netns: bool,
 }
 
 /// Arguments for `rfb-cli forkd sandbox-destroy`.

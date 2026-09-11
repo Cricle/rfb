@@ -245,7 +245,13 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
         ForkdCommand::SandboxCreate(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::create_sandbox(&url, tag, 1, Some(32)))?;
+            let value = block_on(forkd::create_sandbox(
+                &url,
+                tag,
+                1,
+                Some(32),
+                args.per_child_netns,
+            ))?;
             render_output(json_out, json!(value), "sandbox created".to_owned());
             Ok(())
         }

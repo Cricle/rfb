@@ -37,7 +37,7 @@ pub async fn workload(
 
     for si in 0..sandboxes {
         let result = async {
-            let sandbox = create_sandbox(url, tag, 1, Some(32))
+            let sandbox = create_sandbox(url, tag, 1, Some(32), false)
                 .await?
                 .into_iter()
                 .next()

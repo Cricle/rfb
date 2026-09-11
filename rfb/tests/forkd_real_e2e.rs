@@ -276,7 +276,7 @@ fn sandbox_has_no_internet_egress() {
     let tag = common::snapshot_tag();
     common::block_on(async {
         let url = "http://127.0.0.1:8889";
-        let sandbox = rfb::cli::forkd::create_sandbox(url, &tag, 1, Some(32))
+        let sandbox = rfb::cli::forkd::create_sandbox(url, &tag, 1, Some(32), false)
             .await
             .expect("sandbox create")
             .into_iter()
@@ -611,7 +611,7 @@ impl Drop for SandboxGuard {
 /// makes every later create fail with 503).
 fn spawn_guarded_sandbox(tag: &str) -> (rfb::forkd::SandboxInfo, SandboxGuard) {
     let sandbox = common::block_on(async {
-        rfb::cli::forkd::create_sandbox(CONTROLLER_URL, tag, 1, None)
+        rfb::cli::forkd::create_sandbox(CONTROLLER_URL, tag, 1, None, false)
             .await
             .expect("sandbox create")
             .into_iter()
@@ -954,11 +954,17 @@ fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
 fn sandbox_create_rejects_invalid_and_unknown_tags() {
     common::require_real();
     common::block_on(async {
-        let invalid = rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "bad/tag!", 1, None).await;
+        let invalid =
+            rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "bad/tag!", 1, None, false).await;
         assert!(invalid.is_err(), "path-like tag must be rejected");
-        let unknown =
-            rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "rfb-e2e-no-such-tag-xyz", 1, None)
-                .await;
+        let unknown = rfb::cli::forkd::create_sandbox(
+            CONTROLLER_URL,
+            "rfb-e2e-no-such-tag-xyz",
+            1,
+            None,
+            false,
+        )
+        .await;
         assert!(unknown.is_err(), "unknown snapshot tag must be rejected");
     });
 }
@@ -1030,6 +1036,7 @@ fn shared_tap_rejects_multi_spawn_and_sequential_sandboxes_are_isolated() {
         &tag,
         2,
         None,
+        false,
     ))
     .expect_err("n>1 on the shared tap must be rejected");
     assert!(
@@ -1096,6 +1103,83 @@ fn shared_tap_rejects_multi_spawn_and_sequential_sandboxes_are_isolated() {
             read.is_err(),
             "second sandbox must not see the first's file"
         );
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn per_child_netns_supports_concurrently_live_sandboxes() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+
+    // per_child_netns=true is the documented path for parallel sandboxes; the
+    // create must return all N at once and every guest must be independently
+    // reachable while the others are alive.
+    let sandboxes = common::block_on(rfb::cli::forkd::create_sandbox(
+        CONTROLLER_URL,
+        &tag,
+        3,
+        Some(32),
+        true,
+    ))
+    .expect("parallel create with per_child_netns");
+    assert_eq!(sandboxes.len(), 3, "all three sandboxes must be created");
+    struct Guards(Vec<String>);
+    impl Drop for Guards {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = common::block_on(rfb::cli::forkd::destroy_sandbox(CONTROLLER_URL, id));
+            }
+        }
+    }
+    let _guards = Guards(sandboxes.iter().map(|s| s.id.clone()).collect());
+
+    let addresses: BTreeSet<String> = sandboxes.iter().map(|s| s.guest_addr.clone()).collect();
+    assert_eq!(
+        addresses.len(),
+        3,
+        "each sandbox must get its own guest address: {addresses:?}"
+    );
+
+    common::block_on(async {
+        for (index, sandbox) in sandboxes.iter().enumerate() {
+            rfb::cli::forkd::wait_for_guest_ready(&sandbox.guest_addr, Duration::from_secs(30))
+                .await
+                .expect("guest ready");
+            let path = format!("/workspace/parallel-{index}.txt");
+            rfb::cli::forkd::guest_call(
+                &sandbox.guest_addr,
+                serde_json::json!({
+                    "action": "write",
+                    "path": path,
+                    "data": format!("owner-{index}"),
+                }),
+                false,
+            )
+            .await
+            .expect("write in parallel sandbox");
+        }
+        // No sandbox may observe another's file: per-child netns also gives
+        // each guest its own rootfs workspace namespace.
+        for (index, sandbox) in sandboxes.iter().enumerate() {
+            for other in 0..sandboxes.len() {
+                let read = rfb::cli::forkd::guest_call(
+                    &sandbox.guest_addr,
+                    serde_json::json!({
+                        "action": "read",
+                        "path": format!("/workspace/parallel-{other}.txt"),
+                    }),
+                    false,
+                )
+                .await;
+                let visible = read.is_ok();
+                assert_eq!(
+                    visible,
+                    other == index,
+                    "sandbox {index} read parallel-{other}.txt visible={visible}"
+                );
+            }
+        }
     });
 }
 

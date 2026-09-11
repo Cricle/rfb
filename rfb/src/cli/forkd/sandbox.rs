@@ -48,6 +48,10 @@ pub async fn wait_for_guest_ready(address: &str, deadline: Duration) -> Result<V
 
 /// Create `n` sandboxes from a bootable snapshot. Returns the parsed response.
 ///
+/// `per_child_netns` is required for concurrent sandboxes: the default shared
+/// host tap admits only one live sandbox at a time and the controller rejects
+/// further creates with 503 until it is deleted.
+///
 /// # Errors
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
@@ -56,13 +60,14 @@ pub async fn create_sandbox(
     tag: &str,
     n: usize,
     memory_limit_mib: Option<u64>,
+    per_child_netns: bool,
 ) -> Result<Vec<SandboxInfo>, CliError> {
     let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
         .map_err(|error| validation(error.to_string()))?;
     let request = CreateSandboxRequest {
         snapshot_tag: tag,
         n,
-        per_child_netns: false,
+        per_child_netns,
         memory_limit_mib,
         prewarm: false,
         live_fork: false,
