@@ -264,7 +264,13 @@ fn image_build_execute_creates_ext4_and_reports_digest() {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(init_bytes);
-        format!("{:x}", hasher.finalize())
+        // Independent lowercase-hex encoder; digest 0.11 outputs no longer
+        // implement LowerHex.
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     let manifest = directory.path().join("manifest.json");
     write_manifest(

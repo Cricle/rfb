@@ -577,7 +577,12 @@ fn snapshot_lifecycle_private_rootfs_and_delete() {
 fn sha256_file(path: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).expect("read rootfs for digest");
-    format!("{:x}", Sha256::digest(&bytes))
+    // Independent lowercase-hex encoder; digest 0.11 outputs no longer
+    // implement LowerHex.
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

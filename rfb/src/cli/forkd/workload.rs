@@ -7,6 +7,7 @@ use crate::cli::forkd::sandbox::{
     create_sandbox, destroy_sandbox, guest_call, list_sandboxes, wait_for_guest_ready,
     GUEST_READY_DEADLINE,
 };
+use crate::cli::image_build::hex_lower;
 use crate::forkd_guest::ForkdGuestClient;
 use serde_json::{json, Value};
 
@@ -153,7 +154,7 @@ pub async fn workload(
                 use sha2::{Digest, Sha256};
                 let mut h = Sha256::new();
                 h.update(serde_json::to_vec(&summary).map_err(|e| io(e.to_string()))?);
-                format!("{:x}", h.finalize())
+                hex_lower(h.finalize())
             };
             let write = guest_call(
                 &address,
