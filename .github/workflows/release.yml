@@ -83,7 +83,7 @@ jobs:
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-cli-linux-x64" >> dist/SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/rfb-${{ github.ref_name }}.tar.gz
