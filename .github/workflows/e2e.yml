@@ -327,6 +327,10 @@ jobs:
               | tee -a "$OUT"
           }
 
+          # 宿主容量必须进 artifact：没有核数就无法区分「guest 不扩展」与
+          # 「runner 核不够」（两档 vCPU 会与 Firecracker 线程抢同一批核）。
+          echo "{\"label\":\"host\",\"nproc\":$(nproc),\"model\":\"$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo | sed 's/^ *//')\"}" | tee -a "$OUT"
+
           N=6
           sample idle
           start=$(date +%s.%N)

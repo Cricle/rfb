@@ -275,10 +275,12 @@ impl ZeroBootSession {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(SessionError::Io(error));
                     }
-                    // 10 ms retry granularity: the guest binds its vsock
+                    // 1 ms retry granularity: the guest binds its vsock
                     // listener late in boot, and a coarse poll interval used
-                    // to waste up to 100 ms per sandbox on cold start.
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    // to waste up to 100 ms per sandbox on cold start. Finer
+                    // retries cost nothing when the connect succeeds and are
+                    // what an extra session on a running VM mostly pays.
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
         };
@@ -1332,13 +1334,26 @@ async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
     primary._work = Some(work);
     primary._vm = Some(vm);
     let mut sessions = vec![Arc::new(primary)];
-    for index in 1..vm_sessions() {
-        let session = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
-            .await
-            .map_err(|e| {
-                Error::Backend(format!("ZeroBoot session {index} open failed: {e}"))
-            })?;
-        sessions.push(Arc::new(session));
+    // Open the rest of the pool concurrently: every session is an independent
+    // connection to the same guest, so a serial loop multiplies the per-open
+    // cost by the pool size on every boot.
+    let extra = vm_sessions().saturating_sub(1);
+    if extra > 0 {
+        let mut handles = Vec::with_capacity(extra);
+        for _ in 0..extra {
+            let uds = uds.clone();
+            let port = config.guest_port;
+            handles.push(tokio::spawn(async move {
+                ZeroBootSession::open(&uds, port, SESSION_CONNECT_TIMEOUT).await
+            }));
+        }
+        for handle in handles {
+            let session = handle
+                .await
+                .map_err(|e| Error::Backend(format!("ZeroBoot session task failed: {e}")))?
+                .map_err(|e| Error::Backend(format!("ZeroBoot session open failed: {e}")))?;
+            sessions.push(Arc::new(session));
+        }
     }
     Ok(sessions)
 }

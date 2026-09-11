@@ -554,6 +554,9 @@ async fn run_zbrt(args: ZbrtArgs) -> Result<serde_json::Value, String> {
     }
     Ok(serde_json::json!({
         "scenario": "zbrt",
+        "host_cpus": std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         "kernel": args.kernel.display().to_string(),
         "rootfs": args.rootfs.display().to_string(),
         "firecracker": args.firecracker.display().to_string(),
