@@ -31,14 +31,17 @@ impl WorkspaceGuestExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
-        // SAFETY: the closure runs post-fork/pre-exec and only calls the
-        // async-signal-safe `setpgid(0, 0)` to give the child its own group.
-        unsafe {
+        {
+            // A dedicated process group is what lets cancel/timeout tear down
+            // the whole descendant tree. `process_group` expresses exactly the
+            // `setpgid(0, 0)` a `pre_exec` hook would, but leaves std free to
+            // spawn through `posix_spawn` (vfork-based). A `pre_exec` hook
+            // forces fork+exec instead, and every command forks the same large
+            // parent (the guest runtime), so the parent's `mmap_lock` — held
+            // for writing while the page tables are copied — serializes
+            // concurrent commands regardless of how many vCPUs the guest has.
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
+            cmd.process_group(0);
         }
         // The child can create, modify, or delete workspace files, so the
         // cached workspace size cannot survive an exec.
@@ -295,9 +298,10 @@ impl Drop for ChildGuard {
 
 /// Terminate a child and reap it, bounded so a stuck kill cannot block the
 /// cancel path forever. On Unix the child is placed in its own process group
-/// by `pre_exec(setpgid)`, so the whole group (including descendants) is
-/// killed. On platforms without process groups (e.g. Windows) only the direct
-/// child is terminated; descendant-tree cancellation is Unix-only.
+/// by `CommandExt::process_group(0)`, so the whole group (including
+/// descendants) is killed. On platforms without process groups (e.g. Windows)
+/// only the direct child is terminated; descendant-tree cancellation is
+/// Unix-only.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn terminate_and_reap(child: &mut std::process::Child, pid: u32) {
     #[cfg(unix)]

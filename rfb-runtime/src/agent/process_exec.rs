@@ -57,13 +57,13 @@ pub fn prepare_process(command: &mut Command, piped: bool) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
-    // SAFETY: the closure runs post-fork/pre-exec and only calls the
-    // async-signal-safe `setpgid(0, 0)` to give the child its own group.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
+    {
+        // Same contract as a `pre_exec` `setpgid(0, 0)`, but expressed through
+        // `process_group` so std can keep using `posix_spawn`: a `pre_exec`
+        // hook forces fork+exec, and concurrent commands all fork the same
+        // large parent, which serializes them on the parent's `mmap_lock`.
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
 }
 
