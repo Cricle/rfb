@@ -15,4 +15,4 @@ RFB exposes one protocol line: **ZBRT VERSION=1 full protocol**. The CLI does no
 
 ## Runtime and exit codes
 
-Real VM commands require Linux/WSL, KVM, matching kernel/rootfs, and **Firecracker v1.16.1** (the repository release asset is `firecracker-v1.16.1-x86_64.tgz`). Exit codes are stable: `0` success or optional VM check skipped, `2` usage error, `3` validation/protocol failure, `4` I/O failure, `5` external tool failure, and `12` required VM prerequisites unavailable. Use `--json` for machine-readable output.
+Real VM commands require Linux/WSL, KVM, matching kernel/rootfs, and **Firecracker v1.12.x** (installed from `resx/firecracker/firecracker-v1.12.1`; the version gate rejects v1.16.1 for snapshot-boot compatibility). Exit codes are stable: `0` success or optional VM check skipped, `2` usage error, `3` validation/protocol failure, `4` I/O failure, `5` external tool failure, and `12` required VM prerequisites unavailable. Use `--json` for machine-readable output.

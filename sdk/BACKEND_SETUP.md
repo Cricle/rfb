@@ -25,7 +25,7 @@ forkd controller（沙箱生命周期：快照/创建/销毁）
 
 ```bash
 cd monitor/rfb
-cargo build -p rfb --features cli        # 产物: target/debug/rfb-cli
+cargo build -p rfb-sdk --features cli    # 产物: target/debug/rfb-cli
 rfb-cli doctor --json                    # 检查宿主能力（kvm/mke2fs/网络工具）
 ```
 

@@ -141,8 +141,14 @@ else
   log "运行 Python SDK 测试（python3 -m unittest discover -s tests -v）..."
   if (cd "$SDK_DIR/python" && python3 -m unittest discover -s tests -v) \
       2>&1 | tee "$OUT_DIR/python.log"; then
-    SUMMARY+=("python : PASS")
-    PASS=$((PASS + 1))
+    # 防空跑：unittest 对空目录打印 "Ran 0 tests ... OK" 并 exit 0。
+    if grep -qE "Ran 0 tests" "$OUT_DIR/python.log"; then
+      SUMMARY+=("python : FAIL（0 tests，防空跑；详见 $OUT_DIR/python.log）")
+      FAIL=$((FAIL + 1))
+    else
+      SUMMARY+=("python : PASS")
+      PASS=$((PASS + 1))
+    fi
   else
     SUMMARY+=("python : FAIL（详见 $OUT_DIR/python.log）")
     FAIL=$((FAIL + 1))
@@ -222,8 +228,16 @@ else
   log "运行 Node SDK 测试（npm test：tsc 构建 + node 直跑四个套件）..."
   if (cd "$SDK_DIR/nodejs" && npm install --no-audit --no-fund && npm test) \
       2>&1 | tee "$OUT_DIR/node.log"; then
-    SUMMARY+=("node   : PASS")
-    PASS=$((PASS + 1))
+    # 防空跑：统计各文件摘要里的 "tests N"，总数为 0 视为失败。
+    node_tests=$(grep -oE "tests [0-9]+" "$OUT_DIR/node.log" \
+      | awk '{s += $2} END {print s + 0}')
+    if [ "${node_tests:-0}" -gt 0 ]; then
+      SUMMARY+=("node   : PASS ($node_tests tests)")
+      PASS=$((PASS + 1))
+    else
+      SUMMARY+=("node   : FAIL（0 tests，防空跑；详见 $OUT_DIR/node.log）")
+      FAIL=$((FAIL + 1))
+    fi
   else
     SUMMARY+=("node   : FAIL（详见 $OUT_DIR/node.log）")
     FAIL=$((FAIL + 1))
