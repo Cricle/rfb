@@ -448,6 +448,11 @@ jobs:
           mkdir -p dist/npm-cli
           cp dist-cli/raw/rfb-cli dist/npm-cli/rfb-cli
           chmod +x dist/npm-cli/rfb-cli
+          # 显式校验：缺失二进制时绝不能发布一个空壳包（cp 失败不会中断本脚本）。
+          test -x dist/npm-cli/rfb-cli || {
+            echo "::error::rfb-cli 二进制缺失（dist-cli/raw/rfb-cli），拒绝发布空壳包"
+            exit 1
+          }
           cat > dist/npm-cli/package.json <<EOF
           {
             "name": "rfb-cli",
@@ -475,7 +480,9 @@ jobs:
           MDEOF
           log=/tmp/release-npm-cli.log
           set +e
-          npm publish dist/npm-cli 2>&1 | tee "$log"
+          # `./` 前缀强制目录语义：不带它 npm 会把 dist/npm-cli 当 GitHub 简写
+          # （owner/repo）解析并去 git ls-remote（实测 rc=128）。
+          npm publish ./dist/npm-cli 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
