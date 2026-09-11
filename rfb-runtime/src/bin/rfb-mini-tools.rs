@@ -34,6 +34,15 @@ fn main() {
             println!("no route to {target}");
             exit(1);
         }
+        // Guest CPU count, so a host that configures vCPUs the guest never
+        // brings up is visible from inside the sandbox (and to capacity
+        // benchmarks) without needing an interpreter in the image.
+        "nproc" => {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            println!("{cpus}");
+        }
         "echo" => {
             let (newline, words) = match args.first().map(String::as_str) {
                 Some("-n") => (false, &args[1..]),

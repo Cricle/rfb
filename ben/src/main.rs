@@ -278,18 +278,17 @@ mod zbrt {
         Ok(elapsed_ms)
     }
 
-    /// The guest's own view of its CPU count, read through the ZBRT eval path.
-    /// Reported with its raw outcome so a vCPU level that never reaches the
-    /// kernel (or an AP that fails to boot) shows up as data instead of being
-    /// inferred from timings.
+    /// The guest's own view of its CPU count, via the `nproc` applet the ZBRT
+    /// image installs. Reported with its raw outcome so a vCPU level that
+    /// never reaches the kernel (or an AP that fails to boot) shows up as data
+    /// instead of being inferred from timings.
     async fn guest_cpu_probe(
         sandbox: &rfb::zeroboot::ZeroBootSandbox,
         timeout: u64,
     ) -> serde_json::Value {
         let request = ExecSpec {
-            args: vec!["print(open('/proc/cpuinfo').read().count('processor'))".into()],
             timeout: Some(Duration::from_secs(timeout)),
-            ..ExecSpec::new("eval")
+            ..ExecSpec::new("nproc")
         };
         match sandbox.exec(request).await {
             Ok(result) => serde_json::json!({

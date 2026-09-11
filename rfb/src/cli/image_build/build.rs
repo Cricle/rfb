@@ -642,6 +642,15 @@ pub fn build_rootfs(
                 false,
             )?;
         }
+        // `nproc` is that same multi-call binary under another name, so link
+        // it instead of paying another copy: capacity runs use it to report
+        // the CPU count the guest actually brought up.
+        let nproc = "/bin/nproc";
+        if run_debugfs(&image_path, &format!("stat {nproc}"), false).is_ok() {
+            let _ = run_debugfs(&image_path, &format!("unlink {nproc}"), false);
+            let _ = run_debugfs(&image_path, &format!("rm {nproc}"), false);
+        }
+        run_debugfs(&image_path, &format!("ln /bin/echo {nproc}"), false)?;
         // Interpreter multi-call hardlinks: /bin/python3 and /bin/lua point
         // at /init, which dispatches on argv[0]. Zero extra image bytes; the
         // interpreter itself must be compiled into the runtime binary via the
