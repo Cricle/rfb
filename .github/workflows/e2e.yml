@@ -288,32 +288,36 @@ jobs:
           OUT="$RUN_DIR/bench-resources.jsonl"
 
           # 采样：controller + firecracker 的 RSS(MiB)、CPU ticks、FD 合计。
-          # /proc/<pid>/stat 的 comm 含空格/括号，故在最后一个 ')' 之后切片，
-          # 此处位置 12/13 对应 utime/stime。
+          # /proc/<pid>/stat 的 comm 含空格/括号，故在最后一个 ')' 之后按
+          # 空白切分：位置 12/13 对应 utime/stime（字段 14/15）。
+          # 注意：不能用 bash 的 $12 —— 那是 ${1} 后跟字面量 '2'（set -u 下
+          # 曾报 "S2: unbound variable"）。
+          proc_stats() {
+            local pid="$1" rss fds ticks
+            rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+            [ -n "$rss" ] || rss=0
+            fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+            ticks=$(awk -F')' \
+              '{ s = $NF; sub(/^[[:space:]]+/, "", s); split(s, f, /[[:space:]]+/); print f[12] + f[13] }' \
+              "/proc/$pid/stat" 2>/dev/null || echo 0)
+            [ -n "$ticks" ] || ticks=0
+            printf '%s %s %s\n' "$rss" "$fds" "$ticks"
+          }
+
           sample() {
-            local label="$1" ctl_rss=0 fc_rss=0 fc_count=0 fds=0 ticks=0 p stat rest rss
+            local label="$1" ctl_rss=0 fc_rss=0 fc_count=0 fds=0 ticks=0 p rss f t
             for p in $(pgrep -f forkd-controller || true); do
-              rss=$(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
+              read -r rss f t <<< "$(proc_stats "$p")"
               ctl_rss=$((ctl_rss + rss))
-              fds=$((fds + $(ls "/proc/$p/fd" 2>/dev/null | wc -l)))
-              stat=$(cat "/proc/$p/stat" 2>/dev/null || true)
-              if [ -n "$stat" ]; then
-                rest=${stat#*) }
-                set -- $rest
-                ticks=$((ticks + $12 + $13))
-              fi
+              fds=$((fds + f))
+              ticks=$((ticks + t))
             done
             for p in $(pgrep -x firecracker || true); do
+              read -r rss f t <<< "$(proc_stats "$p")"
               fc_count=$((fc_count + 1))
-              rss=$(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
               fc_rss=$((fc_rss + rss))
-              fds=$((fds + $(ls "/proc/$p/fd" 2>/dev/null | wc -l)))
-              stat=$(cat "/proc/$p/stat" 2>/dev/null || true)
-              if [ -n "$stat" ]; then
-                rest=${stat#*) }
-                set -- $rest
-                ticks=$((ticks + $12 + $13))
-              fi
+              fds=$((fds + f))
+              ticks=$((ticks + t))
             done
             printf '{"label":"%s","controller_rss_mb":%s,"firecracker_count":%s,"firecracker_rss_mb":%s,"cpu_ticks":%s,"fds":%s}\n' \
               "$label" "$((ctl_rss / 1024))" "$fc_count" "$((fc_rss / 1024))" "$ticks" "$fds" \
