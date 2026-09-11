@@ -230,11 +230,6 @@ impl RuntimeManager {
     }
     /// Provision at most one worker for a session; concurrent callers share the placeholder/result.
     pub async fn create_for_session(&self, id: &str) -> RuntimeHandle {
-        // Serialize with cancel_for_session: without the lock a cancel that
-        // lands while provisioning runs bumps the generation, and the
-        // finishing create then destroys its worker but still returns a
-        // "running" handle while leaving a Provisioning placeholder behind.
-        let _g = self.lock.lock().await;
         if let Some(h) = self.get(id).await {
             return h;
         }
@@ -305,6 +300,17 @@ impl RuntimeManager {
         {
             s.insert(id.into(), h.clone());
         } else if let Some(w) = h.worker.take() {
+            // Cancelled while provisioning: destroy the worker. Drop the
+            // placeholder only when it is still ours in Provisioning state —
+            // a cancel's Stopped handle (or a new owner) must stay, and a
+            // stale placeholder left behind would wedge the session forever.
+            let stale_placeholder = s
+                .get(id)
+                .map(|x| x.vm_id == h.vm_id && x.status == RuntimeStatus::Provisioning)
+                .unwrap_or(false);
+            if stale_placeholder {
+                s.remove(id);
+            }
             let adapter = self.adapter.clone();
             tokio::spawn(async move {
                 let _ = cleanup_with_retry(10, 2, 100, || adapter.destroy(&w)).await;
