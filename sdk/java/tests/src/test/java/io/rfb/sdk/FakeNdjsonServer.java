@@ -26,6 +26,7 @@ final class FakeNdjsonServer implements AutoCloseable {
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final List<ConnHandler> handlers = new ArrayList<>();
     private final List<Socket> sockets = new ArrayList<>();
+    private final List<Throwable> handlerFailures = java.util.Collections.synchronizedList(new ArrayList<>());
     private volatile boolean closed = false;
 
     FakeNdjsonServer(ConnHandler... perConnectionHandlers) throws IOException {
@@ -68,6 +69,11 @@ final class FakeNdjsonServer implements AutoCloseable {
                         handler.handle(in, out);
                     } catch (IOException ignored) {
                         // client went away — fine for a fake
+                    } catch (Throwable failure) {
+                        // Handler assertions run on pool threads: record them
+                        // so close() can surface the failure instead of the
+                        // test stalling and passing.
+                        handlerFailures.add(failure);
                     }
                 });
             } catch (IOException e) {
@@ -101,6 +107,11 @@ final class FakeNdjsonServer implements AutoCloseable {
             pool.awaitTermination(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        // Surface the first handler-side failure (assertions would otherwise be
+        // swallowed by the pool and the test could pass with a broken guest).
+        if (!handlerFailures.isEmpty()) {
+            throw new AssertionError("fake guest handler failed", handlerFailures.get(0));
         }
     }
 }

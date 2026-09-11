@@ -16,7 +16,7 @@
     <Description>RFB CLI (rfb-cli) native binary for linux-x64. Binary-only package.</Description>
     <PackageProjectUrl>https://github.com/Cricle/rfb</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Cricle/rfb</RepositoryUrl>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
     <IncludeBuildOutput>false</IncludeBuildOutput>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <NoWarn>$(NoWarn);NU5128</NoWarn>

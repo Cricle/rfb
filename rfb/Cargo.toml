@@ -9,6 +9,8 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "RFB sandbox contracts and integrations"
+keywords = ["sandbox", "firecracker", "microvm", "vsock", "zeroboot"]
+categories = ["development-tools", "virtualization"]
 
 [lib]
 name = "rfb"

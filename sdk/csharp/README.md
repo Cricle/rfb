@@ -14,11 +14,12 @@ RFB 统一 SDK 的 C# 实现（多目标 `netstandard2.1` + `net8.0`；ns2.1 侧
 
 ## 构建 / 安装
 
-.NET 8 SDK，无需额外还原第三方包：
+.NET 8 SDK，无需额外还原第三方包（`.slnx` 解决方案格式在 .NET 8 SDK 下无法解析，
+请直接指向工程文件）：
 
 ```bash
 cd sdk/csharp
-dotnet build Rfb.Sdk.slnx
+dotnet build src/Rfb.Sdk/Rfb.Sdk.csproj
 ```
 
 ## 统一 API 快速上手
@@ -75,7 +76,7 @@ var result = await sandbox.Exec(new[] { "echo", "hello" });
 
 ```bash
 cd sdk/csharp
-dotnet test Rfb.Sdk.slnx
+dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj
 ```
 
 测试全部使用进程内 fake 服务器（fake controller HTTP、fake guest NDJSON、fake ZBRT 帧服务，见 `tests/Rfb.Sdk.Tests/Fakes.cs`），无外部依赖，快速执行。

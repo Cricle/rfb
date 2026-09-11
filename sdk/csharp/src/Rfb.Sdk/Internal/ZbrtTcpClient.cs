@@ -76,44 +76,54 @@ internal sealed class ZbrtTcpClient : IDisposable
         await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeExecute(argv, cwd, stdin, timeoutMs);
         var request = new ZbrtFrame { Kind = ZbrtKind.Execute, RequestId = NewRequestId(), Payload = payload };
-        await WriteFrameAsync(request).ConfigureAwait(false);
-
-        var stdout = new List<byte>();
-        var stderr = new List<byte>();
-        while (true)
+        try
         {
-            var frame = await ReadFrameAsync().ConfigureAwait(false);
-            RequireRequestId(frame, request.RequestId);
-            switch (frame.Kind)
-            {
-                case ZbrtKind.Output:
-                    {
-                        var (stream, data) = ZbrtFrameCodec.DecodeOutput(frame.Payload);
-                        if (stream == 0)
-                        {
-                            stdout.AddRange(data);
-                        }
-                        else if (stream == 1)
-                        {
-                            stderr.AddRange(data);
-                        }
-                        else
-                        {
-                            throw new DecodeException("invalid output stream");
-                        }
+            await WriteFrameAsync(request).ConfigureAwait(false);
 
-                        break;
-                    }
-                case ZbrtKind.Exit:
-                    {
-                        var (code, _) = ZbrtFrameCodec.DecodeExit(frame.Payload);
-                        return new ZbrtExecOutcome(code, stdout.ToArray(), stderr.ToArray());
-                    }
-                case ZbrtKind.Error:
-                    throw RemoteError(frame);
-                default:
-                    throw UnexpectedKind(frame, "Output/Exit/Error");
+            var stdout = new List<byte>();
+            var stderr = new List<byte>();
+            while (true)
+            {
+                var frame = await ReadFrameAsync().ConfigureAwait(false);
+                RequireRequestId(frame, request.RequestId);
+                switch (frame.Kind)
+                {
+                    case ZbrtKind.Output:
+                        {
+                            var (stream, data) = ZbrtFrameCodec.DecodeOutput(frame.Payload);
+                            if (stream == 0)
+                            {
+                                stdout.AddRange(data);
+                            }
+                            else if (stream == 1)
+                            {
+                                stderr.AddRange(data);
+                            }
+                            else
+                            {
+                                throw new DecodeException("invalid output stream");
+                            }
+
+                            break;
+                        }
+                    case ZbrtKind.Exit:
+                        {
+                            var (code, _) = ZbrtFrameCodec.DecodeExit(frame.Payload);
+                            return new ZbrtExecOutcome(code, stdout.ToArray(), stderr.ToArray());
+                        }
+                    case ZbrtKind.Error:
+                        throw RemoteError(frame);
+                    default:
+                        throw UnexpectedKind(frame, "Output/Exit/Error");
+                }
             }
+        }
+        catch (TransportException)
+        {
+            // A timed-out read leaves the connection mid-turn: drop it so the
+            // next request cannot consume stale frames.
+            ResetConnection();
+            throw;
         }
     }
 
@@ -197,10 +207,39 @@ internal sealed class ZbrtTcpClient : IDisposable
 
     private async Task<ZbrtFrame> RoundTripAsync(ZbrtFrame request)
     {
-        await WriteFrameAsync(request).ConfigureAwait(false);
-        var reply = await ReadFrameAsync().ConfigureAwait(false);
-        RequireRequestId(reply, request.RequestId);
-        return reply;
+        try
+        {
+            await WriteFrameAsync(request).ConfigureAwait(false);
+            var reply = await ReadFrameAsync().ConfigureAwait(false);
+            RequireRequestId(reply, request.RequestId);
+            return reply;
+        }
+        catch (TransportException)
+        {
+            ResetConnection();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Drop the TCP connection so the next operation reconnects cleanly. A
+    /// timed-out read leaves unread frames buffered on the socket; reusing it
+    /// would poison the next request with stale frames (id mismatch).
+    /// </summary>
+    internal void ResetConnection()
+    {
+        try
+        {
+            _stream?.Dispose();
+        }
+        catch (IOException)
+        {
+            // Disposing a broken stream may throw; the connection is going away anyway.
+        }
+
+        _stream = null;
+        _tcp?.Dispose();
+        _tcp = null;
     }
 
     internal async Task WriteFrameAsync(ZbrtFrame frame)
@@ -306,7 +345,7 @@ internal sealed class ZbrtTcpClient : IDisposable
 }
 
 /// <summary>One ZBRT stream session: Output frames → events, terminal Exit, targeted Cancel on stop.</summary>
-internal sealed class ZbrtStreamSession
+internal sealed class ZbrtStreamSession : IDisposable
 {
     private readonly ZbrtTcpClient _client;
     private readonly byte[] _requestId;
@@ -341,7 +380,10 @@ internal sealed class ZbrtStreamSession
 
             if (!frame.RequestId.AsSpan().SequenceEqual(_requestId))
             {
-                continue; // e.g. CancelAck reusing the cancel frame's id
+                // PROTOCOL.md §3.4: a reply must echo the request id. The stop
+                // path already sends Cancel with this turn's id, so a
+                // CancelAck also matches; anything else is a desync.
+                throw new DecodeException("frame request id mismatch");
             }
 
             switch (frame.Kind)
@@ -419,6 +461,11 @@ internal sealed class ZbrtStreamSession
                 return;
             }
 
+            if (!frame.RequestId.AsSpan().SequenceEqual(_requestId))
+            {
+                throw new DecodeException("frame request id mismatch");
+            }
+
             if (frame.Kind == ZbrtKind.CancelAck)
             {
                 return;
@@ -438,4 +485,11 @@ internal sealed class ZbrtStreamSession
             throw new DecodeException($"expected CancelAck, got frame kind {(int)frame.Kind}");
         }
     }
+
+    /// <summary>
+    /// Release the underlying connection (idempotent). A stream occupies the
+    /// client's single turn, so after disposal the socket state is unknown;
+    /// closing it makes the next operation reconnect cleanly.
+    /// </summary>
+    public void Dispose() => _client.ResetConnection();
 }

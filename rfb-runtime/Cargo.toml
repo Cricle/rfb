@@ -6,6 +6,8 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "Runtime components for RFB sandbox services"
+keywords = ["sandbox", "firecracker", "microvm", "runtime", "vsock"]
+categories = ["virtualization", "os"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }

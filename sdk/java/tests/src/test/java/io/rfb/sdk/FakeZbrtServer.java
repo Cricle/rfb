@@ -36,8 +36,15 @@ final class FakeZbrtServer implements AutoCloseable {
             this.out = socket.getOutputStream();
         }
 
-        ZbrtFrame read() {
-            return ZbrtFrame.decode(in);
+        ZbrtFrame read() throws IOException {
+            try {
+                return ZbrtFrame.decode(in);
+            } catch (io.rfb.sdk.DecodeError e) {
+                // The client closed mid-read (EOF) — expected fake teardown.
+                // Surface as IOException so handlers/pool treat it as "client
+                // went away" instead of an assertion failure.
+                throw new IOException("client closed while reading a frame", e);
+            }
         }
 
         void write(ZbrtFrame frame) throws IOException {
@@ -60,6 +67,7 @@ final class FakeZbrtServer implements AutoCloseable {
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final List<ConnHandler> handlers = new ArrayList<>();
     private final List<Socket> sockets = new ArrayList<>();
+    private final List<Throwable> handlerFailures = java.util.Collections.synchronizedList(new ArrayList<>());
     private volatile boolean closed = false;
 
     FakeZbrtServer(ConnHandler... perConnectionHandlers) throws IOException {
@@ -90,6 +98,11 @@ final class FakeZbrtServer implements AutoCloseable {
                         handler.handle(new FrameIO(socket));
                     } catch (IOException ignored) {
                         // client went away — fine for a fake
+                    } catch (Throwable failure) {
+                        // Handler assertions run on pool threads: record them
+                        // so close() can surface the failure instead of the
+                        // test stalling and passing.
+                        handlerFailures.add(failure);
                     }
                 });
             } catch (IOException e) {
@@ -136,6 +149,11 @@ final class FakeZbrtServer implements AutoCloseable {
             pool.awaitTermination(2, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        // Surface the first handler-side failure (assertions would otherwise be
+        // swallowed by the pool and the test could pass with a broken guest).
+        if (!handlerFailures.isEmpty()) {
+            throw new AssertionError("fake zbrt handler failed", handlerFailures.get(0));
         }
     }
 }

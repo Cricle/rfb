@@ -14,6 +14,9 @@
 *.txt text eol=lf
 # resx ships extensionless ELF assets (kernel, firecracker, forkd binaries).
 resx/** binary
+# …except the JSON sidecar manifests, which stay text so they remain diffable
+# (checksum files stay binary: any eol translation would change them).
+resx/**/*.json text eol=lf
 *.lockb binary
 *.tgz binary
 *.gz binary
