@@ -43,7 +43,7 @@ public class SandboxInfo {
     /** Sets the sandbox id. */
     @JsonProperty("id")
     public void setId(String id) {
-        this.id = id;
+        this.id = id == null ? "" : id;
     }
 
     /** Tag of the snapshot this sandbox was created from. */
@@ -55,7 +55,7 @@ public class SandboxInfo {
     /** Sets the snapshot tag. */
     @JsonProperty("snapshot_tag")
     public void setSnapshotTag(String snapshotTag) {
-        this.snapshotTag = snapshotTag;
+        this.snapshotTag = snapshotTag == null ? "" : snapshotTag;
     }
 
     /** Network namespace (null for shared-tap sandboxes). */
@@ -67,7 +67,7 @@ public class SandboxInfo {
     /** Sets the network namespace. */
     @JsonProperty("netns")
     public void setNetns(String netns) {
-        this.netns = netns;
+        this.netns = netns; // nullable: intentionally accepts null
     }
 
     /** Creation time (Unix seconds). */
@@ -79,7 +79,7 @@ public class SandboxInfo {
     /** Sets the creation time (Unix seconds). */
     @JsonProperty("created_at_unix")
     public void setCreatedAtUnix(Long createdAtUnix) {
-        this.createdAtUnix = createdAtUnix;
+        this.createdAtUnix = createdAtUnix; // nullable
     }
 
     /** Host:port of the guest agent (TCP). */
@@ -91,7 +91,7 @@ public class SandboxInfo {
     /** Sets the guest agent address. */
     @JsonProperty("guest_addr")
     public void setGuestAddr(String guestAddr) {
-        this.guestAddr = guestAddr;
+        this.guestAddr = guestAddr == null ? "" : guestAddr;
     }
 
     /** Memory cap in MiB (null = controller default). */
@@ -103,7 +103,7 @@ public class SandboxInfo {
     /** Sets the memory cap in MiB. */
     @JsonProperty("memory_limit_mib")
     public void setMemoryLimitMib(Long memoryLimitMib) {
-        this.memoryLimitMib = memoryLimitMib;
+        this.memoryLimitMib = memoryLimitMib; // nullable
     }
 
     /** PID of the backing Firecracker process. */
@@ -115,7 +115,7 @@ public class SandboxInfo {
     /** Sets the backing Firecracker PID. */
     @JsonProperty("pid")
     public void setPid(Long pid) {
-        this.pid = pid;
+        this.pid = pid; // nullable
     }
 
     /** True when this sandbox has produced a branch. */

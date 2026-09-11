@@ -85,27 +85,35 @@ export class RfbClient {
   }
 
   async #send(method: string, pathAndQuery: string, body?: unknown): Promise<HttpResponse> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutS * 1000);
-    let response: Response;
-    try {
-      response = await fetch(this.baseUrl + pathAndQuery, {
-        method,
-        headers: {
-          ...(this.token !== null ? { Authorization: `Bearer ${this.token}` } : {}),
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: body === undefined ? null : JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      clearTimeout(timer);
-      const e = error as Error & { cause?: { message?: string } };
-      throw new TransportError(`forkd request failed: ${e.cause?.message ?? e.message}`);
+    // PROTOCOL.md §1.2: a keep-alive connection may be closed by the peer;
+    // retry once for idempotent methods (GET/DELETE/PUT).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutS * 1000);
+      try {
+        const response = await fetch(this.baseUrl + pathAndQuery, {
+          method,
+          headers: {
+            ...(this.token !== null ? { Authorization: `Bearer ${this.token}` } : {}),
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          },
+          body: body === undefined ? null : JSON.stringify(body),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const text = await response.text().catch(() => '');
+        return { status: response.status, body: text };
+      } catch (error) {
+        clearTimeout(timer);
+        if (attempt === 0 && (method === 'GET' || method === 'DELETE' || method === 'PUT')) {
+          continue; // stale keep-alive: retry once
+        }
+        const e = error as Error & { cause?: { message?: string } };
+        throw new TransportError(`forkd request failed: ${e.cause?.message ?? e.message}`);
+      }
     }
-    clearTimeout(timer);
-    const text = await response.text().catch(() => '');
-    return { status: response.status, body: text };
+    // Unreachable: the loop returns on success or throws on error.
+    throw new Error('unreachable');
   }
 
   #expectOk(result: HttpResponse): string {
