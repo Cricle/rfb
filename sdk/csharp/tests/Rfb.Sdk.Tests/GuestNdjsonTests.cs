@@ -75,13 +75,14 @@ public class GuestNdjsonTests
     }
 
     [Fact]
-    public async Task OversizeLine_RaisesTransportError()
+    public async Task OversizeLine_RaisesDecodeError()
     {
         static Task Handler(FakeNdjsonSession session, JsonElement value) =>
             session.WriteAsync(new Dictionary<string, object?> { ["junk"] = new string('x', 1100 * 1024) });
 
         using var guest = new FakeNdjsonGuest { Handler = Handler };
-        var e = await Assert.ThrowsAsync<TransportException>(() => Client(guest).PingAsync());
+        // An oversized line is a decode failure (PROTOCOL.md; Python/Java match).
+        var e = await Assert.ThrowsAsync<DecodeException>(() => Client(guest).PingAsync());
         Assert.Contains("exceeded 1048576 bytes", e.Message);
     }
 
