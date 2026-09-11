@@ -82,9 +82,11 @@ class _ForkdController:
         except (OSError, http.client.HTTPException) as e:
             self._conn = None
             conn.close()
-            if reused:
+            if reused and method in ("GET", "HEAD", "DELETE"):
                 # Stale pooled socket (closed by the peer while idle): retry
-                # once on a fresh connection, then fail.
+                # once on a fresh connection, then fail. Non-idempotent
+                # requests (POST) are NOT replayed - the peer may have
+                # processed them before closing (e.g. an extra sandbox).
                 return self._request(method, path, body)
             raise TransportError(f"forkd request failed: {e}") from e
 

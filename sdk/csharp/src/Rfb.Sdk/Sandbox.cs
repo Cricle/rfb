@@ -11,8 +11,8 @@ public sealed class Sandbox
 {
     private readonly RfbClient _client;
     private readonly TimeSpan _timeout;
-    private readonly Lazy<Task<ForkdGuestNdjson>> _ndjson;
-    private readonly Lazy<Task<ZbrtTcpClient>> _zbrt;
+    private readonly Lazy<ForkdGuestNdjson> _ndjson;
+    private readonly Lazy<ZbrtTcpClient> _zbrt;
 
     internal Sandbox(RfbClient client, SandboxInfo info, string transport, TimeSpan timeout)
     {
@@ -25,40 +25,48 @@ public sealed class Sandbox
         _timeout = timeout;
         Info = info;
         Transport = transport;
-        _ndjson = new Lazy<Task<ForkdGuestNdjson>>(() =>
-            Task.FromResult(new ForkdGuestNdjson(info.GuestAddr, timeout)));
-        _zbrt = new Lazy<Task<ZbrtTcpClient>>(() =>
-            Task.FromResult(new ZbrtTcpClient(info.GuestAddr, timeout)));
+        // Plain Lazy<T>: the constructors are synchronous, so Task.FromResult
+        // wrappers (and the .Result unwrap they forced) added nothing.
+        _ndjson = new Lazy<ForkdGuestNdjson>(() => new ForkdGuestNdjson(info.GuestAddr, timeout));
+        _zbrt = new Lazy<ZbrtTcpClient>(() => new ZbrtTcpClient(info.GuestAddr, timeout));
     }
 
+    /// <summary>Sandbox id (controller-assigned).</summary>
     public string Id => Info.Id;
+    /// <summary>Tag of the snapshot this sandbox was created from.</summary>
     public string SnapshotTag => Info.SnapshotTag;
+    /// <summary>Host:port of the guest agent (TCP).</summary>
     public string GuestAddr => Info.GuestAddr;
+    /// <summary>Creation time (Unix seconds).</summary>
     public long? CreatedAtUnix => Info.CreatedAtUnix;
+    /// <summary>Raw controller metadata for this sandbox.</summary>
     public SandboxInfo Info { get; }
+    /// <summary>Guest transport in use: "ndjson" or "zbrt".</summary>
     public string Transport { get; }
 
     private ForkdGuestNdjson Guest => Transport == "ndjson"
-        ? _ndjson.Value.Result
+        ? _ndjson.Value
         : throw new InvalidOperationException("ndjson transport not active");
 
     private ZbrtTcpClient Zbrt => Transport == "zbrt"
-        ? _zbrt.Value.Result
+        ? _zbrt.Value
         : throw new InvalidOperationException("zbrt transport not active");
 
+    /// <summary>Guest health: true only when the agent answers pong=true.</summary>
     public async Task<bool> Ping()
     {
         if (Transport == "ndjson")
         {
-            var v = await Guest.PingAsync();
+            var v = await Guest.PingAsync().ConfigureAwait(false);
             return v.ValueKind == JsonValueKind.Object
                 && v.TryGetProperty("pong", out var pong)
                 && pong.ValueKind == JsonValueKind.True;
         }
 
-        return await Zbrt.HealthAsync();
+        return await Zbrt.HealthAsync().ConfigureAwait(false);
     }
 
+    /// <summary>Run `args` in the guest; stdin is ZBRT-only (NDJSON drops it).</summary>
     public async Task<ExecResult> Exec(IReadOnlyList<string> args, string cwd = "/", double timeoutS = 60.0, byte[]? stdin = null)
     {
         if (args.Count == 0)
@@ -74,14 +82,15 @@ public sealed class Sandbox
             // Rust baseline: the NDJSON exec wire contract has no stdin
             // channel; non-empty stdin is silently dropped (delivered only
             // over ZBRT).
-            var v = await Guest.ExecAsync(cwd, args, ForkdGuestNdjson.TimeoutSecs(timeoutS));
+            var v = await Guest.ExecAsync(cwd, args, ForkdGuestNdjson.TimeoutSecs(timeoutS)).ConfigureAwait(false);
             return GuestResults.ParseExec(v);
         }
 
-        var outcome = await Zbrt.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS));
+        var outcome = await Zbrt.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS)).ConfigureAwait(false);
         return new ExecResult(outcome.ExitCode, outcome.Stdout, outcome.Stderr, false);
     }
 
+    /// <summary>Evaluate a code snippet in the guest; output maps to stdout.</summary>
     public async Task<ExecResult> Eval(string code, string? cwd = null, double? timeoutS = null)
     {
         GuestValidation.EvalCode(code);
@@ -94,15 +103,16 @@ public sealed class Sandbox
 
         if (Transport == "ndjson")
         {
-            var v = await Guest.EvalAsync(code, cwd, timeoutS);
+            var v = await Guest.EvalAsync(code, cwd, timeoutS).ConfigureAwait(false);
             return GuestResults.ParseEval(v);
         }
 
         var argv = new List<string> { "eval", code };
-        var outcome = await Zbrt.ExecuteAsync(argv, cwd, [], TimeoutMs(timeoutS));
+        var outcome = await Zbrt.ExecuteAsync(argv, cwd, [], TimeoutMs(timeoutS)).ConfigureAwait(false);
         return new ExecResult(outcome.ExitCode, outcome.Stdout, outcome.Stderr, false);
     }
 
+    /// <summary>Directory entries under `path` (default ".").</summary>
     public async Task<IReadOnlyList<DirEntry>> Ls(string path = ".")
     {
         GuestValidation.FsPath(path);
@@ -116,7 +126,7 @@ public sealed class Sandbox
             return GuestResults.ParseLs(v);
         }
 
-        var result = await Zbrt.FsAsync(FsOp.Ls, path, LsJson);
+        var result = await Zbrt.FsAsync(FsOp.Ls, path, LsJson).ConfigureAwait(false);
         return GuestResults.ParseLs(result);
     }
 
@@ -154,7 +164,7 @@ public sealed class Sandbox
             ["pattern"] = pattern,
             ["max_results"] = GuestValidation.MaxResults,
         });
-        var result = await Zbrt.FsAsync(FsOp.Find, path, json);
+        var result = await Zbrt.FsAsync(FsOp.Find, path, json).ConfigureAwait(false);
         return GuestResults.ParseFind(result);
     }
 
@@ -194,10 +204,11 @@ public sealed class Sandbox
             ["max_results"] = GuestValidation.MaxResults,
             ["max_bytes"] = GuestValidation.MaxResultBytes,
         });
-        var result = await Zbrt.FsAsync(FsOp.Grep, path, json);
+        var result = await Zbrt.FsAsync(FsOp.Grep, path, json).ConfigureAwait(false);
         return GuestResults.ParseGrep(result);
     }
 
+    /// <summary>Read a guest file with optional offset / maxBytes cap.</summary>
     public async Task<FileRead> Read(string path, long? offset = null, long? maxBytes = null)
     {
         GuestValidation.FilePath(path);
@@ -219,7 +230,7 @@ public sealed class Sandbox
                 args["max_bytes"] = maxBytes.Value;
             }
 
-            var v = await Guest.ToolAsync("read", args);
+            var v = await Guest.ToolAsync("read", args).ConfigureAwait(false);
             return GuestResults.ParseRead(v);
         }
 
@@ -228,10 +239,11 @@ public sealed class Sandbox
             ["offset"] = offset,
             ["max_bytes"] = maxBytes,
         });
-        var result = await Zbrt.FsAsync(FsOp.Read, path, json);
+        var result = await Zbrt.FsAsync(FsOp.Read, path, json).ConfigureAwait(false);
         return GuestResults.ParseRead(result);
     }
 
+    /// <summary>Write (or append) `data`; returns bytes written.</summary>
     public async Task<long> Write(string path, byte[] data, bool append = false, uint? mode = null)
     {
         GuestValidation.FilePath(path);
@@ -249,7 +261,7 @@ public sealed class Sandbox
                 args["mode"] = mode.Value;
             }
 
-            var v = await Guest.ToolAsync("write", args);
+            var v = await Guest.ToolAsync("write", args).ConfigureAwait(false);
             return GuestResults.ParseWrite(v);
         }
 
@@ -259,7 +271,7 @@ public sealed class Sandbox
             ["append"] = append,
             ["mode"] = mode,
         });
-        var result = await Zbrt.FsAsync(FsOp.Write, path, json);
+        var result = await Zbrt.FsAsync(FsOp.Write, path, json).ConfigureAwait(false);
         return GuestResults.ParseWrite(result);
     }
 
@@ -285,7 +297,7 @@ public sealed class Sandbox
             var envObj = env is null
                 ? null
                 : (IReadOnlyDictionary<string, object?>)env.ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
-            var session = await Guest.StreamAsync(args, cwd, pty, envObj);
+            var session = await Guest.StreamAsync(args, cwd, pty, envObj).ConfigureAwait(false);
             return new GuestStream(session);
         }
 
@@ -299,14 +311,14 @@ public sealed class Sandbox
             throw new ValidationException("env is not supported over zbrt transport");
         }
 
-        var zbrtSession = await Zbrt.StreamAsync(args, cwd);
+        var zbrtSession = await Zbrt.StreamAsync(args, cwd).ConfigureAwait(false);
         return new GuestStream(zbrtSession);
     }
 
     /// <summary>Delete this sandbox (2xx/404 both succeed).</summary>
     public async Task Delete()
     {
-        await _client.DeleteSandbox(Id);
+        await _client.DeleteSandbox(Id).ConfigureAwait(false);
     }
 
     // Constant ZBRT fs-request bodies (payload never varies → build once).

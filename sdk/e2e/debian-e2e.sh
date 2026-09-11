@@ -233,7 +233,7 @@ else
   command -v node >/dev/null 2>&1 || die12 "node 缺失，无法运行 Node 套件"
   command -v npm >/dev/null 2>&1 || die12 "npm 缺失，无法运行 Node 套件"
   log "运行 Node SDK 测试（npm test：tsc 构建 + node 直跑四个套件）..."
-  if (cd "$SDK_DIR/nodejs" && npm install --no-audit --no-fund && npm test) \
+  if (cd "$SDK_DIR/nodejs" && npm ci --no-audit --no-fund && npm test) \
       2>&1 | tee "$OUT_DIR/node.log"; then
     # 防空跑：统计各文件摘要里的 "tests N"，总数为 0 视为失败。
     # 同样容忍空输入（见 Java 套件的计数说明）。

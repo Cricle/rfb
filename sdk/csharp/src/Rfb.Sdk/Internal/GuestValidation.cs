@@ -50,7 +50,7 @@ internal static class GuestValidation
             || Utf8Len(path) > MaxPathBytes
             || ContainsNul(path)
             || (path.StartsWith('/') && !IsWorkspacePath(path))
-            || path.Contains('\\')
+            || path.IndexOf('\\') >= 0
             || HasDotDotSegment(path))
         {
             throw new ValidationException(
@@ -125,7 +125,7 @@ internal static class GuestValidation
     /// <summary>Timeout in seconds: finite and strictly positive (mirror of Rust timeout_secs).</summary>
     public static void Timeout(double timeoutS)
     {
-        if (!double.IsFinite(timeoutS) || timeoutS <= 0)
+        if (double.IsNaN(timeoutS) || double.IsInfinity(timeoutS) || timeoutS <= 0)
         {
             throw new ValidationException("timeout must be a positive number of seconds");
         }
@@ -149,7 +149,8 @@ internal static class GuestValidation
 
         foreach (var c in id)
         {
-            if (!(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_'))
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '-' || c == '_'))
             {
                 throw new ValidationException("invalid forkd sandbox id");
             }

@@ -10,12 +10,19 @@ name = "rfb-sdk"
 version = "0.0.1"
 description = "RFB unified SDK (Python): RfbClient facade over forkd controller, forkd guest and ZBRT v1"
 readme = "README.md"
-requires-python = ">=3"
-license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -23,3 +30,6 @@ Repository = "https://github.com/Cricle/rfb"
 
 [tool.setuptools]
 packages = ["rfb_sdk"]
+
+[tool.setuptools.package-data]
+rfb_sdk = ["py.typed"]

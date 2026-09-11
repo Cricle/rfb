@@ -30,8 +30,6 @@ x86/
 [Aa][Rr][Mm]/
 [Aa][Rr][Mm]64/
 bld/
-!rfb-runtime/src/bin/
-!rfb-runtime/src/bin/*
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
@@ -496,3 +494,18 @@ resx/rootfs/*.ext4*
 # Node.js build output
 sdk/nodejs/dist/
 sdk/nodejs/lib/
+
+# Python build outputs / generated release payloads
+sdk/python/dist/
+sdk/python/build/
+sdk/python/*.egg-info/
+sdk/python-cli/dist/
+sdk/python-cli/build/
+sdk/python-cli/*.egg-info/
+sdk/python-cli/rfb_cli/_bin/
+# C# binary-only CLI payload (injected at release time)
+sdk/csharp/Rfb.Cli/tools/
+# Root-level release staging
+/dist/
+# Snapshots must never be committed (README:80)
+resx/snapshots/

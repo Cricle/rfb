@@ -39,7 +39,7 @@ internal sealed class ZbrtTcpClient : IDisposable
         using var cts = new CancellationTokenSource(_timeout);
         try
         {
-            await tcp.ConnectAsync(_host, _port, cts.Token);
+            await TcpCompat.ConnectAsync(tcp, _host, _port, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -49,7 +49,7 @@ internal sealed class ZbrtTcpClient : IDisposable
         catch (SocketException e)
         {
             tcp.Dispose();
-            throw new TransportException($"guest connect failed: {e.Message}");
+            throw new TransportException($"guest connect failed: {e.Message}", e);
         }
 
         _tcp = tcp;
@@ -60,8 +60,8 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Optional handshake: Hello → HelloAck.</summary>
     public async Task<ZbrtHelloAck> HelloAsync(string client, IReadOnlyList<string> capabilities)
     {
-        await ConnectAsync();
-        var reply = await RoundTripAsync(ZbrtFrameCodec.HelloFrame(NewRequestId(), client, capabilities));
+        await ConnectAsync().ConfigureAwait(false);
+        var reply = await RoundTripAsync(ZbrtFrameCodec.HelloFrame(NewRequestId(), client, capabilities)).ConfigureAwait(false);
         if (reply.Kind != ZbrtKind.HelloAck)
         {
             throw UnexpectedKind(reply, ZbrtKind.HelloAck);
@@ -73,16 +73,16 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Execute: 0..n Output frames then exactly one terminal Exit (or Error frame).</summary>
     public async Task<ZbrtExecOutcome> ExecuteAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
     {
-        await ConnectAsync();
+        await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeExecute(argv, cwd, stdin, timeoutMs);
         var request = new ZbrtFrame { Kind = ZbrtKind.Execute, RequestId = NewRequestId(), Payload = payload };
-        await WriteFrameAsync(request);
+        await WriteFrameAsync(request).ConfigureAwait(false);
 
         var stdout = new List<byte>();
         var stderr = new List<byte>();
         while (true)
         {
-            var frame = await ReadFrameAsync();
+            var frame = await ReadFrameAsync().ConfigureAwait(false);
             RequireRequestId(frame, request.RequestId);
             switch (frame.Kind)
             {
@@ -120,10 +120,10 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Health → HealthAck; returns the guest's healthy flag.</summary>
     public async Task<bool> HealthAsync()
     {
-        await ConnectAsync();
+        await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeHealth(healthy: true, message: null);
         var request = new ZbrtFrame { Kind = ZbrtKind.Health, RequestId = NewRequestId(), Payload = payload };
-        var reply = await RoundTripAsync(request);
+        var reply = await RoundTripAsync(request).ConfigureAwait(false);
         if (reply.Kind != ZbrtKind.HealthAck)
         {
             throw UnexpectedKind(reply, ZbrtKind.HealthAck);
@@ -136,10 +136,10 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Route one filesystem RPC: Fs frame → FsResult JSON (or Error frame).</summary>
     public async Task<JsonElement> FsAsync(byte op, string path, byte[] jsonArgs)
     {
-        await ConnectAsync();
+        await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeFs(op, path, jsonArgs);
         var request = new ZbrtFrame { Kind = ZbrtKind.Fs, RequestId = NewRequestId(), Payload = payload };
-        var reply = await RoundTripAsync(request);
+        var reply = await RoundTripAsync(request).ConfigureAwait(false);
         if (reply.Kind == ZbrtKind.Error)
         {
             throw RemoteError(reply);
@@ -168,10 +168,10 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Idempotent Cancel; returns the CancelAck reply frame.</summary>
     public async Task<ZbrtFrame> CancelAsync(byte[]? target, string? reason)
     {
-        await ConnectAsync();
+        await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeCancel(reason, target);
         var request = new ZbrtFrame { Kind = ZbrtKind.Cancel, RequestId = NewRequestId(), Payload = payload };
-        var reply = await RoundTripAsync(request);
+        var reply = await RoundTripAsync(request).ConfigureAwait(false);
         if (reply.Kind == ZbrtKind.Error)
         {
             throw RemoteError(reply);
@@ -188,17 +188,17 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Start a stream session for one Execute request.</summary>
     public async Task<ZbrtStreamSession> StreamAsync(IReadOnlyList<string> argv, string? cwd)
     {
-        await ConnectAsync();
+        await ConnectAsync().ConfigureAwait(false);
         var payload = ZbrtFrameCodec.EncodeExecute(argv, cwd, [], timeoutMs: 0);
         var request = new ZbrtFrame { Kind = ZbrtKind.Execute, RequestId = NewRequestId(), Payload = payload };
-        await WriteFrameAsync(request);
+        await WriteFrameAsync(request).ConfigureAwait(false);
         return new ZbrtStreamSession(this, request.RequestId);
     }
 
     private async Task<ZbrtFrame> RoundTripAsync(ZbrtFrame request)
     {
-        await WriteFrameAsync(request);
-        var reply = await ReadFrameAsync();
+        await WriteFrameAsync(request).ConfigureAwait(false);
+        var reply = await ReadFrameAsync().ConfigureAwait(false);
         RequireRequestId(reply, request.RequestId);
         return reply;
     }
@@ -210,7 +210,7 @@ internal sealed class ZbrtTcpClient : IDisposable
         try
         {
             // one write per frame (NetworkStream is unbuffered; Flush is a no-op)
-            await _stream!.WriteAsync(bytes, cts.Token);
+            await _stream!.WriteAsync(bytes, 0, bytes.Length, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -225,7 +225,7 @@ internal sealed class ZbrtTcpClient : IDisposable
     internal async Task<ZbrtFrame> ReadFrameAsync()
     {
         using var cts = new CancellationTokenSource(_timeout);
-        await ReadExactlyAsync(_header, cts.Token);
+        await ReadExactlyAsync(_header, cts.Token).ConfigureAwait(false);
         var payloadLen = BinaryPrimitives.ReadUInt32BigEndian(_header.AsSpan(24, 4));
         if (payloadLen > ZbrtFrameCodec.MaxPayload)
         {
@@ -236,7 +236,7 @@ internal sealed class ZbrtTcpClient : IDisposable
         // payload straight after it (no intermediate payload array, no join copy).
         var full = new byte[ZbrtFrameCodec.HeaderLen + payloadLen];
         _header.CopyTo(full, 0);
-        await ReadExactlyAsync(full.AsMemory(ZbrtFrameCodec.HeaderLen), cts.Token);
+        await ReadExactlyAsync(full.AsMemory(ZbrtFrameCodec.HeaderLen), cts.Token).ConfigureAwait(false);
         return ZbrtFrameCodec.Decode(full);
     }
 
@@ -248,7 +248,7 @@ internal sealed class ZbrtTcpClient : IDisposable
             int n;
             try
             {
-                n = await _stream!.ReadAsync(buffer.Slice(offset), token);
+                n = await _stream!.ReadAsync(buffer.Slice(offset), token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -287,7 +287,16 @@ internal sealed class ZbrtTcpClient : IDisposable
 
     /// <summary>Fresh 128-bit request id per request.</summary>
     internal static byte[] NewRequestId() =>
-        System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+        RandomBytes(16);
+
+    private static byte[] RandomBytes(int count)
+    {
+        // Instance API exists on every TFM (the static GetBytes(int) is net6+).
+        using var rng = System.Security.Cryptography.RandomNumberGenerator.Create();
+        var buffer = new byte[count];
+        rng.GetBytes(buffer);
+        return buffer;
+    }
 
     public void Dispose()
     {
@@ -323,7 +332,7 @@ internal sealed class ZbrtStreamSession
             ZbrtFrame frame;
             try
             {
-                frame = await _client.ReadFrameAsync();
+                frame = await _client.ReadFrameAsync().ConfigureAwait(false);
             }
             catch (TransportException e) when (e.Message == "guest closed connection")
             {
@@ -396,13 +405,13 @@ internal sealed class ZbrtStreamSession
         _stopped = true;
         var payload = ZbrtFrameCodec.EncodeCancel("stop", _requestId);
         var cancel = new ZbrtFrame { Kind = ZbrtKind.Cancel, RequestId = _requestId, Payload = payload };
-        await _client.WriteFrameAsync(cancel);
+        await _client.WriteFrameAsync(cancel).ConfigureAwait(false);
         while (true)
         {
             ZbrtFrame frame;
             try
             {
-                frame = await _client.ReadFrameAsync();
+                frame = await _client.ReadFrameAsync().ConfigureAwait(false);
             }
             catch (TransportException e) when (e.Message == "guest closed connection")
             {

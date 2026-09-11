@@ -8,7 +8,7 @@ namespace Rfb.Sdk;
 /// The Rust implementation <c>rfb::client::RfbClient</c> is the reference; this
 /// class mirrors it method by method.
 /// </summary>
-public sealed class RfbClient
+public sealed class RfbClient : IDisposable
 {
     private readonly ForkdControllerHttp _controller;
     private readonly TimeSpan _timeout;
@@ -40,16 +40,17 @@ public sealed class RfbClient
         _controller = new ForkdControllerHttp(url, tok, _timeout);
     }
 
+    /// <summary>All snapshots as reported by the controller.</summary>
     public async Task<IReadOnlyList<Snapshot>> ListSnapshots()
     {
-        var arr = await _controller.ListSnapshotsAsync();
+        var arr = await _controller.ListSnapshotsAsync().ConfigureAwait(false);
         return ParseList<Snapshot>(arr);
     }
 
     /// <summary>Snapshot detail via /info → legacy fallback; both 404 → null.</summary>
     public async Task<Snapshot?> Snapshot(string tag)
     {
-        var v = await _controller.SnapshotInfoAsync(tag);
+        var v = await _controller.SnapshotInfoAsync(tag).ConfigureAwait(false);
         return v is null ? null : ParseOne<Snapshot>(v.Value);
     }
 
@@ -59,7 +60,7 @@ public sealed class RfbClient
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(timeoutS);
         while (true)
         {
-            var snapshots = await ListSnapshots();
+            var snapshots = await ListSnapshots().ConfigureAwait(false);
             Snapshot? match = null;
             foreach (var s in snapshots)
             {
@@ -88,10 +89,11 @@ public sealed class RfbClient
                 throw new TransportException($"forkd snapshot `{tag}` did not become Ready before timeout");
             }
 
-            await Task.Delay(100);
+            await Task.Delay(100).ConfigureAwait(false);
         }
     }
 
+    /// <summary>Create `n` sandboxes from a bootable snapshot tag.</summary>
     public async Task<IReadOnlyList<Sandbox>> CreateSandbox(
         string snapshotTag,
         int n = 1,
@@ -112,13 +114,14 @@ public sealed class RfbClient
             ["live_fork"] = liveFork,
             ["hugepages"] = hugepages,
         };
-        var arr = await _controller.CreateSandboxesAsync(body);
+        var arr = await _controller.CreateSandboxesAsync(body).ConfigureAwait(false);
         return ToSandboxes(ParseList<SandboxInfo>(arr), transport);
     }
 
+    /// <summary>Live sandboxes; `transport` selects the guest transport of the returned handles.</summary>
     public async Task<IReadOnlyList<Sandbox>> ListSandboxes(string transport = "ndjson")
     {
-        var arr = await _controller.ListSandboxesAsync();
+        var arr = await _controller.ListSandboxesAsync().ConfigureAwait(false);
         return ToSandboxes(ParseList<SandboxInfo>(arr), transport);
     }
 
@@ -145,7 +148,7 @@ public sealed class RfbClient
             case string id:
                 {
                     GuestValidation.Id(id);
-                    var list = await ListSandboxes(transport);
+                    var list = await ListSandboxes(transport).ConfigureAwait(false);
                     foreach (var sandbox in list)
                     {
                         if (sandbox.Id == id)
@@ -163,11 +166,11 @@ public sealed class RfbClient
 
     /// <summary>Raw controller ping reply, returned as-is.</summary>
     public async Task<JsonElement> PingSandbox(string id) =>
-        await _controller.PingAsync(id);
+        await _controller.PingAsync(id).ConfigureAwait(false);
 
     /// <summary>Delete a sandbox; 2xx and 404 are both success.</summary>
     public async Task DeleteSandbox(string id) =>
-        await _controller.DeleteSandboxAsync(id);
+        await _controller.DeleteSandboxAsync(id).ConfigureAwait(false);
 
     internal TimeSpan Timeout => _timeout;
 
@@ -200,4 +203,7 @@ public sealed class RfbClient
             throw new DecodeException($"invalid forkd response: {e.Message}");
         }
     }
+
+    /// <summary>Dispose the underlying controller HTTP client.</summary>
+    public void Dispose() => _controller.Dispose();
 }

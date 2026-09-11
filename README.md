@@ -81,7 +81,7 @@ This repository keeps `resx/firecracker/firecracker-v1.16.1-x86_64.tgz` as the o
 
 ## CI/CD
 
-- **CI** — every PR and non-main push: Rust checks (fmt, clippy, tests, docs with `--all-features`, boundary checks) plus full SDK builds and tests (Python / C# / Java) in a clean Debian 12 container.
+- **CI** — every PR and non-main push: Rust checks (fmt, clippy, tests, docs with `--all-features`, boundary checks) plus full SDK builds and tests (Python / C# / Java / Node.js) in a clean Debian 12 container.
 - **Real-VM E2E** — pushes to `main`: boots the real Firecracker/forkd stack on a KVM runner, creates a snapshot from the forkd-agent rootfs, and runs the full `#[ignore]`-gated real-VM test suite.
 - **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-rig` to crates.io, `rfb-sdk` to PyPI, `io.github.cricle:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, and `rfb-sdk` (TypeScript) plus the `rfb-cli` binary to npm, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
 

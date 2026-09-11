@@ -23,7 +23,7 @@ internal sealed class ForkdGuestNdjson
     }
 
     public async Task<JsonElement> PingAsync() =>
-        await LastResponseAsync(new Dictionary<string, object?> { ["action"] = "ping" });
+        await LastResponseAsync(new Dictionary<string, object?> { ["action"] = "ping" }).ConfigureAwait(false);
 
     public async Task<JsonElement> ExecAsync(string cwd, IReadOnlyList<string> args, ulong timeoutSecs) =>
         await LastResponseAsync(new Dictionary<string, object?>
@@ -51,13 +51,13 @@ internal sealed class ForkdGuestNdjson
             action["timeout"] = TimeoutSecs(timeoutS.Value);
         }
 
-        return await LastResponseAsync(action);
+        return await LastResponseAsync(action).ConfigureAwait(false);
     }
 
     public async Task<JsonElement> ToolAsync(string tool, Dictionary<string, object?> args)
     {
         args["action"] = tool;
-        return await LastResponseAsync(args);
+        return await LastResponseAsync(args).ConfigureAwait(false);
     }
 
     public async Task<ForkdGuestNdjsonStream> StreamAsync(
@@ -66,7 +66,7 @@ internal sealed class ForkdGuestNdjson
         var tcp = new TcpClient();
         try
         {
-            await ConnectAsync(tcp);
+            await ConnectAsync(tcp).ConfigureAwait(false);
             var stream = tcp.GetStream();
             var action = new Dictionary<string, object?>
             {
@@ -88,7 +88,7 @@ internal sealed class ForkdGuestNdjson
                 action["env"] = env;
             }
 
-            await WriteLineAsync(stream, JsonSerializer.Serialize(action));
+            await WriteLineAsync(stream, JsonSerializer.Serialize(action)).ConfigureAwait(false);
             return new ForkdGuestNdjsonStream(tcp, stream, _timeout);
         }
         catch
@@ -103,7 +103,7 @@ internal sealed class ForkdGuestNdjson
 
     private async Task<JsonElement> LastResponseAsync(Dictionary<string, object?> action)
     {
-        var responses = await RequestAsync(action);
+        var responses = await RequestAsync(action).ConfigureAwait(false);
         return responses[^1];
     }
 
@@ -111,16 +111,16 @@ internal sealed class ForkdGuestNdjson
     private async Task<List<JsonElement>> RequestAsync(Dictionary<string, object?> action)
     {
         using var tcp = new TcpClient();
-        await ConnectAsync(tcp);
-        await using var stream = tcp.GetStream();
-        await WriteLineAsync(stream, JsonSerializer.Serialize(action));
+        await ConnectAsync(tcp).ConfigureAwait(false);
+        using var stream = tcp.GetStream();
+        await WriteLineAsync(stream, JsonSerializer.Serialize(action)).ConfigureAwait(false);
 
         var reader = new NdjsonLineReader(stream, _timeout);
         var responses = new List<JsonElement>();
         while (true)
         {
             // Skip empty keepalive lines like the Rust/Python/Java baselines.
-            var line = await reader.ReadLineAsync(skipEmpty: true);
+            var line = await reader.ReadLineAsync(skipEmpty: true).ConfigureAwait(false);
             if (line is null)
             {
                 throw new RemoteException("guest closed before response");
@@ -152,7 +152,7 @@ internal sealed class ForkdGuestNdjson
         using var cts = new CancellationTokenSource(_timeout);
         try
         {
-            await tcp.ConnectAsync(_host, _port, cts.Token);
+            await TcpCompat.ConnectAsync(tcp, _host, _port, cts.Token).ConfigureAwait(false);
             tcp.NoDelay = true;
         }
         catch (OperationCanceledException)
@@ -161,7 +161,7 @@ internal sealed class ForkdGuestNdjson
         }
         catch (SocketException e)
         {
-            throw new TransportException($"guest connect failed: {e.Message}");
+            throw new TransportException($"guest connect failed: {e.Message}", e);
         }
     }
 
@@ -169,9 +169,9 @@ internal sealed class ForkdGuestNdjson
     {
         // Encode into ONE buffer and issue ONE write (no string concat copy).
         var bytes = new byte[Encoding.UTF8.GetByteCount(line) + 1];
-        Encoding.UTF8.GetBytes(line, bytes);
+        Encoding.UTF8.GetBytes(line).CopyTo(bytes.AsSpan());
         bytes[^1] = (byte)'\n';
-        await stream.WriteAsync(bytes);
+        await stream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
     }
 
     /// <summary>RFB durations are milliseconds; forkd's eval/exec timeout is seconds (ceil, min 1).</summary>
@@ -208,7 +208,7 @@ internal sealed class ForkdGuestNdjsonStream : IDisposable
             return null; // sequence ended with the terminal exit event
         }
 
-        var line = await _reader.ReadLineAsync(skipEmpty: true);
+        var line = await _reader.ReadLineAsync(skipEmpty: true).ConfigureAwait(false);
         if (line is null)
         {
             return null;
@@ -240,7 +240,7 @@ internal sealed class ForkdGuestNdjsonStream : IDisposable
             throw new RemoteException("guest stream is no longer running");
         }
 
-        await WriteJsonAsync(JsonSerializer.Serialize(new Dictionary<string, object?> { ["in"] = input }));
+        await WriteJsonAsync(JsonSerializer.Serialize(new Dictionary<string, object?> { ["in"] = input })).ConfigureAwait(false);
     }
 
     public async Task StopAsync()
@@ -251,7 +251,7 @@ internal sealed class ForkdGuestNdjsonStream : IDisposable
         }
 
         _stopped = true;
-        await WriteJsonAsync(JsonSerializer.Serialize(new Dictionary<string, object?> { ["action"] = "stop" }));
+        await WriteJsonAsync(JsonSerializer.Serialize(new Dictionary<string, object?> { ["action"] = "stop" })).ConfigureAwait(false);
     }
 
     private async Task WriteJsonAsync(string json)
@@ -260,9 +260,9 @@ internal sealed class ForkdGuestNdjsonStream : IDisposable
         try
         {
             var bytes = new byte[Encoding.UTF8.GetByteCount(json) + 1];
-            Encoding.UTF8.GetBytes(json, bytes);
+            Encoding.UTF8.GetBytes(json).CopyTo(bytes.AsSpan());
             bytes[^1] = (byte)'\n';
-            await _stream.WriteAsync(bytes, cts.Token);
+            await _stream.WriteAsync(bytes, 0, bytes.Length, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -270,7 +270,7 @@ internal sealed class ForkdGuestNdjsonStream : IDisposable
         }
         catch (SocketException e)
         {
-            throw new TransportException($"guest write failed: {e.Message}");
+            throw new TransportException($"guest write failed: {e.Message}", e);
         }
     }
 

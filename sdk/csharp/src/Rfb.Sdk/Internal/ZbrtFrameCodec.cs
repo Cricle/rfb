@@ -80,7 +80,7 @@ internal ref struct PayloadWriter
         var n = Encoding.UTF8.GetByteCount(s);
         Ensure(4 + n);
         U32((uint)n);
-        Encoding.UTF8.GetBytes(s, _buf.AsSpan(_len));
+        Encoding.UTF8.GetBytes(s).CopyTo(_buf.AsSpan(_len));
         _len += n;
     }
 

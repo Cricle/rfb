@@ -16,7 +16,7 @@ internal readonly record struct RawResponse(int Status, string Body)
 /// HTTP/JSON adapter for the forkd controller (PROTOCOL.md §1; mirror of
 /// rfb/src/forkd/controller.rs). Internal only — never part of the public API.
 /// </summary>
-internal sealed class ForkdControllerHttp
+internal sealed class ForkdControllerHttp : IDisposable
 {
     public const string DefaultBaseUrl = "http://127.0.0.1:8889";
 
@@ -40,19 +40,22 @@ internal sealed class ForkdControllerHttp
         _http.Timeout = timeout;
     }
 
+    /// <summary>Dispose the owned HTTP client (and its default handler).</summary>
+    public void Dispose() => _http.Dispose();
+
     public async Task<JsonElement> ListSnapshotsAsync() =>
-        await SendForJsonAsync(HttpMethod.Get, "/v1/snapshots", null);
+        await SendForJsonAsync(HttpMethod.Get, "/v1/snapshots", null).ConfigureAwait(false);
 
     /// <summary>/info → legacy endpoint fallback; both 404 → null.</summary>
     public async Task<JsonElement?> SnapshotInfoAsync(string tag)
     {
-        var preferred = await RawAsync(HttpMethod.Get, $"/v1/snapshots/{Escape(tag)}/info");
+        var preferred = await RawAsync(HttpMethod.Get, $"/v1/snapshots/{Escape(tag)}/info").ConfigureAwait(false);
         if (preferred.Status != 404)
         {
             return (await ParseAsync(preferred)).RootElement.Clone();
         }
 
-        var legacy = await RawAsync(HttpMethod.Get, $"/v1/snapshots/{Escape(tag)}");
+        var legacy = await RawAsync(HttpMethod.Get, $"/v1/snapshots/{Escape(tag)}").ConfigureAwait(false);
         if (legacy.Status == 404)
         {
             return null;
@@ -62,22 +65,22 @@ internal sealed class ForkdControllerHttp
     }
 
     public async Task<JsonElement> CreateSandboxesAsync(object body) =>
-        await SendForJsonAsync(HttpMethod.Post, "/v1/sandboxes", body);
+        await SendForJsonAsync(HttpMethod.Post, "/v1/sandboxes", body).ConfigureAwait(false);
 
     public async Task<JsonElement> ListSandboxesAsync() =>
-        await SendForJsonAsync(HttpMethod.Get, "/v1/sandboxes", null);
+        await SendForJsonAsync(HttpMethod.Get, "/v1/sandboxes", null).ConfigureAwait(false);
 
     public async Task<JsonElement> PingAsync(string sandboxId)
     {
         GuestValidation.Id(sandboxId);
-        return await SendForJsonAsync(HttpMethod.Post, $"/v1/sandboxes/{Escape(sandboxId)}/ping", null);
+        return await SendForJsonAsync(HttpMethod.Post, $"/v1/sandboxes/{Escape(sandboxId)}/ping", null).ConfigureAwait(false);
     }
 
     /// <summary>2xx and 404 are both success.</summary>
     public async Task DeleteSandboxAsync(string sandboxId)
     {
         GuestValidation.Id(sandboxId);
-        var raw = await RawAsync(HttpMethod.Delete, $"/v1/sandboxes/{Escape(sandboxId)}");
+        var raw = await RawAsync(HttpMethod.Delete, $"/v1/sandboxes/{Escape(sandboxId)}").ConfigureAwait(false);
         if (raw.Status == 404 || raw.IsSuccess)
         {
             return;
@@ -90,7 +93,7 @@ internal sealed class ForkdControllerHttp
 
     private async Task<JsonElement> SendForJsonAsync(HttpMethod method, string path, object? body)
     {
-        var raw = await RawAsync(method, path, body);
+        var raw = await RawAsync(method, path, body).ConfigureAwait(false);
         return (await ParseAsync(raw)).RootElement.Clone();
     }
 
@@ -110,7 +113,7 @@ internal sealed class ForkdControllerHttp
         HttpResponseMessage response;
         try
         {
-            response = await _http.SendAsync(request);
+            response = await _http.SendAsync(request).ConfigureAwait(false);
         }
         catch (TaskCanceledException)
         {
@@ -118,12 +121,12 @@ internal sealed class ForkdControllerHttp
         }
         catch (HttpRequestException e)
         {
-            throw new TransportException($"forkd request failed: {e.Message}");
+            throw new TransportException($"forkd request failed: {e.Message}", e);
         }
 
         using (response)
         {
-            var text = await response.Content.ReadAsStringAsync();
+            var text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             return new RawResponse((int)response.StatusCode, text);
         }
     }

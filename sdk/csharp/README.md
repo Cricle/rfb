@@ -1,6 +1,6 @@
 # RFB SDK（C#）
 
-RFB 统一 SDK 的 C# 实现（.NET 8，`net8.0`，仅依赖 BCL：`System.Net.Sockets` / `System.Text.Json` 等，零第三方 NuGet 包），异步风格 API（`async`/`await` + `Task`，PascalCase 命名）。
+RFB 统一 SDK 的 C# 实现（多目标 `netstandard2.1` + `net8.0`；ns2.1 侧唯一包依赖是 `System.Text.Json`（net8 为内置），PolySharp 仅编译期源生成器、不随包分发——无任何第三方运行时依赖），异步风格 API（`async`/`await` + `Task`，PascalCase 命名）。
 
 ## 覆盖范围
 
@@ -82,7 +82,7 @@ dotnet test Rfb.Sdk.slnx
 
 ## 已知限制
 
-- **NDJSON 传输下 `Exec` 不支持 stdin**：forkd guest 协议不携带 stdin，传入非空 `stdin` 抛 `ValidationException`（ZBRT 传输的 Execute 帧内可携带 stdin）。
+- **NDJSON 传输下 `Exec` 不支持 stdin**：forkd guest 协议不携带 stdin 通道，传入非空 `stdin` 会被静默丢弃（ZBRT 传输的 Execute 帧内可携带 stdin）。
 - **ZBRT 传输下的 `SendInput`**：ZBRT v1 只在 Execute 帧内携带 stdin，没有向已提交请求追加 stdin 的 wire 消息，因此 `GuestStream.SendInput` 在 ZBRT 传输下抛 `RemoteException`（`pty` / `env` 参数同样仅 NDJSON 支持；ZBRT 下传非空 `env` 或 `pty: true` 均抛 `ValidationException`，fail closed）。
 - **ZBRT 传输下的 `Eval`**：ZBRT v1 没有独立 eval 原语，SDK 将 `eval(code)` 内部映射为 Execute 帧（`argv=["eval", code]`，见 `../shared/README.md` 四语言契约与 `../shared/conformance/eval_zbrt_vectors.json` 黄金向量）；这是 SDK 内部决策，wire 格式本身严格遵循 PROTOCOL.md。
 - **`Find` / `Grep` 的参数顺序**：与 Rust/Python 基线统一为 path 在前（`sandbox.Find(path: ".", pattern: "*.cs")`），`path` 默认 `"."`；另提供单参数便捷重载 `Find("*.cs")` / `Grep("rfb")`（等价于 `path="."`）。

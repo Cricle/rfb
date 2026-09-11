@@ -23,6 +23,7 @@ if [[ -n "$tag" && "$tag" != "v$version" ]]; then
 fi
 
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features --no-fail-fast
 RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
 

@@ -15,7 +15,7 @@
 #   包版本由 tag 推导（v0.0.1 -> 0.0.1）。
 # - npm:        sdk/nodejs 打包为 rfb-sdk（TypeScript，构建+测试后发布）；
 #   rfb-cli 为仅二进制包（linux-x64，bin 入口直接指向二进制）。凭据
-#   NPM_KEY（npm automation token，setup-node 注入 NODE_AUTH_TOKEN）。
+#   NPM_KEY（npm granular access token：Read and write + All packages + bypass 2FA）。
 #
 # tag 与 workspace 版本的一致性（v0.0.1 <-> Cargo.toml version 0.0.1）在
 # crates 渠道强制校验；PyPI/Maven 版本各自固定为 0.0.1，与 tag 同步维护。
@@ -27,12 +27,16 @@ on:
     tags: ['v*.*.*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   crates:
     name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only the crates job creates the GitHub Release.
+    permissions:
+      contents: write
     steps:
       # fetch-depth 0：release.sh 用 git describe --tags --exact-match 校验
       # tag 与 workspace 版本一致，浅克隆拿不到 tag 会导致发布误判失败。
@@ -102,6 +106,7 @@ jobs:
     name: Publish rfb-sdk + rfb-cli to PyPI
     needs: crates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -205,6 +210,7 @@ jobs:
   maven:
     name: Publish rfb-sdk to Maven Central
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
@@ -213,6 +219,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: maven
       - name: Configure settings.xml from MAVEN_KEY
         env:
           MAVEN_KEY: ${{ secrets.MAVEN_KEY }}
@@ -314,6 +321,7 @@ jobs:
     name: Publish Rfb.Sdk + Rfb.Cli to NuGet
     needs: crates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -386,12 +394,15 @@ jobs:
     name: Publish rfb-sdk + rfb-cli to npm
     needs: crates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+          cache: npm
+          cache-dependency-path: sdk/nodejs/package-lock.json
       # 重跑保护：该版本已在 npm 上时跳过发布（npm 对重复版本直接报错）。
       - name: Check already-published packages
         id: npm_guard
@@ -415,7 +426,7 @@ jobs:
           set +e
           {
             cd sdk/nodejs
-            npm install --no-audit --no-fund
+            npm ci --no-audit --no-fund
             npm test
             npm publish
           } 2>&1 | tee "$log"

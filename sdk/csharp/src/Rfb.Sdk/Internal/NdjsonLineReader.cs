@@ -80,7 +80,8 @@ internal sealed class NdjsonLineReader
                 _start = 0;
                 _end = 0;
 
-                var n = await _stream.ReadAsync(_chunk, cts.Token);
+                var n = await _stream.ReadAsync(_chunk, 0, _chunk.Length, cts.Token)
+                    .ConfigureAwait(false);
                 if (n == 0)
                 {
                     if (_line.Length > 0)

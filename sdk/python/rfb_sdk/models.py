@@ -1,6 +1,6 @@
 """Public result/DTO types (UNIFIED_API.md sections 1 and 6)."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 

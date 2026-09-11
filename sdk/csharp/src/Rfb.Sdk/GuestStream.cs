@@ -21,11 +21,11 @@ public sealed class GuestStream
     {
         if (_ndjson is not null)
         {
-            var value = await _ndjson.NextEventAsync();
+            var value = await _ndjson.NextEventAsync().ConfigureAwait(false);
             return value is null ? null : GuestResults.MapStreamEvent(value.Value);
         }
 
-        return await _zbrt!.NextEventAsync();
+        return await _zbrt!.NextEventAsync().ConfigureAwait(false);
     }
 
     /// <summary>Send stdin text; calling after the terminal event raises RemoteException.</summary>
@@ -33,11 +33,11 @@ public sealed class GuestStream
     {
         if (_ndjson is not null)
         {
-            await _ndjson.SendInputAsync(text);
+            await _ndjson.SendInputAsync(text).ConfigureAwait(false);
         }
         else
         {
-            await _zbrt!.SendInputAsync(text);
+            await _zbrt!.SendInputAsync(text).ConfigureAwait(false);
         }
     }
 
@@ -46,11 +46,11 @@ public sealed class GuestStream
     {
         if (_ndjson is not null)
         {
-            await _ndjson.StopAsync();
+            await _ndjson.StopAsync().ConfigureAwait(false);
         }
         else
         {
-            await _zbrt!.StopAsync();
+            await _zbrt!.StopAsync().ConfigureAwait(false);
         }
     }
 }

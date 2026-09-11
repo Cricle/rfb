@@ -1,7 +1,7 @@
 # RFB 发布与 CI 手册（RELEASE.md）
 
 > 面向维护者的发布流水线与 CI 完整说明。agent 可读的闭环 runbook 见
-> `rfb/skills/rfb-release/SKILL.md`；本文记录"为什么是这样"与踩坑速查。
+> `rfb/skills/cli-usage/SKILL.md` 与各 skill 目录；本文记录"为什么是这样"与踩坑速查。
 
 ## 1. 流水线总览
 
@@ -73,7 +73,7 @@ Central 校验签名时使用。私钥备份见仓库外的运维文档。
 |---|---|---|
 | Rust crate | Rust 1.90+（edition 2021，`rust-version` 已在各 Cargo.toml 声明） | CI 用 stable 构建；MSRV 由 Cargo.lock 依赖下限决定 |
 | Java SDK（io.github.cricle:rfb-sdk） | **Java 8+**（8/11/16/17/21…） | 内部值类型为 Java 8 兼容手写类（原 record 已降级）；HTTP 层用 HttpURLConnection（无 java.net.http 依赖） |
-| C# SDK（Rfb.Sdk） | netstandard2.0 / 2.1 / net8.0 | System.Text.Json 经条件包引用；`init`/record 经 IsExternalInit polyfill；.NET 5+ API 均在 `#if NET5_0_OR_GREATER` 内 |
+| C# SDK（Rfb.Sdk） | netstandard2.1 / net8.0 | System.Text.Json 经条件包引用（net8 内置）；PolySharp（编译期，PrivateAssets）提供 Range/Index 等语法糖；ns2.0 因缺 Span/BinaryPrimitives 且拒绝引入 System.Memory 依赖链而不再目标 |
 | Python SDK（rfb-sdk） | Python 3（`requires-python = ">=3"`） | 纯 stdlib + Jackson 无关；tests 用 unittest |
 | rfb-cli 二进制 | linux-x64（glibc，ubuntu-24.04 构建） | crates.io 源码安装无此限制；musl 静态版可后续加 |
 | Python rfb-cli wheel | linux-x64（manylinux_2_39） | 仅打包预编译二进制，无 Python 包装代码 |
@@ -86,7 +86,7 @@ Central 校验签名时使用。私钥备份见仓库外的运维文档。
 | dotnet 首次启动 FailFast / rc=134 | debian:12 容器缺 libicu | apt 装 `libicu72`（bookworm）/ `libicu76`（trixie），脚本按版本回退 |
 | 快照就绪等待 300s 超时但快照早已 ready | `python3 -c` 内嵌代码继承 YAML 块缩进 → IndentationError，每次轮询静默失败 | 判定脚本用 heredoc 顶格落盘（内容行与块同缩进，YAML 剥离后顶格） |
 | E2E step 11 秒死 exit 1，`$TAG: unbound variable` | GITHUB_ENV 写入的变量不传播（实测） | TAG 按 `ci-e2e-$GITHUB_RUN_ID` 在使用处重算 |
-| 测试断言 `IsExternalInit` 缺失（netstandard2.0） | `init` 访问器 / record struct 需要该编译器注入类型 | `#if !NET8_0_OR_GREATER` 内置 polyfill |
+| 测试断言 `IsExternalInit` 缺失 | `init` 访问器 / record struct 需要该编译器注入类型 | 仓库内置 `Internal/IsExternalInit.cs` polyfill（ns2.1 目标） |
 | NS2.0 报 WriteAsync/ConnectAsync/GetBytes/`^` 重载缺失 | Memory/ValueTask/CT 重载是 .NET 5+；`^` 需 System.Index | `#if NET5_0_OR_GREATER` 条件编译 + 经典重载回退 |
 | CI 的 E2E 全绿但 agent_contract 17 个测试失败 | runner 的 `/tmp` 是 ext4：删除重建可复用同 inode，身份 pinning 漏检 | EndpointIdentity 增加 birth time |
 | Java 8 目标编译失败：records / java.net.http / writeBytes / URLEncoder(Charset) | SDK 源码用了 JDK16+/11+/10+ 特性 | record→手写值类；HttpClient→HttpURLConnection；writeBytes→write(b,0,len)；encode(Str,Charset)→encode(Str,"UTF-8") |

@@ -102,13 +102,16 @@ class RfbClient:
     # -- snapshots ---------------------------------------------------------
 
     def list_snapshots(self) -> list:
+        """All snapshots as reported by the controller (`GET /v1/snapshots`)."""
         return [Snapshot.from_json(item) for item in self._controller.list_snapshots()]
 
     def snapshot(self, tag: str) -> Optional[Snapshot]:
+        """Snapshot detail for `tag`, or None when unknown (404)."""
         value = self._controller.snapshot(tag)
         return None if value is None else Snapshot.from_json(value)
 
     def wait_snapshot(self, tag: str, timeout_s: int = DEFAULT_WAIT_TIMEOUT_S) -> Snapshot:
+        """Block until `tag` is ready+bootable; raise on failed or timeout."""
         deadline = time.monotonic() + timeout_s
         while True:
             for item in self._controller.list_snapshots():
@@ -152,12 +155,14 @@ class RfbClient:
         ]
 
     def list_sandboxes(self) -> list:
+        """Live sandboxes as reported by the controller."""
         return [
             Sandbox(SandboxInfo.from_json(item), self)
             for item in self._controller.list_sandboxes()
         ]
 
     def connect(self, sandbox_or_id, transport: Optional[str] = None) -> "Sandbox":
+        """Attach by sandbox id, or reuse a `Sandbox` handle as-is."""
         if isinstance(sandbox_or_id, Sandbox):
             # Rust attach semantics (ConnectTarget for &Sandbox): attach the
             # facade as-is; only an explicitly passed transport overrides it.
@@ -176,9 +181,11 @@ class RfbClient:
         raise RemoteError(f"sandbox not found: {sandbox_id}")
 
     def ping_sandbox(self, sandbox_id: str) -> Any:
+        """Controller-level ping for a sandbox id."""
         return self._controller.ping_sandbox(sandbox_id)
 
     def delete_sandbox(self, sandbox_id: str) -> None:
+        """Delete a sandbox (2xx and 404 are both success)."""
         self._controller.delete_sandbox(sandbox_id)
 
 
@@ -236,6 +243,7 @@ class Sandbox:
     # -- health --------------------------------------------------------------
 
     def ping(self) -> bool:
+        """Guest health: True only when the agent answers pong=true."""
         guest = self._guest()
         if self._transport == "zbrt":
             return guest.ping()
@@ -266,6 +274,7 @@ class Sandbox:
         )
 
     def eval(self, code: str, cwd: Optional[str] = None, timeout_s: Optional[float] = None):
+        """Evaluate a code snippet in the guest; output maps to stdout."""
         validate_eval_code(code)
         if cwd is not None:
             validate_guest_cwd(cwd)
@@ -286,6 +295,7 @@ class Sandbox:
     # -- filesystem ----------------------------------------------------------
 
     def ls(self, path: str = ".") -> list:
+        """Directory entries under `path` (default ".")."""
         validate_fs_path(path)
         return _entries(
             self._fs_call(FS_OP_LS, "ls", path, {"max_results": MAX_GUEST_RESULTS})
@@ -315,6 +325,7 @@ class Sandbox:
         return _grep_matches(value)
 
     def read(self, path: str, offset: Optional[int] = None, max_bytes: Optional[int] = None) -> FileRead:
+        """Read a guest file with optional offset / max_bytes cap."""
         validate_guest_file_path(path)
         if max_bytes is not None and (max_bytes <= 0 or max_bytes > MAX_GUEST_RESULT_BYTES):
             raise ValidationError(
@@ -330,6 +341,7 @@ class Sandbox:
         )
 
     def write(self, path: str, data, append: bool = False, mode: Optional[int] = None) -> int:
+        """Write (or append) `data`; returns bytes written."""
         validate_guest_file_path(path)
         data = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         validate_payload_size(len(data), MAX_GUEST_RESULT_BYTES)
@@ -346,6 +358,7 @@ class Sandbox:
     # -- stream / lifecycle ---------------------------------------------------
 
     def stream(self, args, cwd: Optional[str] = None, pty: Optional[bool] = None, env: Optional[dict] = None) -> "GuestStream":
+        """Open an interactive stream (transport per the handle; ZBRT has no pty/stdin)."""
         validate_argv(args)
         if cwd is not None:
             validate_guest_cwd(cwd)
@@ -367,6 +380,7 @@ class Sandbox:
         return GuestStream(inner)
 
     def delete(self) -> None:
+        """Delete this sandbox via the controller."""
         self._client.delete_sandbox(self.id)
 
 

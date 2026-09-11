@@ -1,15 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- Multi-target: netstandard2.0/2.1 for broad ecosystem compatibility,
-         net8.0 for the in-box System.Text.Json / modern API surface. -->
-    <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0</TargetFrameworks>
+    <!-- Multi-target: netstandard2.1 (in-box Span/BinaryPrimitives, zero
+         extra runtime deps) plus net8.0 for the in-box System.Text.Json and
+         modern API surface. netstandard2.0 is intentionally NOT targeted:
+         its BCL lacks Span/BinaryPrimitives, and shimming those would add a
+         runtime dependency chain this package deliberately avoids. -->
+    <TargetFrameworks>netstandard2.1;net8.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <RootNamespace>Rfb.Sdk</RootNamespace>
     <AssemblyName>Rfb.Sdk</AssemblyName>
-    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- XML docs ship with the package for IntelliSense. -->
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <!-- NuGet 包元数据；CI 发布时用 tag 覆盖 Version（-p:Version=...） -->
     <PackageId>Rfb.Sdk</PackageId>
@@ -19,6 +23,9 @@
     <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/Cricle/rfb</RepositoryUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageTags>rfb;sandbox;forkd;firecracker;microvm;zbrt</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Deterministic>true</Deterministic>
   </PropertyGroup>
 
   <!-- System.Text.Json ships in-box only for net8.0; older targets get the
@@ -27,8 +34,18 @@
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
+  <!-- Compile-time-only polyfills (source generator, PrivateAssets=all: no
+       runtime dependency ships to consumers). -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0'">
+    <PackageReference Include="PolySharp" Version="1.15.0" PrivateAssets="all" />
+  </ItemGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="Rfb.Sdk.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 
 </Project>
