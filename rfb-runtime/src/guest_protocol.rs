@@ -121,22 +121,40 @@ pub struct SequencedRuntimeMessage {
     pub message: RuntimeMessage,
 }
 
+/// Decode failures for length-delimited guest frames.
+#[derive(Debug, thiserror::Error)]
+pub enum GuestProtocolError {
+    /// A frame length prefix or payload is truncated.
+    #[error("incomplete guest frame {0}")]
+    Incomplete(&'static str),
+    /// The frame codec rejected a frame.
+    #[error("guest frame decode failed: {0}")]
+    Decode(#[from] crate::codec::CodecError),
+    /// The peer sent a message type this decoder does not accept.
+    #[error("unexpected guest response message type")]
+    UnexpectedMessage,
+}
+
 /// Decode a buffer of length-delimited guest frames into sequenced messages,
 /// rejecting unexpected message types.
 pub fn decode_guest_messages_with_sequence(
     codec: &FrameCodec,
     bytes: &[u8],
-) -> anyhow::Result<Vec<SequencedRuntimeMessage>> {
+) -> Result<Vec<SequencedRuntimeMessage>, GuestProtocolError> {
     let mut cursor = 0usize;
     let mut messages = Vec::new();
     while cursor < bytes.len() {
         if bytes.len() - cursor < 4 {
-            anyhow::bail!("incomplete guest frame length")
+            return Err(GuestProtocolError::Incomplete("length"));
         }
-        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into()?) as usize;
+        let len = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| GuestProtocolError::Incomplete("length"))?,
+        ) as usize;
         cursor += 4;
         if bytes.len() - cursor < len {
-            anyhow::bail!("incomplete guest frame payload")
+            return Err(GuestProtocolError::Incomplete("payload"));
         }
         let frame = &bytes[cursor..cursor + len];
         cursor += len;
@@ -149,7 +167,7 @@ pub fn decode_guest_messages_with_sequence(
             && header.message_type != MessageType::FileContent
             && header.message_type != MessageType::WriteAck
         {
-            anyhow::bail!("unexpected guest response message type")
+            return Err(GuestProtocolError::UnexpectedMessage);
         }
         messages.push(SequencedRuntimeMessage {
             sequence: header.sequence,
@@ -163,7 +181,7 @@ pub fn decode_guest_messages_with_sequence(
 pub fn decode_guest_messages(
     codec: &FrameCodec,
     bytes: &[u8],
-) -> anyhow::Result<Vec<RuntimeMessage>> {
+) -> Result<Vec<RuntimeMessage>, GuestProtocolError> {
     Ok(decode_guest_messages_with_sequence(codec, bytes)?
         .into_iter()
         .map(|item| item.message)

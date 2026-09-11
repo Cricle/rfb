@@ -69,7 +69,7 @@ pub async fn run(addr: &str) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(async move {
-            let _ = handle_connection(stream).await;
+            let _ = Box::pin(handle_connection(stream)).await;
         });
     }
 }
@@ -140,12 +140,14 @@ async fn handle_connection(stream: TcpStream) -> io::Result<()> {
         let action = request.get("action").and_then(Value::as_str).unwrap_or("");
         let result = match action {
             "ping" => Ok(ping_response()),
-            "exec" => execute(&request).await,
+            "exec" => Box::pin(execute(&request)).await,
             "stream" => {
                 stream_process(&request, &mut reader, &mut writer).await?;
                 return Ok(());
             }
-            "ls" | "find" | "grep" | "read" | "write" | "eval" => structured(&request).await,
+            "ls" | "find" | "grep" | "read" | "write" | "eval" => {
+                Box::pin(structured(&request)).await
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unknown action: {action}"),

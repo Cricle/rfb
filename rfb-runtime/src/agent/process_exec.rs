@@ -128,14 +128,16 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
     // sequential read would deadlock against a child that fills the pipe we
     // are not reading. Captures are bounded, so a runaway writer cannot grow
     // host memory before the wire-size check runs.
-    let wait = async {
+    // Boxed: the joined future is large (three concurrent readers plus the
+    // child), and an unboxed one bloats every caller frame holding it.
+    let wait = Box::pin(async {
         let (out, err, status) = tokio::try_join!(
             read_bounded(&mut stdout, MAX_EXEC_STREAM_BYTES),
             read_bounded(&mut stderr, MAX_EXEC_STREAM_BYTES),
             child.wait(),
         )?;
         Ok::<_, io::Error>((out, err, status))
-    };
+    });
     let (out, err, truncated, status) = match timeout {
         Some(limit) => match tokio::time::timeout(limit, wait).await {
             Ok(result) => {

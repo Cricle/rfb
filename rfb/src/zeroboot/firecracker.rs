@@ -1,7 +1,20 @@
 // Snapshot/restore scaffolding is not yet reachable from the CLI; only the
 // rfb-cli `zeroboot verify` path (boot_with_runtime) is live. Keep the
 // capability for upcoming snapshot workflows without dead-code noise.
-use anyhow::{bail, Context, Result};
+
+/// Firecracker VM helper failures. Typed (not `anyhow`) because this
+/// module is public API of a published crate; `source()` chains survive.
+#[derive(Debug, thiserror::Error)]
+pub enum FirecrackerError {
+    /// Underlying I/O failure (socket, log file, process spawn).
+    #[error("firecracker io failure: {0}")]
+    Io(#[from] std::io::Error),
+    /// The Firecracker API or setup protocol failed.
+    #[error("{0}")]
+    Protocol(String),
+}
+
+type Result<T> = std::result::Result<T, FirecrackerError>;
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -24,7 +37,9 @@ impl ChildGuard {
         Self(Some(child))
     }
     fn take(&mut self) -> Result<Child> {
-        self.0.take().context("child guard already consumed")
+        self.0
+            .take()
+            .ok_or_else(|| FirecrackerError::Protocol("child guard already consumed".into()))
     }
 }
 use std::time::{Duration, Instant};
@@ -42,21 +57,23 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// substring — so a `Content-Length: 2048` header cannot be mistaken for a
 /// `204 OK` status.
 pub(crate) fn parse_response_head(headers: &str) -> Result<(u16, usize)> {
-    let status_line = headers
-        .lines()
-        .next()
-        .context("Firecracker returned an empty response")?;
+    let status_line = headers.lines().next().ok_or_else(|| {
+        FirecrackerError::Protocol("Firecracker returned an empty response".into())
+    })?;
     let mut parts = status_line.split_whitespace();
     let version = parts.next().unwrap_or_default();
-    anyhow::ensure!(
-        version.starts_with("HTTP/1."),
-        "Firecracker returned a non-HTTP/1.x status line: {status_line:?}"
-    );
+    if !version.starts_with("HTTP/1.") {
+        return Err(FirecrackerError::Protocol(format!(
+            "Firecracker returned a non-HTTP/1.x status line: {status_line:?}"
+        )));
+    }
     let status: u16 = parts
         .next()
         .and_then(|code| code.parse().ok())
-        .with_context(|| {
-            format!("Firecracker returned an unparsable status line: {status_line:?}")
+        .ok_or_else(|| {
+            FirecrackerError::Protocol(format!(
+                "Firecracker returned an unparsable status line: {status_line:?}"
+            ))
         })?;
     let content_length = headers
         .lines()
@@ -86,31 +103,37 @@ pub(crate) fn read_response(stream: &mut UnixStream) -> Result<(u16, String)> {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4;
         }
-        let n = stream
-            .read(&mut chunk)
-            .context("read Firecracker API response")?;
+        let n = stream.read(&mut chunk).map_err(|e| {
+            FirecrackerError::Protocol(format!("read Firecracker API response: {e}"))
+        })?;
         if n == 0 {
-            bail!("Firecracker closed the connection before completing the response");
+            return Err(FirecrackerError::Protocol(
+                "Firecracker closed the connection before completing the response".into(),
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
-        anyhow::ensure!(
-            buf.len() <= MAX_RESPONSE_BYTES,
-            "Firecracker response exceeded {MAX_RESPONSE_BYTES} bytes before header end"
-        );
+        if buf.len() > MAX_RESPONSE_BYTES {
+            return Err(FirecrackerError::Protocol(format!(
+                "Firecracker response exceeded {MAX_RESPONSE_BYTES} bytes before header end"
+            )));
+        }
     };
 
     let header_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
     let (status, content_length) = parse_response_head(&header_text)?;
-    anyhow::ensure!(
-        header_end.saturating_add(content_length) <= MAX_RESPONSE_BYTES,
-        "Firecracker response body exceeds {MAX_RESPONSE_BYTES} bytes"
-    );
+    if header_end.saturating_add(content_length) > MAX_RESPONSE_BYTES {
+        return Err(FirecrackerError::Protocol(format!(
+            "Firecracker response body exceeds {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
     while buf.len() < header_end + content_length {
-        let n = stream
-            .read(&mut chunk)
-            .context("read Firecracker API response body")?;
+        let n = stream.read(&mut chunk).map_err(|e| {
+            FirecrackerError::Protocol(format!("read Firecracker API response body: {e}"))
+        })?;
         if n == 0 {
-            bail!("Firecracker closed the connection before sending the full response body");
+            return Err(FirecrackerError::Protocol(
+                "Firecracker closed the connection before sending the full response body".into(),
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -186,22 +209,25 @@ impl FirecrackerVm {
         // Start Firecracker
         eprintln!("Starting Firecracker...");
         let log_path = format!("{work_dir}/firecracker.log");
-        let log = std::fs::File::create(&log_path)
-            .with_context(|| format!("create Firecracker log at {log_path}"))?;
+        let log = std::fs::File::create(&log_path).map_err(|e| {
+            FirecrackerError::Protocol(format!("create Firecracker log at {log_path}: {e}"))
+        })?;
         let process = Command::new(firecracker_path)
             .args(["--api-sock", &socket_path])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
-            .context("Failed to start Firecracker")?;
+            .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;
         let mut process = ChildGuard::new(process);
 
         // Wait for socket
         let start = Instant::now();
         while !Path::new(&socket_path).exists() {
             if start.elapsed() > Duration::from_secs(5) {
-                bail!("Firecracker socket didn't appear");
+                return Err(FirecrackerError::Protocol(
+                    "Firecracker socket didn't appear".into(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -274,14 +300,19 @@ impl FirecrackerVm {
     }
 
     fn api_request<T: Serialize>(&self, method: &str, path: &str, body: &T) -> Result<String> {
-        let body_json = serde_json::to_string(body)?;
+        let body_json = serde_json::to_string(body)
+            .map_err(|e| FirecrackerError::Protocol(format!("encode request body: {e}")))?;
         let request = format!(
             "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             method, path, body_json.len(), body_json
         );
 
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("Connect to Firecracker socket at {}", self.socket_path))?;
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
+            FirecrackerError::Protocol(format!(
+                "Connect to Firecracker socket at {}: {e}",
+                self.socket_path
+            ))
+        })?;
         stream.set_read_timeout(Some(FC_SOCKET_TIMEOUT))?;
         stream.set_write_timeout(Some(FC_SOCKET_TIMEOUT))?;
 
@@ -290,13 +321,10 @@ impl FirecrackerVm {
 
         let (status, resp) = read_response(&mut stream)?;
         if !(200..300).contains(&status) {
-            bail!(
+            return Err(FirecrackerError::Protocol(format!(
                 "Firecracker API error on {} {}: HTTP {} {}",
-                method,
-                path,
-                status,
-                resp
-            );
+                method, path, status, resp
+            )));
         }
 
         Ok(resp)

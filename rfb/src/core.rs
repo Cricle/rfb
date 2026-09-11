@@ -611,7 +611,14 @@ impl fmt::Display for ContractError {
     }
 }
 
-impl Error for ContractError {}
+impl Error for ContractError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidManifest(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
 
 /// Error from a sandbox provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,7 +641,14 @@ impl fmt::Display for ProviderError {
     }
 }
 
-impl Error for ProviderError {}
+impl Error for ProviderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSpec(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
 
 /// Error from an individual sandbox operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,4 +680,11 @@ impl fmt::Display for SandboxError {
     }
 }
 
-impl Error for SandboxError {}
+impl Error for SandboxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidSpec(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}

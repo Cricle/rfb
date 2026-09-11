@@ -17,13 +17,11 @@ pub(super) fn value_bytes(value: Option<&Value>) -> Result<Vec<u8>, RfbError> {
             .map(|item| {
                 item.as_u64()
                     .and_then(|n| u8::try_from(n).ok())
-                    .ok_or_else(|| {
-                        RfbError::Decode("output must be a UTF-8 string or byte array".to_owned())
-                    })
+                    .ok_or_else(|| RfbError::decode("output must be a UTF-8 string or byte array"))
             })
             .collect(),
-        Some(_) => Err(RfbError::Decode(
-            "output must be a UTF-8 string or byte array".to_owned(),
+        Some(_) => Err(RfbError::decode(
+            "output must be a UTF-8 string or byte array",
         )),
     }
 }

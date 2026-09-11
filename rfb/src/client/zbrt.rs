@@ -32,7 +32,7 @@ fn io_error(message: &'static str) -> RfbError {
 }
 
 fn decode_error(message: impl Into<String>) -> RfbError {
-    RfbError::Decode(message.into())
+    RfbError::decode(message)
 }
 
 /// Map a ZBRT `Error` frame payload to a [`RfbError::Remote`].

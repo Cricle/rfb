@@ -123,7 +123,7 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
             if let Some(cwd) = request.get("cwd") {
                 r["cwd"] = cwd.clone();
             }
-            let result = execute(&r).await?;
+            let result = Box::pin(execute(&r)).await?;
             // Eval has its own typed wire contract. Keep `exec`'s historical
             // out/err/exit_code fields intact, but expose output/status here.
             let output = result["out"]

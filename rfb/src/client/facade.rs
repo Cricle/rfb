@@ -119,7 +119,7 @@ impl RfbClient {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| RfbError::Decode("controller returned no sandbox".to_owned()))
+            .ok_or_else(|| RfbError::decode("controller returned no sandbox"))
     }
 
     /// `GET /v1/sandboxes` — the live sandbox pool.
@@ -485,10 +485,10 @@ impl GuestOps {
                     path: path.to_owned(),
                     max_results: MAX_GUEST_RESULTS,
                 })
-                .map_err(|e| RfbError::Decode(e.to_string()))?;
+                .map_err(|e| RfbError::decode_with(e.to_string(), e))?;
                 let value = client.execute_tool("ls", args).await?;
                 Ok(serde_json::from_value::<LsResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .entries)
             }
             #[cfg(feature = "zeroboot")]
@@ -497,7 +497,7 @@ impl GuestOps {
                     .fs(1, path, json!({"max_results": MAX_GUEST_RESULTS}))
                     .await?;
                 Ok(serde_json::from_value::<LsResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .entries)
             }
         }
@@ -511,10 +511,10 @@ impl GuestOps {
                     pattern: pattern.to_owned(),
                     max_results: MAX_GUEST_RESULTS,
                 })
-                .map_err(|e| RfbError::Decode(e.to_string()))?;
+                .map_err(|e| RfbError::decode_with(e.to_string(), e))?;
                 let value = client.execute_tool("find", args).await?;
                 Ok(serde_json::from_value::<FindResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .matches)
             }
             #[cfg(feature = "zeroboot")]
@@ -527,7 +527,7 @@ impl GuestOps {
                     )
                     .await?;
                 Ok(serde_json::from_value::<FindResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .matches)
             }
         }
@@ -542,10 +542,10 @@ impl GuestOps {
                     max_results: MAX_GUEST_RESULTS,
                     max_bytes: MAX_GUEST_RESULT_BYTES,
                 })
-                .map_err(|e| RfbError::Decode(e.to_string()))?;
+                .map_err(|e| RfbError::decode_with(e.to_string(), e))?;
                 let value = client.execute_tool("grep", args).await?;
                 Ok(serde_json::from_value::<GrepResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .matches)
             }
             #[cfg(feature = "zeroboot")]
@@ -562,7 +562,7 @@ impl GuestOps {
                     )
                     .await?;
                 Ok(serde_json::from_value::<GrepResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .matches)
             }
         }
@@ -581,10 +581,10 @@ impl GuestOps {
                     offset,
                     max_bytes,
                 })
-                .map_err(|e| RfbError::Decode(e.to_string()))?;
+                .map_err(|e| RfbError::decode_with(e.to_string(), e))?;
                 let value = client.execute_tool("read", args).await?;
                 serde_json::from_value::<FileRead>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))
             }
             #[cfg(feature = "zeroboot")]
             GuestOps::Zbrt(guest) => {
@@ -592,7 +592,7 @@ impl GuestOps {
                     .fs(4, path, json!({"offset": offset, "max_bytes": max_bytes}))
                     .await?;
                 serde_json::from_value::<FileRead>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))
             }
         }
     }
@@ -612,10 +612,10 @@ impl GuestOps {
                     append,
                     mode,
                 })
-                .map_err(|e| RfbError::Decode(e.to_string()))?;
+                .map_err(|e| RfbError::decode_with(e.to_string(), e))?;
                 let value = client.execute_tool("write", args).await?;
                 Ok(serde_json::from_value::<WriteResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .bytes_written)
             }
             #[cfg(feature = "zeroboot")]
@@ -628,7 +628,7 @@ impl GuestOps {
                     )
                     .await?;
                 Ok(serde_json::from_value::<WriteResult>(value)
-                    .map_err(|e| RfbError::Decode(e.to_string()))?
+                    .map_err(|e| RfbError::decode_with(e.to_string(), e))?
                     .bytes_written)
             }
         }

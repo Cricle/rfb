@@ -20,8 +20,15 @@ pub enum RfbError {
     },
     /// A response or frame could not be decoded (including strict codec
     /// rejections).
-    #[error("decode failure: {0}")]
-    Decode(String),
+    #[error("decode failure: {message}")]
+    Decode {
+        /// Human-readable description of the failure.
+        message: String,
+        /// Underlying parser/codec failure, when one exists — kept so
+        /// `Error::source()` chains survive into host applications.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
     /// The peer reported an error (guest `error` line, ZBRT `Error` frame,
     /// forkd `error` field).
     #[error("remote error: {0}")]
@@ -41,7 +48,7 @@ impl From<crate::controller::ForkdClientError> for RfbError {
                 status: status.as_u16(),
                 message,
             },
-            crate::controller::ForkdClientError::Decode(message) => RfbError::Decode(message),
+            crate::controller::ForkdClientError::Decode(message) => RfbError::decode(message),
         }
     }
 }
@@ -51,9 +58,11 @@ impl From<crate::forkd_guest::ForkdGuestError> for RfbError {
         match error {
             crate::forkd_guest::ForkdGuestError::Io(err) => RfbError::Transport(err),
             crate::forkd_guest::ForkdGuestError::TooLarge => {
-                RfbError::Decode("guest response exceeded the 1 MiB line limit".to_owned())
+                RfbError::decode("guest response exceeded the 1 MiB line limit")
             }
-            crate::forkd_guest::ForkdGuestError::Json(err) => RfbError::Decode(err.to_string()),
+            crate::forkd_guest::ForkdGuestError::Json(err) => {
+                RfbError::decode_with(err.to_string(), err)
+            }
             crate::forkd_guest::ForkdGuestError::Remote(message) => RfbError::Remote(message),
             crate::forkd_guest::ForkdGuestError::InvalidPath => {
                 RfbError::Validation("invalid guest path".to_owned())
@@ -71,6 +80,27 @@ impl From<crate::forkd_guest::ForkdGuestError> for RfbError {
 impl From<crate::ContractError> for RfbError {
     fn from(error: crate::ContractError) -> Self {
         RfbError::Validation(error.to_string())
+    }
+}
+
+impl RfbError {
+    /// Decode failure without an underlying error object.
+    pub(crate) fn decode(message: impl Into<String>) -> Self {
+        RfbError::Decode {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Decode failure that keeps the parser/codec error as the source.
+    pub(crate) fn decode_with(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        RfbError::Decode {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
     }
 }
 
