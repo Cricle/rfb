@@ -254,7 +254,6 @@ impl ArtifactManifest {
         mode: &str,
         entrypoint: &str,
         protocol: &str,
-        _size_mb: u64,
     ) -> Result<Self, CliError> {
         let (backend, profile, transport) = match mode {
             "forkd-agent" => ("forkd", "forkd-agent-tcp", "tcp"),

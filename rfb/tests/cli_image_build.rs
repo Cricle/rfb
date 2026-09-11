@@ -688,14 +688,15 @@ fn artifact_for_rootfs_selects_modes_and_rejects_unknown_ones() {
         "forkd-agent",
         "/forkd-init.sh",
         "forkd",
-        64,
     )
     .expect("forkd-agent rootfs builds");
     assert_eq!(rootfs.backend, "forkd");
     assert_eq!(rootfs.profile, "forkd-agent-tcp");
     assert_eq!(rootfs.transport, "tcp");
     assert_eq!(rootfs.guest_port, 8888);
-    assert_eq!(rootfs.vm.memory_bytes, 64 * 1024 * 1024);
+    // Rootfs artifacts declare no VM memory (memory_bytes = 0): the
+    // provenance identity skips the memory comparison for them.
+    assert_eq!(rootfs.vm.memory_bytes, 0);
     assert!(rootfs.validate().is_ok());
 
     let vsock = ArtifactManifest::for_rootfs(
@@ -704,7 +705,6 @@ fn artifact_for_rootfs_selects_modes_and_rejects_unknown_ones() {
         "rfb-vsock",
         "/sbin/rfb-runtime",
         "rfb1",
-        32,
     )
     .expect("rfb-vsock rootfs builds");
     assert_eq!(vsock.backend, "rfb1");
@@ -719,7 +719,6 @@ fn artifact_for_rootfs_selects_modes_and_rejects_unknown_ones() {
         "zeroboot-zbrt",
         "/init",
         "zbrt",
-        64,
     )
     .expect("zbrt rootfs builds");
     assert_eq!(zbrt.backend, "zeroboot");
@@ -728,15 +727,9 @@ fn artifact_for_rootfs_selects_modes_and_rejects_unknown_ones() {
     assert_eq!(zbrt.guest_port, 5000);
     assert!(zbrt.validate().is_ok());
 
-    let err = ArtifactManifest::for_rootfs(
-        Path::new("/out.ext4"),
-        &digest(),
-        "bogus",
-        "/init",
-        "rfb1",
-        32,
-    )
-    .expect_err("unknown mode rejected");
+    let err =
+        ArtifactManifest::for_rootfs(Path::new("/out.ext4"), &digest(), "bogus", "/init", "rfb1")
+            .expect_err("unknown mode rejected");
     assert_eq!(err.code, EXIT_VALIDATION);
     assert!(err.message.contains("unsupported rootfs artifact mode"));
 }
@@ -1028,7 +1021,6 @@ fn artifact_local_file_checks_cover_missing_files_and_digests() {
         "rfb-vsock",
         "/sbin/rfb-runtime",
         "rfb1",
-        32,
     )
     .expect("rootfs artifact builds");
     assert!(rootfs.validate_schema().is_ok());
@@ -1046,7 +1038,6 @@ fn artifact_manifest_load_and_sidecar_round_trip() {
         "rfb-vsock",
         "/sbin/rfb-runtime",
         "rfb1",
-        32,
     )
     .expect("rootfs artifact builds");
 

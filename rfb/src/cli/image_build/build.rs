@@ -673,7 +673,7 @@ pub fn build_rootfs(
         .map_err(|error| io(error.error.to_string()))?;
 
     let artifact = crate::cli::image_build::ArtifactManifest::for_rootfs(
-        output, &digest, mode, entrypoint, protocol, size_mb,
+        output, &digest, mode, entrypoint, protocol,
     )?;
     artifact.validate()?;
     let artifact_manifest_path = artifact.write_sidecar(output)?;
