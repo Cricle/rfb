@@ -92,7 +92,7 @@ try (GuestStream s = box.stream(List.of("tail", "-f", "x"))) {
 ```
 
 两种传输下 `exec`/`eval`/`ls`/`find`/`grep`/`read`/`write`/`stream`/`ping` 的方法名与结果字段一致（eval 的 `output` 统一映射为 `ExecResult.stdout`）。
-DTO 取值统一走 getter（JavaBean 命名）：`ExecResult.getExitCode()/getStdout()/getStderr()/isTimedOut()`、`FileRead.getData()/isTruncated()/getTotalBytes()`、`StreamEvent.getKind()/getData()/getCode()`、`DirEntry.getName()/isDir()/getSize()`、`GrepMatch.getPath()/getLine()/getColumn()/getText()`；`byte[]` 访问器按值返回拷贝（构造与取值两侧均防御性复制），DTO 均实现 `equals`/`hashCode`。
+DTO 取值统一走 getter（JavaBean 命名）：`ExecResult.getExitCode()/getStdout()/getStderr()/isTimedOut()`、`FileRead.getData()/isTruncated()/getTotalBytes()`、`StreamEvent.getKind()/getData()/getCode()`、`DirEntry.getName()/isDir()/getSize()`、`GrepMatch.getPath()/getLine()/getColumn()/getText()`；控制器 DTO `SandboxInfo`/`Snapshot` 为可变 JavaBean（同名 getter/setter，Jackson 字段绑定，字段名与 PROTOCOL.md §1.3 一致）；`byte[]` 访问器按值返回拷贝（构造与取值两侧均防御性复制），DTO 均实现 `equals`/`hashCode`。
 
 ### 3. 错误处理
 
