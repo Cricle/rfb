@@ -67,6 +67,17 @@ struct ZbrtArgs {
     /// Comma-separated VM memory ladder in MiB (overrides RFB_ZBRT_VM_MEM_MIB).
     #[arg(long, default_value = "512")]
     mem_mib: String,
+    /// Comma-separated guest vCPU ladder (overrides RFB_ZBRT_VM_VCPU). One VM
+    /// is booted per (memory, vCPU) pair, so this is the scaling axis for
+    /// CPU-bound guest commands.
+    #[arg(long, default_value = "1")]
+    vcpus: String,
+    /// ZBRT connection pool size per VM (overrides RFB_ZBRT_SESSIONS). The V1
+    /// contract is single-active per connection, so this caps how many ladder
+    /// workers can run at once; 0 (the default) uses the largest ladder level
+    /// so the ladder measures guest capacity instead of pool queueing.
+    #[arg(long, default_value_t = 0)]
+    sessions: usize,
     /// Per-exec timeout in seconds.
     #[arg(long, default_value_t = 30)]
     timeout_secs: u64,
@@ -96,6 +107,12 @@ fn parse_levels(spec: &str) -> Result<Vec<usize>, String> {
 #[cfg(any(target_os = "linux", test))]
 fn parse_mem_mib(spec: &str) -> Result<Vec<u32>, String> {
     parse_list(spec, "memory level")
+}
+
+/// Parse "1,2" into [1, 2] vCPU levels; rejects zero and duplicates.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vcpus(spec: &str) -> Result<Vec<u32>, String> {
+    parse_list(spec, "vCPU level")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -264,17 +281,28 @@ mod zbrt {
         Ok(elapsed_ms)
     }
 
-    /// Run one full pass of the benchmark at a single guest memory level.
+    /// Run one full pass of the benchmark at a single guest memory/vCPU level.
     pub(super) async fn run_level(
         args: &ZbrtArgs,
         mem_mib: u32,
+        vcpus: u32,
+        sessions: usize,
     ) -> Result<serde_json::Value, String> {
-        // The provider reads this at boot time, so per-level overrides work.
+        // The provider reads these at boot time, so per-level overrides work.
         // set_var is not thread-safe; the benchmark loop runs one level at a
         // time, so a plain "did it change?" check is sufficient.
         static LAST_MEM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if LAST_MEM.swap(mem_mib, std::sync::atomic::Ordering::Relaxed) != mem_mib {
             std::env::set_var("RFB_ZBRT_VM_MEM_MIB", mem_mib.to_string());
+        }
+        static LAST_VCPU: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LAST_VCPU.swap(vcpus, std::sync::atomic::Ordering::Relaxed) != vcpus {
+            std::env::set_var("RFB_ZBRT_VM_VCPU", vcpus.to_string());
+        }
+        static LAST_SESSIONS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if LAST_SESSIONS.swap(sessions, std::sync::atomic::Ordering::Relaxed) != sessions {
+            std::env::set_var("RFB_ZBRT_SESSIONS", sessions.to_string());
         }
         let config = ZbrtConfig {
             kernel: Some(args.kernel.clone()),
@@ -361,6 +389,8 @@ mod zbrt {
 
         Ok(serde_json::json!({
             "mem_mib": mem_mib,
+            "vcpus": vcpus,
+            "sessions": sessions,
             "cold_boot_ms": cold_boot_ms,
             "single": latency_summary(single_latencies, single_failures),
             "ladder": ladder,
@@ -372,10 +402,26 @@ mod zbrt {
 #[cfg(target_os = "linux")]
 async fn run_zbrt(args: ZbrtArgs) -> Result<serde_json::Value, String> {
     let mem_levels = parse_mem_mib(&args.mem_mib)?;
-    let mut reports = Vec::with_capacity(mem_levels.len());
+    let vcpu_levels = parse_vcpus(&args.vcpus)?;
+    let ladder_levels = parse_levels(&args.levels)?;
+    let widest = ladder_levels.iter().copied().max().unwrap_or(1);
+    let sessions = if args.sessions == 0 {
+        widest
+    } else {
+        args.sessions
+    };
+    if sessions < widest {
+        eprintln!(
+            "rfb-ben: warning: --sessions {sessions} is below the widest ladder level {widest}; \
+             that level measures pool queueing as well as guest capacity"
+        );
+    }
+    let mut reports = Vec::with_capacity(mem_levels.len() * vcpu_levels.len());
     for mem_mib in mem_levels {
-        eprintln!("rfb-ben: running zbrt ladder level {mem_mib} MiB");
-        reports.push(zbrt::run_level(&args, mem_mib).await?);
+        for vcpus in &vcpu_levels {
+            eprintln!("rfb-ben: running zbrt ladder level {mem_mib} MiB / {vcpus} vCPU ({sessions} sessions)");
+            reports.push(zbrt::run_level(&args, mem_mib, *vcpus, sessions).await?);
+        }
     }
     Ok(serde_json::json!({
         "scenario": "zbrt",
@@ -422,7 +468,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{latency_summary, parse_levels, parse_mem_mib, quantile};
+    use super::{latency_summary, parse_levels, parse_mem_mib, parse_vcpus, quantile};
 
     #[test]
     fn quantile_is_nearest_rank() {
@@ -447,6 +493,13 @@ mod tests {
         assert_eq!(parse_mem_mib("512,64").unwrap(), vec![512, 64]);
         assert!(parse_mem_mib("0").is_err());
         assert!(parse_mem_mib("64,64").is_err());
+    }
+
+    #[test]
+    fn vcpu_parse_and_reject() {
+        assert_eq!(parse_vcpus("1,2,4").unwrap(), vec![1, 2, 4]);
+        assert!(parse_vcpus("0").is_err());
+        assert!(parse_vcpus("2,2").is_err());
     }
 
     #[test]

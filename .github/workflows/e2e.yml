@@ -401,10 +401,13 @@ jobs:
             --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" --json \
             | tee "$RUN_DIR/bench-zeroboot-verify.json"
 
+          # 阶梯同时扫 vCPU：会话池让并发命令真正并行，vCPU 才是吞吐的
+          # 上限轴；两档（1/2 vCPU）足以看出是否随核数扩展。
           cargo build -p rfb-ben --release
           ./target/release/rfb-ben zbrt \
             --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" \
-            --samples 100 --warmup 5 --levels 1,2,4,8,16 --rounds 4 --mem-mib 512 \
+            --samples 100 --warmup 5 --levels 1,2,4,8,16 --rounds 4 \
+            --mem-mib 512 --vcpus 1,2 \
             --json-out "$RUN_DIR/bench-zeroboot.json" | tee "$RUN_DIR/bench-zeroboot.log"
 
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。

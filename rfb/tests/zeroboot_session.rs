@@ -973,3 +973,80 @@ async fn concurrent_execs_queue_instead_of_failing_the_turn() {
     assert_eq!(c.unwrap().stdout, b"three\n");
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn sandbox_pool_runs_concurrent_execs_on_separate_connections() {
+    // The pool is what turns a VM's capacity into usable concurrency, so two
+    // execs must be in flight at the same time on two connections. A pool of
+    // one can never reach the barrier, which is exactly the regression this
+    // guards: the single-session turn lock serialized every command.
+    let path = socket_path("pool");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let in_flight = Arc::new(tokio::sync::Barrier::new(2));
+    let server = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let in_flight = in_flight.clone();
+            connections.push(tokio::spawn(async move {
+                expect_connect(&mut stream, 5000).await;
+                let hello = read_frame(&mut stream).await;
+                assert_eq!(hello.kind, Kind::Hello);
+                write_frame(
+                    &mut stream,
+                    &reply(
+                        hello.request_id,
+                        Kind::HelloAck,
+                        hello_ack(vec!["execute".into()]),
+                    ),
+                )
+                .await;
+
+                let exec = read_frame(&mut stream).await;
+                assert_eq!(exec.kind, Kind::Execute);
+                // Both connections must hold a live Execute before either may
+                // answer: no reply is written until the barrier trips.
+                in_flight.wait().await;
+                write_frame(
+                    &mut stream,
+                    &reply(
+                        exec.request_id,
+                        Kind::Exit,
+                        Exit {
+                            code: 0,
+                            signal: None,
+                        }
+                        .encode()
+                        .unwrap(),
+                    ),
+                )
+                .await;
+            }));
+        }
+        for connection in connections {
+            connection.await.unwrap();
+        }
+    });
+
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        sessions.push(
+            ZeroBootSession::open(&path, 5000, Duration::from_secs(2))
+                .await
+                .unwrap(),
+        );
+    }
+    let sandbox = ZeroBootSandbox::from_sessions_for_test(Config::default(), sessions);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            sandbox.exec(ExecSpec::new("echo")),
+            sandbox.exec(ExecSpec::new("echo")),
+        )
+    })
+    .await
+    .expect("pooled execs must not serialize behind a single connection");
+    assert_eq!(first.unwrap().status, Some(0));
+    assert_eq!(second.unwrap().status, Some(0));
+    server.await.unwrap();
+}

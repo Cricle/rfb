@@ -186,6 +186,26 @@ struct MachineConfig {
     mem_size_mib: u32,
 }
 
+/// Guest VM shape: what Firecracker allocates at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmResources {
+    /// Guest memory in MiB.
+    pub mem_mib: u32,
+    /// Guest vCPU count. Every guest session runs its command on a worker
+    /// thread, so this is what lets concurrent commands use host cores.
+    pub vcpu_count: u32,
+}
+
+impl VmResources {
+    /// Build a shape from its two axes.
+    pub const fn new(mem_mib: u32, vcpu_count: u32) -> Self {
+        Self {
+            mem_mib,
+            vcpu_count,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct VmAction {
     action_type: String,
@@ -197,7 +217,7 @@ impl FirecrackerVm {
         kernel_path: &str,
         rootfs_path: &str,
         work_dir: &str,
-        mem_mib: u32,
+        resources: VmResources,
         init_path: &str,
         vsock: Option<VsockConfig>,
     ) -> Result<Self> {
@@ -244,8 +264,8 @@ impl FirecrackerVm {
         vm.api_put(
             "/machine-config",
             &MachineConfig {
-                vcpu_count: 1,
-                mem_size_mib: mem_mib,
+                vcpu_count: resources.vcpu_count,
+                mem_size_mib: resources.mem_mib,
             },
         )?;
 
@@ -347,12 +367,14 @@ impl FirecrackerVm {
         self.process.id()
     }
 
+    /// Boot a VM with a vsock device so the guest runtime can be driven over
+    /// the Firecracker UDS relay.
     pub fn boot_with_runtime(
         firecracker_path: &str,
         kernel_path: &str,
         rootfs_path: &str,
         work_dir: &str,
-        mem_mib: u32,
+        resources: VmResources,
         init_path: &str,
         guest_cid: u32,
     ) -> Result<Self> {
@@ -362,7 +384,7 @@ impl FirecrackerVm {
             kernel_path,
             rootfs_path,
             work_dir,
-            mem_mib,
+            resources,
             init_path,
             Some(VsockConfig {
                 guest_cid,

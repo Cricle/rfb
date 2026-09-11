@@ -72,6 +72,8 @@ rfb-cli doctor --json   # host capability report
 
 Protocol lines — RFB1 (framed vsock), forkd (TCP/NDJSON), and ZBRT (ZeroBoot binary frame) — are not interchangeable. Missing capabilities must fail closed.
 
+The ZeroBoot provider keeps one VM but opens a pool of ZBRT connections into it, because the V1 contract allows one active command per connection. Three environment variables size that VM for a host (defaults in parentheses): `RFB_ZBRT_VM_MEM_MIB` (512), `RFB_ZBRT_VM_VCPU` (1), and `RFB_ZBRT_SESSIONS` (4, the number of commands that can run at once). `rfb-ben zbrt --vcpus 1,2 --mem-mib 512` measures the resulting scaling curve on a real KVM host.
+
 ## Runtime asset boundary
 
 Protocol code, build code, image manifest examples, and docs live inside the git/crates.io boundary. Large, platform-specific artifacts are deliberately NOT published as crate dependencies: Firecracker binaries, Linux kernels, ext4 rootfs images, snapshots, forkd agent images, runtime static binaries, logs, and build directories are external artifacts. A controlled artifact store or deployment pipeline downloads them per target platform, verifies SHA-256, and injects them via absolute paths or environment variables (for example `RFB_RUNTIME_BIN`, `FORKD_ROOTFS`).

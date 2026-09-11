@@ -110,7 +110,7 @@ mod firecracker {
                 "/kernel",
                 "/rootfs",
                 work.to_str().unwrap(),
-                0,
+                VmResources::new(0, 1),
                 "/init",
                 None,
             )

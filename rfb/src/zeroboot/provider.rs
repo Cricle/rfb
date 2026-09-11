@@ -1,12 +1,12 @@
 // Linux-native ZeroBoot RFB provider over Firecracker virtio-vsock.
 //
-// Each sandbox owns one Firecracker VM and one reusable ZBRT vsock session.
-// The VM is booted once at create time; every exec runs over that negotiated
-// session, so a command never triggers a cold boot. Only capabilities the
-// ZeroBoot V1 guest actually implements end-to-end are advertised: Health and
-// Execute today. Filesystem and Cancel frames are routed through the session
-// only after the guest's HelloAck proves support; otherwise they fail closed
-// at the sandbox boundary.
+// Each sandbox owns one Firecracker VM and a pool of reusable ZBRT vsock
+// sessions. The VM is booted once at create time; every exec runs over one of
+// the negotiated sessions, so a command never triggers a cold boot. Only
+// capabilities the ZeroBoot V1 guest actually implements end-to-end are
+// advertised: Health and Execute today. Filesystem and Cancel frames are
+// routed through the session only after the guest's HelloAck proves support;
+// otherwise they fail closed at the sandbox boundary.
 
 use crate::{
     BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, ProviderError, Sandbox, SandboxError,
@@ -609,6 +609,7 @@ impl ZeroBootSession {
             terminated: false,
             pending: std::collections::VecDeque::new(),
             _turn_guard: Some(turn_guard),
+            _slot: None,
         })
     }
 
@@ -683,6 +684,104 @@ impl ZeroBootSession {
         };
         self.inflight.lock().await.remove(&request_id);
         result
+    }
+}
+
+/// A pool of negotiated ZBRT sessions against one ZeroBoot guest.
+///
+/// The V1 contract allows one active turn *per connection*, and the guest
+/// serves every accepted connection independently (own runtime service, own
+/// workspace executor, own worker thread). The pool is therefore what makes a
+/// VM's capacity usable by more than one caller at a time: a request only
+/// waits when every slot is busy, instead of queueing behind a single
+/// connection's turn lock. Sessions are reused across requests, so steady
+/// state pays neither a connect nor a Hello handshake per command.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+struct SessionPool {
+    sessions: Vec<Arc<ZeroBootSession>>,
+    busy: Vec<std::sync::atomic::AtomicBool>,
+    free: Arc<tokio::sync::Semaphore>,
+}
+
+/// A claimed pool slot. Dropping it frees the slot and its session, so a
+/// cancelled or failed request can never leak capacity.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+struct PooledSession {
+    session: Arc<ZeroBootSession>,
+    pool: Arc<SessionPool>,
+    slot: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl PooledSession {
+    fn session(&self) -> &Arc<ZeroBootSession> {
+        &self.session
+    }
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl Drop for PooledSession {
+    fn drop(&mut self) {
+        // Release the flag before the permit: a waiter that wins the permit
+        // must always find the slot it just freed marked free.
+        self.pool.busy[self.slot].store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl SessionPool {
+    fn new(sessions: Vec<Arc<ZeroBootSession>>) -> Arc<Self> {
+        let count = sessions.len();
+        assert!(count > 0, "a session pool needs at least one session");
+        Arc::new(Self {
+            sessions,
+            busy: (0..count)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            free: Arc::new(tokio::sync::Semaphore::new(count)),
+        })
+    }
+
+    /// Session for control RPCs (health, filesystem): they interleave with an
+    /// active turn on the same connection instead of occupying a slot.
+    fn primary(&self) -> &Arc<ZeroBootSession> {
+        &self.sessions[0]
+    }
+
+    /// Every session, for operations that must reach whichever one holds the
+    /// target (cancel is idempotent per connection).
+    fn all(&self) -> &[Arc<ZeroBootSession>] {
+        &self.sessions
+    }
+
+    /// Wait for a free slot and claim it.
+    async fn acquire(self: &Arc<Self>) -> PooledSession {
+        let permit = self
+            .free
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session pool semaphore is never closed");
+        let slot = self
+            .busy
+            .iter()
+            .position(|busy| {
+                busy.compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            })
+            .expect("a free permit guarantees a free slot");
+        PooledSession {
+            session: Arc::clone(&self.sessions[slot]),
+            pool: Arc::clone(self),
+            slot,
+            _permit: permit,
+        }
     }
 }
 
@@ -810,6 +909,9 @@ pub struct ZeroBootStream {
     /// frees the queue but leaves the guest turn active until the next
     /// request fails closed — the pre-existing abandoned-stream behavior).
     _turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Pool slot backing this stream; released when the stream discharges or
+    /// drops, so another request can claim the connection.
+    _slot: Option<PooledSession>,
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
@@ -827,6 +929,7 @@ impl ZeroBootStream {
     fn discharge(&mut self) {
         self.terminated = true;
         self._turn_guard = None;
+        self._slot = None;
     }
 }
 
@@ -1023,11 +1126,43 @@ const VM_MEM_MIB_ENV: &str = "RFB_ZBRT_VM_MEM_MIB";
 fn vm_mem_mib() -> u32 {
     // Capacity-evaluation override: lets operators measure the real memory
     // floor of a ZBRT microVM without touching wire behavior or defaults.
-    std::env::var(VM_MEM_MIB_ENV)
+    env_positive(VM_MEM_MIB_ENV).unwrap_or(VM_MEM_MIB)
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const VM_VCPU: u32 = 1;
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const VM_VCPU_ENV: &str = "RFB_ZBRT_VM_VCPU";
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn vm_vcpu() -> u32 {
+    // Capacity override: each guest session runs its command on a worker
+    // thread, so a single vCPU serializes CPU-bound commands even when the
+    // host multiplexes several sessions onto the VM.
+    env_positive(VM_VCPU_ENV).unwrap_or(VM_VCPU)
+}
+
+/// Session pool size: how many ZBRT connections the provider opens per VM.
+/// The V1 contract is single-active *per connection*, so this is the number of
+/// commands the VM can run concurrently.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const VM_SESSIONS: usize = 4;
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const VM_SESSIONS_ENV: &str = "RFB_ZBRT_SESSIONS";
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn vm_sessions() -> usize {
+    env_positive(VM_SESSIONS_ENV)
+        .map(|n| n as usize)
+        .unwrap_or(VM_SESSIONS)
+}
+
+/// Read a positive numeric override from the environment, ignoring malformed
+/// or zero values so a bad knob can never boot a broken VM.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn env_positive(name: &str) -> Option<u32> {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .filter(|mib| *mib > 0)
-        .unwrap_or(VM_MEM_MIB)
+        .filter(|value| *value > 0)
 }
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const VM_INIT_PATH: &str = "/init";
@@ -1132,11 +1267,13 @@ fn stage_private_rootfs(work_path: &str, source: &str) -> Result<String> {
         .ok_or_else(|| Error::Backend("private rootfs path is not valid UTF-8".into()))
 }
 
-/// Boot one Firecracker VM for a sandbox and return a reusable negotiated
-/// session bound to it. The VM keeps running for the session's lifetime, so
-/// every later exec/control RPC runs without a cold boot.
+/// Boot one Firecracker VM for a sandbox and return the negotiated session
+/// pool bound to it. The VM keeps running for the pool's lifetime, so every
+/// later exec/control RPC runs without a cold boot. The pool size comes from
+/// `RFB_ZBRT_SESSIONS`; extra sessions pay one connect + Hello handshake at
+/// create time and then serve commands concurrently.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-async fn boot_and_open(config: &Config) -> Result<ZeroBootSession> {
+async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
     let firecracker = config
         .firecracker
         .as_ref()
@@ -1172,7 +1309,7 @@ async fn boot_and_open(config: &Config) -> Result<ZeroBootSession> {
                 &kernel,
                 &rootfs,
                 &work_path,
-                vm_mem_mib(),
+                crate::firecracker::VmResources::new(vm_mem_mib(), vm_vcpu()),
                 VM_INIT_PATH,
                 GUEST_CID,
             )
@@ -1186,12 +1323,24 @@ async fn boot_and_open(config: &Config) -> Result<ZeroBootSession> {
     })
     .await
     .map_err(|e| Error::Backend(format!("ZeroBoot boot worker failed: {e}")))??;
-    let mut session = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
+    let mut primary = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
         .await
         .map_err(|e| Error::Backend(format!("ZeroBoot session open failed: {e}")))?;
-    session._work = Some(work);
-    session._vm = Some(vm);
-    Ok(session)
+    // Ownership of the VM and its work dir stays with the primary session:
+    // dropping it tears the VM down, and the rest of the pool only holds
+    // connections into it.
+    primary._work = Some(work);
+    primary._vm = Some(vm);
+    let mut sessions = vec![Arc::new(primary)];
+    for index in 1..vm_sessions() {
+        let session = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
+            .await
+            .map_err(|e| {
+                Error::Backend(format!("ZeroBoot session {index} open failed: {e}"))
+            })?;
+        sessions.push(Arc::new(session));
+    }
+    Ok(sessions)
 }
 
 #[derive(Debug, Clone)]
@@ -1289,14 +1438,14 @@ impl ZeroBootProvider {
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
                 // Boot is a one-time cost per sandbox: subsequent exec/health
-                // calls reuse this session and never cold-boot the VM.
-                let session = boot_and_open(&self.config)
+                // calls reuse these sessions and never cold-boot the VM.
+                let sessions = boot_and_open(&self.config)
                     .await
                     .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
-                let capabilities = capabilities_from_negotiated(session.negotiated());
+                let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
                 Ok(ZeroBootSandbox {
                     config: self.config.clone(),
-                    session: Arc::new(session),
+                    pool: SessionPool::new(sessions),
                     capabilities,
                 })
             }
@@ -1309,12 +1458,12 @@ impl ZeroBootProvider {
 }
 
 /// Sandbox created by the ZeroBoot provider. It owns one Firecracker VM and a
-/// reusable ZBRT vsock session; dropping the sandbox tears down the VM.
+/// pool of ZBRT vsock sessions into it; dropping the sandbox tears down the VM.
 pub struct ZeroBootSandbox {
     #[allow(dead_code)]
     config: Arc<Config>,
     #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-    session: Arc<ZeroBootSession>,
+    pool: Arc<SessionPool>,
     /// Capabilities derived from the guest's HelloAck: only operations the
     /// guest actually supports end-to-end are advertised.
     #[cfg(all(feature = "zeroboot", target_os = "linux"))]
@@ -1330,10 +1479,25 @@ impl ZeroBootSandbox {
         config: Config,
         session: ZeroBootSession,
     ) -> Self {
-        let capabilities = capabilities_from_negotiated(&session.negotiated);
+        Self::from_sessions_for_test(config, vec![session])
+    }
+
+    /// Build a sandbox over an explicit session pool. Used by mock-guest tests
+    /// that need several connections to one guest without booting a VM.
+    #[cfg(all(feature = "zeroboot", target_os = "linux"))]
+    #[doc(hidden)]
+    pub fn from_sessions_for_test(
+        config: Config,
+        sessions: Vec<ZeroBootSession>,
+    ) -> Self {
+        assert!(
+            !sessions.is_empty(),
+            "a sandbox needs at least one session"
+        );
+        let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
         Self {
             config: Arc::new(config),
-            session: Arc::new(session),
+            pool: SessionPool::new(sessions.into_iter().map(Arc::new).collect()),
             capabilities,
         }
     }
@@ -1342,7 +1506,7 @@ impl ZeroBootSandbox {
     #[cfg(all(feature = "zeroboot", target_os = "linux"))]
     #[doc(hidden)]
     pub fn firecracker_pid(&self) -> Option<u32> {
-        self.session.firecracker_pid()
+        self.pool.primary().firecracker_pid()
     }
 }
 
@@ -1401,10 +1565,13 @@ impl Sandbox for ZeroBootSandbox {
             spec.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "execute", Capability::Execute)?;
+                check_supported(self.pool.primary(), "execute", Capability::Execute)?;
                 let request = execute_request(&spec, self.config.timeout)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
-                self.session.exec(request).await.map_err(map_session_error)
+                // Claim a session for the whole command: concurrent execs run
+                // on separate connections instead of queueing.
+                let slot = self.pool.acquire().await;
+                slot.session().exec(request).await.map_err(map_session_error)
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
             {
@@ -1418,8 +1585,8 @@ impl Sandbox for ZeroBootSandbox {
         Box::pin(async move {
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "health", Capability::Health)?;
-                self.session.health().await.map_err(map_session_error)
+                check_supported(self.pool.primary(), "health", Capability::Health)?;
+                self.pool.primary().health().await.map_err(map_session_error)
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
             {
@@ -1436,10 +1603,14 @@ impl Sandbox for ZeroBootSandbox {
             spec.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "stream", Capability::Stream)?;
+                check_supported(self.pool.primary(), "stream", Capability::Stream)?;
                 let request = stream_to_execute(&spec, self.config.timeout)?;
-                let session = self.session.clone();
-                let stream = session.stream(request).await.map_err(map_session_error)?;
+                let slot = self.pool.acquire().await;
+                let session = Arc::clone(slot.session());
+                let mut stream = session.stream(request).await.map_err(map_session_error)?;
+                // The slot is held for as long as the stream occupies the
+                // connection, and released when it discharges or drops.
+                stream._slot = Some(slot);
                 Ok(Box::new(stream) as Box<dyn crate::guest::GuestStream + 'a>)
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
@@ -1456,12 +1627,19 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "cancel", Capability::Cancel)?;
-                self.session
-                    .cancel(request.id)
-                    .await
-                    .map_err(map_session_error)?;
-                Ok(crate::guest::CancelResult { cancelled: true })
+                check_supported(self.pool.primary(), "cancel", Capability::Cancel)?;
+                // The target lives on whichever connection is running it, so
+                // fan the cancel out; idle sessions acknowledge idempotently.
+                let mut last_error = None;
+                for session in self.pool.all() {
+                    match session.cancel(request.id.clone()).await {
+                        Ok(()) => return Ok(crate::guest::CancelResult { cancelled: true }),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(map_session_error(
+                    last_error.expect("a session pool is never empty"),
+                ))
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
             {
@@ -1477,11 +1655,12 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "filesystem", Capability::Ls)?;
+                check_supported(self.pool.primary(), "filesystem", Capability::Ls)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 let data = self
-                    .session
+                    .pool
+                    .primary()
                     .fs(fs_op::LS, &request.path, payload)
                     .await
                     .map_err(map_session_error)?;
@@ -1503,11 +1682,12 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "filesystem", Capability::Find)?;
+                check_supported(self.pool.primary(), "filesystem", Capability::Find)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 let data = self
-                    .session
+                    .pool
+                    .primary()
                     .fs(fs_op::FIND, &request.path, payload)
                     .await
                     .map_err(map_session_error)?;
@@ -1529,11 +1709,12 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "filesystem", Capability::Grep)?;
+                check_supported(self.pool.primary(), "filesystem", Capability::Grep)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 let data = self
-                    .session
+                    .pool
+                    .primary()
                     .fs(fs_op::GREP, &request.path, payload)
                     .await
                     .map_err(map_session_error)?;
@@ -1555,11 +1736,12 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "filesystem", Capability::ReadFile)?;
+                check_supported(self.pool.primary(), "filesystem", Capability::ReadFile)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 let data = self
-                    .session
+                    .pool
+                    .primary()
                     .fs(fs_op::READ, &request.path, payload)
                     .await
                     .map_err(map_session_error)?;
@@ -1581,11 +1763,12 @@ impl Sandbox for ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(&self.session, "filesystem", Capability::WriteFile)?;
+                check_supported(self.pool.primary(), "filesystem", Capability::WriteFile)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 let data = self
-                    .session
+                    .pool
+                    .primary()
                     .fs(fs_op::WRITE, &request.path, payload)
                     .await
                     .map_err(map_session_error)?;
