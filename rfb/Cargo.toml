@@ -28,7 +28,7 @@ cli = ["dep:clap", "dep:sha2", "dep:rfb-runtime", "rfb-runtime/host-vsock", "for
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
 url = { version = "2", optional = true }
