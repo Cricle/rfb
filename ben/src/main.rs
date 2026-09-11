@@ -279,20 +279,72 @@ mod zbrt {
     }
 
     /// The guest's own view of its CPU count, read through the ZBRT eval path.
-    /// Reported so a vCPU level that never reaches the kernel (or an AP that
-    /// fails to boot) shows up as data instead of being inferred from timings.
-    async fn guest_cpu_count(
+    /// Reported with its raw outcome so a vCPU level that never reaches the
+    /// kernel (or an AP that fails to boot) shows up as data instead of being
+    /// inferred from timings.
+    async fn guest_cpu_probe(
         sandbox: &rfb::zeroboot::ZeroBootSandbox,
         timeout: u64,
-    ) -> Option<u64> {
+    ) -> serde_json::Value {
         let request = ExecSpec {
             args: vec!["print(open('/proc/cpuinfo').read().count('processor'))".into()],
             timeout: Some(Duration::from_secs(timeout)),
             ..ExecSpec::new("eval")
         };
-        let result = sandbox.exec(request).await.ok()?;
-        let text = String::from_utf8_lossy(&result.stdout);
-        text.trim().parse().ok()
+        match sandbox.exec(request).await {
+            Ok(result) => serde_json::json!({
+                "stdout": String::from_utf8_lossy(&result.stdout).trim().to_string(),
+                "stderr": String::from_utf8_lossy(&result.stderr).trim().to_string(),
+                "status": result.status,
+            }),
+            Err(error) => serde_json::json!({ "error": error.to_string() }),
+        }
+    }
+
+    /// How many guest commands really overlap. `workers` execs of
+    /// `sleep <SLEEP_MS>` start together: a serialized command path finishes
+    /// in workers × SLEEP_MS (effective ≈ 1), a parallel one in ≈ SLEEP_MS
+    /// (effective ≈ workers). The command sleeps instead of computing, so the
+    /// result is about the execution path, not about guest CPU time.
+    async fn exec_concurrency(
+        sandbox: &Arc<rfb::zeroboot::ZeroBootSandbox>,
+        workers: usize,
+        timeout: u64,
+    ) -> serde_json::Value {
+        const SLEEP_MS: u64 = 200;
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let worker = Arc::clone(sandbox);
+            handles.push(tokio::spawn(async move {
+                let request = ExecSpec {
+                    args: vec![format!("{}", SLEEP_MS as f64 / 1000.0)],
+                    timeout: Some(Duration::from_secs(timeout)),
+                    ..ExecSpec::new("sleep")
+                };
+                worker.exec(request).await
+            }));
+        }
+        let mut failures = 0usize;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(result)) if result.status == Some(0) => {}
+                _ => failures += 1,
+            }
+        }
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let effective = if wall_ms > 0.0 {
+            workers as f64 * SLEEP_MS as f64 / wall_ms
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "workers": workers,
+            "sleep_ms": SLEEP_MS,
+            "wall_ms": wall_ms,
+            "failures": failures,
+            "effective_concurrency": effective,
+        })
     }
 
     async fn echo_once(
@@ -365,7 +417,7 @@ mod zbrt {
                 .await
                 .map_err(|error| format!("warmup failed: {error}"))?;
         }
-        let guest_cpus = guest_cpu_count(&sandbox, args.timeout_secs).await;
+        let guest_cpus = guest_cpu_probe(&sandbox, args.timeout_secs).await;
 
         let mut single_latencies = Vec::with_capacity(args.samples);
         let mut single_failures = 0usize;
@@ -455,6 +507,8 @@ mod zbrt {
                 "latency": latency_summary(latencies, failures),
             }));
         }
+        let probe_workers = levels.iter().copied().max().unwrap_or(1).min(16);
+        let exec_concurrency = exec_concurrency(&sandbox, probe_workers, args.timeout_secs).await;
         drop(sandbox);
         std::thread::sleep(Duration::from_millis(200));
         let peak_rss_kib = sampler.peak_kib();
@@ -469,6 +523,7 @@ mod zbrt {
             "single": latency_summary(single_latencies, single_failures),
             "ladder": ladder,
             "ladder_health": ladder_health,
+            "exec_concurrency": exec_concurrency,
             "firecracker_peak_rss_kib": peak_rss_kib,
         }))
     }
