@@ -14,7 +14,7 @@ postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
-zstd = "0.13"
+zstd = "0.14"
 thiserror = "2"
 libc = { version = "0.2", optional = true }
 uuid = { version = "1", features = ["v7"], optional = true }
