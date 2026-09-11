@@ -138,7 +138,11 @@ where
                         // active request; straggler chunks from a cancelled
                         // turn are dropped once its terminal has been sent.
                         if active_id == Some(request_id) {
-                            forward_event(&mut writer, request_id, &event).await?;
+                            if let Err(error) =
+                                forward_event(&mut writer, request_id, &event).await
+                            {
+                                break Err(error);
+                            }
                         }
                     }
                     Some(WorkerMessage::Terminal((request_id, session_id, request_id_str, result, executor))) => {
@@ -149,7 +153,9 @@ where
                             runtime.complete_turn(session_id, request_id_str, result, executor)
                         };
                         if let Some(frame) = terminal_frame(request_id, &responses) {
-                            write_frame_async(&mut writer, &frame).await?;
+                            if let Err(error) = write_frame_async(&mut writer, &frame).await {
+                                break Err(error);
+                            }
                         }
                         if let Some(entry) = requests.get_mut(&request_id) {
                             entry.terminated = true;
@@ -173,7 +179,7 @@ where
                 let reply = match frame.kind {
                     Kind::Hello => handle_hello(frame.request_id, &frame.payload),
                     Kind::Execute => {
-                        handle_execute(
+                        match handle_execute(
                             &service,
                             frame.request_id,
                             &frame.payload,
@@ -182,27 +188,40 @@ where
                             &mut active_id,
                             &mut requests,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(reply) => reply,
+                            Err(error) => break Err(error),
+                        }
                     }
                     Kind::Cancel => {
-                        handle_cancel(
+                        match handle_cancel(
                             &service,
                             frame.request_id,
                             &frame.payload,
                             active_id,
                             &requests,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(reply) => reply,
+                            Err(error) => break Err(error),
+                        }
                     }
                     Kind::Health => handle_health(frame.request_id, &frame.payload),
-                    Kind::Fs => handle_fs(&service, frame.request_id, &frame.payload).await?,
+                    Kind::Fs => match handle_fs(&service, frame.request_id, &frame.payload).await {
+                        Ok(reply) => reply,
+                        Err(error) => break Err(error),
+                    },
                     _ => Some(fail_closed_error(
                         frame.request_id,
                         "unsupported request kind",
                     )),
                 };
                 if let Some(frame) = reply {
-                    write_frame_async(&mut writer, &frame).await?;
+                    if let Err(error) = write_frame_async(&mut writer, &frame).await {
+                        break Err(error);
+                    }
                 }
             }
         }

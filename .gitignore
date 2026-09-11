@@ -490,6 +490,8 @@ sdk/java/tests/target/
 
 # Rust build output
 /target/
+# Built guest rootfs artifacts (image build-rootfs outputs)
+resx/rootfs/*.ext4*
 
 # Node.js build output
 sdk/nodejs/dist/

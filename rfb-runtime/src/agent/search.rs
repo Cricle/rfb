@@ -16,15 +16,27 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
         "ls" => {
             let path = guest_path(request.get("path"), true)?;
             let max = limit(request.get("max_results"), MAX_RESULTS, MAX_RESULTS)?;
+            // Bounded collection: read at most 2*max+1 entries so a huge
+            // directory cannot materialize millions of entries, while the
+            // sort still sees a representative sample. `truncated` is set
+            // whenever entries were dropped (early stop or the final cut).
+            let scan_cap = max.saturating_mul(2).saturating_add(1);
             let mut entries = Vec::new();
+            let mut truncated = false;
             for item in std::fs::read_dir(path)? {
                 let item = item?;
+                if entries.len() >= scan_cap {
+                    truncated = true;
+                    break;
+                }
                 let meta = item.metadata()?;
                 entries.push(json!({"name":item.file_name().to_string_lossy(),"is_dir":meta.is_dir(),"size":if meta.is_file(){Some(meta.len())}else{None}}));
             }
             entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-            let truncated = entries.len() > max;
-            entries.truncate(max);
+            if entries.len() > max {
+                truncated = true;
+                entries.truncate(max);
+            }
             Ok(json!({"entries":entries,"truncated":truncated}))
         }
         "find" => {
@@ -32,9 +44,7 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
             let p = pattern(request)?;
             let max = limit(request.get("max_results"), MAX_RESULTS, MAX_RESULTS)?;
             let mut out = Vec::new();
-            find_walk(&root, &root, p, max, &mut out)?;
-            let truncated = out.len() >= max;
-            out.truncate(max);
+            let truncated = find_walk(&root, &root, p, max, &mut out)?;
             Ok(json!({"matches":out,"truncated":truncated}))
         }
         "grep" => {
@@ -43,9 +53,7 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
             let max = limit(request.get("max_results"), MAX_RESULTS, MAX_RESULTS)?;
             let bytes = limit(request.get("max_bytes"), MAX_BYTES, MAX_BYTES)?;
             let mut out = Vec::new();
-            grep_walk(&root, &root, p, max, bytes, &mut out)?;
-            let truncated = out.len() > max;
-            out.truncate(max);
+            let truncated = grep_walk(&root, &root, p, max, bytes, &mut out)?;
             Ok(json!({"matches":out,"truncated":truncated}))
         }
         "read" => {
@@ -133,16 +141,21 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
     }
 }
 
+/// Returns whether the walk stopped early because the `max` cap was hit
+/// (the caller reports it as `truncated`).
 fn find_walk(
     root: &Path,
     dir: &Path,
     pat: &str,
     max: usize,
     out: &mut Vec<String>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let p = e.path();
+        if out.len() >= max {
+            return Ok(true);
+        }
         let name = e.file_name().to_string_lossy().to_string();
         if if pat.contains('*') {
             glob_matches(pat, &name)
@@ -156,11 +169,11 @@ fn find_walk(
                     .replace('\\', "/"),
             );
         }
-        if e.file_type()?.is_dir() && out.len() <= max {
-            find_walk(root, &p, pat, max, out)?;
+        if e.file_type()?.is_dir() && find_walk(root, &p, pat, max, out)? {
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(out.len() >= max)
 }
 
 fn glob_matches(pattern: &str, text: &str) -> bool {
@@ -191,6 +204,8 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// Returns whether the walk stopped early because a cap was hit (the caller
+/// reports it as `truncated`).
 fn grep_walk(
     root: &Path,
     dir: &Path,
@@ -198,13 +213,13 @@ fn grep_walk(
     max: usize,
     bytes: usize,
     out: &mut Vec<Value>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let p = e.path();
         if e.file_type()?.is_dir() {
-            if out.len() <= max {
-                grep_walk(root, &p, pat, max, bytes, out)?;
+            if out.len() < max && grep_walk(root, &p, pat, max, bytes, out)? {
+                return Ok(true);
             }
             continue;
         }
@@ -238,15 +253,15 @@ fn grep_walk(
                 let item = json!({"path":path,"line":line_no,"text":text});
                 let item_bytes = serde_json::to_vec(&item).unwrap_or_default().len();
                 if consumed + item_bytes > bytes && !out.is_empty() {
-                    return Ok(());
+                    return Ok(true);
                 }
                 consumed += item_bytes;
                 out.push(item);
                 if out.len() >= max || consumed >= bytes {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
     }
-    Ok(())
+    Ok(out.len() >= max)
 }

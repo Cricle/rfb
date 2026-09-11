@@ -230,6 +230,11 @@ impl RuntimeManager {
     }
     /// Provision at most one worker for a session; concurrent callers share the placeholder/result.
     pub async fn create_for_session(&self, id: &str) -> RuntimeHandle {
+        // Serialize with cancel_for_session: without the lock a cancel that
+        // lands while provisioning runs bumps the generation, and the
+        // finishing create then destroys its worker but still returns a
+        // "running" handle while leaving a Provisioning placeholder behind.
+        let _g = self.lock.lock().await;
         if let Some(h) = self.get(id).await {
             return h;
         }

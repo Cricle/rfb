@@ -390,10 +390,10 @@ impl SharedHostSession {
                             })?;
                         match terminal.stream {
                             crate::session::TerminalStream::Stdout => {
-                                stdout.push_str(&terminal.data)
+                                append_capped(&mut stdout, &terminal.data)
                             }
                             crate::session::TerminalStream::Stderr => {
-                                stderr.push_str(&terminal.data)
+                                append_capped(&mut stderr, &terminal.data)
                             }
                         }
                     }
@@ -668,6 +668,27 @@ impl HostClient {
 
 #[cfg(unix)]
 const POISON_MESSAGE: &str = "a previous operation timed out mid-frame; recreate the session";
+
+/// Append stream output up to a per-stream cap. A chatty guest must not make
+/// the host buffer unbounded output for the whole turn deadline; later chunks
+/// are dropped (the turn result stays valid).
+#[cfg(unix)]
+fn append_capped(target: &mut String, data: &str) {
+    const CAP: usize = 1024 * 1024;
+    if target.len() >= CAP {
+        return;
+    }
+    let remaining = CAP - target.len();
+    if data.len() <= remaining {
+        target.push_str(data);
+        return;
+    }
+    let mut cut = remaining;
+    while cut > 0 && !data.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    target.push_str(&data[..cut]);
+}
 
 #[cfg(unix)]
 fn is_stream_timeout(error: &VsockClientError) -> bool {
