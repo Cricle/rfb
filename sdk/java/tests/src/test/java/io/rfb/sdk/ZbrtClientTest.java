@@ -1,10 +1,16 @@
 package io.rfb.sdk;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import io.rfb.sdk.internal.Json;
 import io.rfb.sdk.internal.ZbrtCodec;
 import io.rfb.sdk.internal.ZbrtFrame;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -25,7 +31,38 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * comparing wire bytes (same approach as the Rust baseline test).
  */
 class ZbrtClientTest {
-    private static final String GOLDEN_REQUEST_ID_HEX = "000102030405060708090a0b0c0d0e0f";
+    /** Shared conformance vectors: sdk/shared/conformance/eval_zbrt_vectors.json. */
+    private static final JsonNode SHARED_VECTORS = loadSharedVectors();
+
+    private static JsonNode loadSharedVectors() {
+        Path current = Paths.get("").toAbsolutePath();
+        while (current != null) {
+            Path candidate = current.resolve("sdk/shared/conformance/eval_zbrt_vectors.json");
+            if (Files.isRegularFile(candidate)) {
+                try {
+                    return Json.MAPPER.readTree(candidate.toFile());
+                } catch (IOException e) {
+                    throw new IllegalStateException("cannot read " + candidate, e);
+                }
+            }
+            current = current.getParent();
+        }
+        throw new IllegalStateException(
+                "shared conformance vectors not found from " + Paths.get("").toAbsolutePath());
+    }
+
+    /** Golden frame hex for a named shared vector. */
+    private static String sharedVectorHex(String name) {
+        for (JsonNode vector : SHARED_VECTORS.get("vectors")) {
+            if (name.equals(vector.path("name").asText())) {
+                return vector.path("expected_frame_hex").asText();
+            }
+        }
+        throw new IllegalStateException("missing shared vector: " + name);
+    }
+
+    private static final String GOLDEN_REQUEST_ID_HEX =
+            SHARED_VECTORS.path("request_id_hex").asText();
 
     private FakeZbrtServer server;
 
@@ -65,9 +102,7 @@ class ZbrtClientTest {
         });
         ExecResult result = zbrtSandbox().eval("1+1", "/workspace", 5.0);
         assertEquals(
-                "5a42525401030000000102030405060708090a0b0c0d0e0f00000027"
-                        + "02000000046576616c00000003312b31"
-                        + "010000000a2f776f726b73706163650000000000001388",
+                sharedVectorHex("EVAL_ZBRT_BASIC"),
                 normalizedFrameHex(captured.get()),
                 "EVAL_ZBRT_BASIC wire bytes");
         assertExecuteFields(captured.get(), List.of("eval", "1+1"), "/workspace", 5000);
@@ -88,9 +123,7 @@ class ZbrtClientTest {
         });
         ExecResult defaults = zbrtSandbox().eval("print(40+2)");
         assertEquals(
-                "5a42525401030000000102030405060708090a0b0c0d0e0f00000021"
-                        + "02000000046576616c0000000b7072696e742834302b3229"
-                        + "000000000000000000",
+                sharedVectorHex("EVAL_ZBRT_DEFAULTS"),
                 normalizedFrameHex(capturedDefaults.get()),
                 "EVAL_ZBRT_DEFAULTS wire bytes");
         assertExecuteFields(capturedDefaults.get(), List.of("eval", "print(40+2)"), null, 0);

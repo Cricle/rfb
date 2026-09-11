@@ -177,15 +177,43 @@ public class ZbrtClientTests
 /// </summary>
 public class EvalZbrtVectorTests
 {
-    private static readonly byte[] RequestId = Hex.ToBytes("000102030405060708090a0b0c0d0e0f");
+    private static readonly JsonElement SharedVectors = LoadSharedVectors();
 
-    // EVAL_ZBRT_BASIC: eval('1+1', cwd='/workspace', timeout_s=5)
-    private const string BasicHex =
-        "5a42525401030000000102030405060708090a0b0c0d0e0f0000002702000000046576616c00000003312b31010000000a2f776f726b73706163650000000000001388";
+    private static JsonElement LoadSharedVectors()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName, "sdk", "shared", "conformance",
+                "eval_zbrt_vectors.json");
+            if (File.Exists(candidate))
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(candidate));
+                return doc.RootElement.Clone();
+            }
 
-    // EVAL_ZBRT_DEFAULTS: eval('print(40+2)') — no cwd, no timeout
-    private const string DefaultsHex =
-        "5a42525401030000000102030405060708090a0b0c0d0e0f0000002102000000046576616c0000000b7072696e742834302b3229000000000000000000";
+            dir = dir.Parent;
+        }
+
+        throw new InvalidOperationException(
+            $"shared conformance vectors not found from {AppContext.BaseDirectory}");
+    }
+
+    private static string SharedVectorHex(string name)
+    {
+        foreach (var vector in SharedVectors.GetProperty("vectors").EnumerateArray())
+        {
+            if (vector.GetProperty("name").GetString() == name)
+            {
+                return vector.GetProperty("expected_frame_hex").GetString()!;
+            }
+        }
+
+        throw new InvalidOperationException($"missing shared vector: {name}");
+    }
+
+    private static readonly byte[] RequestId =
+        Hex.ToBytes(SharedVectors.GetProperty("request_id_hex").GetString()!);
 
     private static ZbrtFrame EvalFrame(string code, string? cwd, double? timeoutS)
     {
@@ -202,7 +230,7 @@ public class EvalZbrtVectorTests
     public void Eval_Zbrt_MatchesSharedVector()
     {
         var frame = EvalFrame("1+1", "/workspace", 5);
-        Assert.Equal(BasicHex, Hex.Of(ZbrtFrameCodec.Encode(frame)));
+        Assert.Equal(SharedVectorHex("EVAL_ZBRT_BASIC"), Hex.Of(ZbrtFrameCodec.Encode(frame)));
         var exec = ZbrtFrameCodec.DecodeExecute(frame.Payload);
         Assert.Equal(2, exec.Argv.Count);
         Assert.Equal(new[] { "eval", "1+1" }, exec.Argv);
@@ -211,7 +239,7 @@ public class EvalZbrtVectorTests
         Assert.Equal(5000u, exec.TimeoutMs);
 
         var defaults = EvalFrame("print(40+2)", null, null);
-        Assert.Equal(DefaultsHex, Hex.Of(ZbrtFrameCodec.Encode(defaults)));
+        Assert.Equal(SharedVectorHex("EVAL_ZBRT_DEFAULTS"), Hex.Of(ZbrtFrameCodec.Encode(defaults)));
         var exec2 = ZbrtFrameCodec.DecodeExecute(defaults.Payload);
         Assert.Equal(2, exec2.Argv.Count);
         Assert.Equal(new[] { "eval", "print(40+2)" }, exec2.Argv);
