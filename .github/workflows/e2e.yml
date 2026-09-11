@@ -256,6 +256,23 @@ jobs:
           emit_diag /tmp/e2e-diag.txt e2e-tests
           exit "$rc"
 
+      # 沙箱全面基准（真实快照）：create/ping/stream/exec/cleanup 分位数 +
+      # 多沙箱 workload 聚合。JSON 同时进 run 日志与 logs 目录，随
+      # forkd-e2e-logs artifact 归档，便于跨 run 对比性能回归。
+      - name: Sandbox benchmark (forkd micro + workload, JSON archive)
+        run: |
+          set -euo pipefail
+          TAG="ci-e2e-$GITHUB_RUN_ID"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          export FORKD_SNAPSHOT_TAG="$TAG"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          ./target/release/rfb-cli forkd benchmark --tag "$TAG" --n 20 --json \
+            | tee "$RUN_DIR/bench-forkd.json"
+          ./target/release/rfb-cli forkd workload --tag "$TAG" \
+            --sandboxes 3 --rounds 2 --reuse-execs 25 --json \
+            | tee "$RUN_DIR/bench-workload.json"
+
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
       # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
       # FORKD_TOKEN），日志天然脱敏 —— 若未来引入认证，必须先过滤再上传。
