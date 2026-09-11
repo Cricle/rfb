@@ -347,6 +347,32 @@ jobs:
           done
           sample after-destroy
 
+      # ZeroBoot/ZBRT 基准（与 forkd 并列的第二后端）：先构建 zeroboot-zbrt
+      # rootfs，再跑 full-protocol acceptance + 100 样本往返 bench，最后跑
+      # 容量基准（冷启动、并发阶梯 1/2/4/8/16、按内存档采样 Firecracker RSS）。
+      - name: ZeroBoot benchmark (acceptance + round trips + capacity ladder + RSS)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          KERNEL="$PWD/resx/kernel/vmlinux-arcbox-0.0.24"
+          ZB_ROOTFS="$PWD/resx/rootfs/zeroboot-zbrt.ext4"
+          FC=/usr/local/bin/firecracker
+
+          ./target/release/rfb-cli image build-rootfs \
+            target/x86_64-unknown-linux-musl/release/rfb-runtime \
+            "$ZB_ROOTFS" --mode zeroboot-zbrt --force
+
+          ./target/release/rfb-cli zeroboot verify --bench --require-vm \
+            --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" --json \
+            | tee "$RUN_DIR/bench-zeroboot-verify.json"
+
+          cargo build -p rfb-ben --release
+          ./target/release/rfb-ben zbrt \
+            --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" \
+            --samples 100 --warmup 5 --levels 1,2,4,8,16 --rounds 4 --mem-mib 512 \
+            --json-out "$RUN_DIR/bench-zeroboot.json" | tee "$RUN_DIR/bench-zeroboot.log"
+
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
       # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
       # FORKD_TOKEN），日志天然脱敏 —— 若未来引入认证，必须先过滤再上传。
