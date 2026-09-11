@@ -582,6 +582,9 @@ pub struct ForkdSandboxArgs {
     pub tag: String,
     /// Give the sandbox its own network namespace. Required for concurrent
     /// sandboxes: the shared host tap admits only one live sandbox at a time.
+    /// Needs a root-provisioned netns pool (`scripts/netns-setup.sh N` from the
+    /// forkd checkout); each guest is then reachable only through the
+    /// controller, which runs commands inside that namespace.
     #[arg(long)]
     pub per_child_netns: bool,
 }

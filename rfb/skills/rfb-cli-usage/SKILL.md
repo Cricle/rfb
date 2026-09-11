@@ -44,8 +44,11 @@ rfb-cli forkd snapshot-info --tag my-snap
 ```bash
 rfb-cli forkd sandbox-create --tag my-snap
 # 输出 JSON 包含 sandbox id 和 guest_addr
-# 共享 tap 同时只允许一个存活沙箱；要并发多个请加 --per-child-netns
-rfb-cli forkd sandbox-create --tag my-snap --per-child-netns
+# 共享 tap 同时只允许一个存活沙箱；并发需先用 root 建 netns 池
+# （forkd 仓库的 scripts/netns-setup.sh N，需重启 controller），再加：
+#   rfb-cli forkd sandbox-create --tag my-snap --per-child-netns
+# 注意：netns 内 guest 只能由 controller 进 netns 代理访问，直连
+# guest_addr 的 NDJSON/ZBRT 传输在该模式下不可用。
 ```
 
 ### 4. 在沙箱内执行命令

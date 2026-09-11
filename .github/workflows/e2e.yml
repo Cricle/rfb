@@ -273,11 +273,14 @@ jobs:
             --sandboxes 3 --rounds 2 --reuse-execs 25 --json \
             | tee "$RUN_DIR/bench-workload.json"
 
-      # 沙箱启动吞吐 + 资源占用：并行发起 N 个独立创建请求测「每秒启动数」，
-      # 并在创建前/创建后/稳定期/销毁后四个时点采样 forkd-controller 与全部
-      # firecracker 进程的 RSS、CPU ticks、FD 数。部分创建失败不判红（记录
-      # n_created），结果写入 bench-resources.jsonl 随 artifact 归档。
-      - name: Sandbox burst benchmark (parallel starts + memory/CPU sampling)
+      # 沙箱启动吞吐 + 资源占用：共享 tap 模式下一次只允许一个存活沙箱
+      # （并发 create 会被 controller 以 503 拒绝；per_child_netns 需要 root
+      # 预置的 netns 池，且 netns 内的 guest 只能由 controller 进 netns 代理
+      # 访问），故这里测该部署模式下真实的「每秒启动数」：create→destroy
+      # 顺序循环；并行能力仅记录为 unsupported。同时在循环前/后/稳定期/
+      # 销毁后采样 forkd-controller 与全部 firecracker 进程的 RSS、CPU
+      # ticks、FD 数，结果写入 bench-resources.jsonl 随 artifact 归档。
+      - name: Sandbox start-rate benchmark (sequential cycles + memory/CPU sampling)
         run: |
           set -euo pipefail
           TAG="ci-e2e-$GITHUB_RUN_ID"
@@ -327,24 +330,45 @@ jobs:
           N=6
           sample idle
           start=$(date +%s.%N)
+          created=0
           for i in $(seq 1 "$N"); do
-            ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --per-child-netns --json \
-              > "$RUN_DIR/burst-$i.json" 2>&1 &
+            ok=0
+            for attempt in 1 2 3; do
+              if ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --json \
+                   > "$RUN_DIR/seq-$i.json" 2>&1; then
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            [ "$ok" = 1 ] || continue
+            created=$((created + 1))
+            sid=$(python3 -c '
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          if isinstance(data, list) and data:
+              data = data[0]
+          print(data.get("id", "") if isinstance(data, dict) else "")
+          ' "$RUN_DIR/seq-$i.json" 2>/dev/null || true)
+            [ -n "$sid" ] || continue
+            # destroy 会向 controller 确认列表里已无该 id 才返回，因此返回即
+            # 表示共享 tap 已释放，下一次 create 可以安全发起。
+            ./target/release/rfb-cli forkd sandbox-destroy "$sid" --json > /dev/null 2>&1 || true
           done
-          wait || true
           end=$(date +%s.%N)
-          created=$( { grep -l '"guest_addr"' "$RUN_DIR"/burst-*.json 2>/dev/null || true; } | wc -l)
           python3 -c '
           import sys
           n, created, start, end = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
           wall = max(end - start, 0.001)
-          print("{\"label\":\"burst\",\"n_requested\":%d,\"n_created\":%d,\"wall_s\":%.3f,\"starts_per_sec\":%.2f}"
+          print("{\"label\":\"sequential\",\"n_requested\":%d,\"n_created\":%d,\"wall_s\":%.3f,\"starts_per_sec\":%.2f}"
                 % (n, created, wall, created / wall))
           ' "$N" "$created" "$start" "$end" | tee -a "$OUT"
+          echo '{"label":"parallel","status":"unsupported","reason":"shared tap admits one live sandbox; per_child_netns needs a root-provisioned netns pool (sudo scripts/netns-setup.sh N) and controller-mediated guest access"}' \
+            | tee -a "$OUT"
           sample after-burst
           sleep 3
           sample steady
-          for f in "$RUN_DIR"/burst-*.json; do
+          for f in "$RUN_DIR"/seq-*.json; do
             sid=$(python3 -c '
           import json, sys
           data = json.load(open(sys.argv[1]))
