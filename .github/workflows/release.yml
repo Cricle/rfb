@@ -92,7 +92,7 @@ jobs:
           generate_release_notes: true
       # CLI 二进制供 pypi / nuget job 打包（rfb-cli / Rfb.Cli）。
       - name: Upload CLI binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rfb-cli-linux-x64
           path: dist/rfb-cli
