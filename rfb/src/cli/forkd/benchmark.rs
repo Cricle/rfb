@@ -76,7 +76,9 @@ pub async fn benchmark(
             outcome.failure += 1;
         }
 
-        // Wait for the guest listener before measuring RPC latency.
+        // Wait for the guest listener before measuring RPC latency; the wait
+        // is itself part of the start path users feel, so record it.
+        let ready_started = Instant::now();
         if wait_for_guest_ready(&address, GUEST_READY_DEADLINE)
             .await
             .is_err()
@@ -85,6 +87,10 @@ pub async fn benchmark(
             let _ = destroy_sandbox(url, &sid).await;
             continue;
         }
+        samples
+            .entry("ready".into())
+            .or_default()
+            .push(ready_started.elapsed().as_nanos() as u64);
         // guest ping (health)
         let t = Instant::now();
         let ping = ForkdGuestClient::new(address.clone()).ping().await;

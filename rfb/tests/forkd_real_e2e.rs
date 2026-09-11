@@ -45,6 +45,7 @@ const ACCEPTANCE_CHECKS: &[&str] = &[
 const ACCEPTANCE_NEGATIVES: &[&str] = &["ls_escape", "ls_zero_limit", "grep_too_many_bytes"];
 const BENCH_STAGES: &[&str] = &[
     "create",
+    "ready",
     "controller_ping",
     "health",
     "stream",
