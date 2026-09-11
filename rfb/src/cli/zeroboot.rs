@@ -226,7 +226,9 @@ pub fn verify(
     let linux = matches!(caps.kind, HostKind::Linux | HostKind::Wsl);
     if !linux || !caps.kvm {
         if require_vm {
-            return Err(external("Linux/KVM are required for ZBRT verify"));
+            return Err(crate::cli::error::no_vm(
+                "Linux/KVM are required for ZBRT verify",
+            ));
         }
         return Ok(json!({"status": "skipped", "reason": "Linux/KVM unavailable"}));
     }

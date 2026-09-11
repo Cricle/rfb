@@ -118,27 +118,29 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let n=n?;
                 if n>0 { write_json(writer,json!({"err":String::from_utf8_lossy(&eb[..n])})).await?; }
             }
-            n=reader.read_until(b'\n',&mut input)=>{
-                let n = n?;
-                if n == 0 {
-                    terminate(&mut child).await;
-                    let _ = child.wait().await;
-                    drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                    // A client-side stdin EOF ends the session with a clean
-                    // terminal frame (no `error` key: the host turns any
-                    // string `error` into a fatal Remote failure).
-                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
-                    return Ok(());
-                }
-                if input.len() > MAX_LINE {
-                    // Oversized input line: kill the child and still emit the
-                    // terminal frame so the host session cannot hang until its
-                    // read timeout.
-                    terminate(&mut child).await;
-                    let _ = child.wait().await;
-                    drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
-                    write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
-                    return Ok(());
+            outcome = read_line_bounded(reader, &mut input, MAX_LINE) => {
+                match outcome? {
+                    LineReadOutcome::Eof => {
+                        terminate(&mut child).await;
+                        let _ = child.wait().await;
+                        drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        // A client-side stdin EOF ends the session with a clean
+                        // terminal frame (no `error` key: the host turns any
+                        // string `error` into a fatal Remote failure).
+                        write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
+                        return Ok(());
+                    }
+                    LineReadOutcome::TooLong => {
+                        // Oversized input line: kill the child and still emit
+                        // the terminal frame so the host session cannot hang
+                        // until its read timeout.
+                        terminate(&mut child).await;
+                        let _ = child.wait().await;
+                        drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
+                        return Ok(());
+                    }
+                    LineReadOutcome::Line => {}
                 }
                 let v:Value=serde_json::from_slice(input.trim_ascii()).unwrap_or(Value::Null);
                 if v.get("action").and_then(Value::as_str)==Some("stop") {
@@ -151,10 +153,84 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                     return Ok(());
                 } else if let Some(text)=v.get("in").and_then(Value::as_str) {
-                    stdin.write_all(text.as_bytes()).await?;
-                    stdin.flush().await?;
+                    // Bound the forward: a child that stops draining its stdin
+                    // must not make the stop/timeout paths unreachable (the
+                    // select cannot poll other branches while this arm body is
+                    // awaiting a full pipe).
+                    let write = async {
+                        stdin.write_all(text.as_bytes()).await?;
+                        stdin.flush().await
+                    };
+                    match tokio::time::timeout(STDIN_FORWARD_TIMEOUT, write).await {
+                        Ok(Ok(())) => {}
+                        // Broken pipe: the child is gone; the wait branch
+                        // reaps it and emits the real terminal frame.
+                        Ok(Err(error)) => {
+                            eprintln!("rfb-agent: stream stdin write failed: {error}");
+                        }
+                        Err(_) => {
+                            terminate(&mut child).await;
+                            let _ = child.wait().await;
+                            drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                            write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
+                            return Ok(());
+                        }
+                    }
                 }
-                input.clear();
+            }
+        }
+    }
+}
+
+/// How long a single stdin forward may block before the session is
+/// force-terminated. Bounds how long a full child pipe can delay the
+/// stop/timeout paths (the select cannot poll other branches while this arm
+/// body is awaiting a write).
+const STDIN_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum LineReadOutcome {
+    /// A complete line (or a trailing partial line at EOF) sits in the buffer.
+    Line,
+    /// Clean end of stream with no buffered bytes.
+    Eof,
+    /// The line exceeded the cap; no further bytes were buffered.
+    TooLong,
+}
+
+/// Bounded line read: never buffers more than `cap` bytes of one line, unlike
+/// `AsyncBufReadExt::read_until` which grows the buffer until a newline
+/// arrives (a newline-free flood would otherwise OOM the agent).
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<LineReadOutcome> {
+    out.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if out.is_empty() {
+                LineReadOutcome::Eof
+            } else {
+                LineReadOutcome::Line
+            });
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(position) => {
+                if out.len() + position + 1 > cap {
+                    return Ok(LineReadOutcome::TooLong);
+                }
+                out.extend_from_slice(&available[..=position]);
+                reader.consume(position + 1);
+                return Ok(LineReadOutcome::Line);
+            }
+            None => {
+                if out.len() + available.len() > cap {
+                    return Ok(LineReadOutcome::TooLong);
+                }
+                let take = available.len();
+                out.extend_from_slice(available);
+                reader.consume(take);
             }
         }
     }

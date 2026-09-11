@@ -405,7 +405,10 @@ impl RuntimeService {
         let failed = responses
             .iter()
             .any(|r| matches!(r, RuntimeMessage::Error { .. }));
-        if finished {
+        // A worker failure also ends the turn: keeping the session "active"
+        // after an Error response would wedge every later request on it
+        // ("session already has an active request" forever).
+        if finished || failed {
             self.active_sessions.remove(&session_id);
         }
         if cancelled {

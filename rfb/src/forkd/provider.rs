@@ -399,8 +399,12 @@ impl Sandbox for ForkdSandbox {
             };
             Ok(core_guest::EvalResult {
                 output,
+                // The forkd agent answers eval with `status` (PROTOCOL.md
+                // §2.4); `exit_code` is the legacy/exec alias some agents
+                // still send — accept both so status is never silently None.
                 status: v
-                    .get("exit_code")
+                    .get("status")
+                    .or_else(|| v.get("exit_code"))
                     .and_then(|x| x.as_i64())
                     .map(|x| x as i32),
                 timed_out: v

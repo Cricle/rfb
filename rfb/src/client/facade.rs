@@ -692,9 +692,16 @@ impl GuestStream {
             return Ok(None);
         }
         let event = match &mut self.inner {
-            StreamInner::Ndjson(inner) => match inner.next_event().await? {
-                Some(value) => ndjson::stream_event(value)?,
-                None => None,
+            StreamInner::Ndjson(inner) => loop {
+                match inner.next_event().await? {
+                    None => break None,
+                    Some(value) => {
+                        if let Some(event) = ndjson::stream_event(value)? {
+                            break Some(event);
+                        }
+                        // Unrecognized frame: skip it and read on (PROTOCOL.md §2.5).
+                    }
+                }
             },
             #[cfg(feature = "zeroboot")]
             StreamInner::Zbrt(inner) => inner.next_event().await?,

@@ -65,6 +65,40 @@ pub fn prepare_process(command: &mut Command, piped: bool) {
     }
 }
 
+/// Per-stream capture cap for `exec`: the response carries each stream twice
+/// (out/stdout, err/stderr aliases), so 128 KiB per stream keeps the
+/// serialized response far below the 1 MiB wire limit. Output beyond the cap
+/// is drained but dropped, and `truncated` is set.
+const MAX_EXEC_STREAM_BYTES: usize = 128 * 1024;
+
+/// Read a child stream to EOF, keeping at most `limit` bytes. Draining past
+/// the cap keeps the child from blocking on a full pipe.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    use tokio::io::AsyncReadExt;
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if data.len() < limit {
+            let take = (limit - data.len()).min(n);
+            data.extend_from_slice(&buf[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((data, truncated))
+}
+
 pub async fn execute(request: &Value) -> io::Result<Value> {
     let timeout = request
         .get("timeout")
@@ -78,13 +112,36 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
     }
     let mut command = command_from(request)?;
     prepare_process(&mut command, false);
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
     let child_id = child.id();
-    let output = if let Some(limit) = timeout {
-        match tokio::time::timeout(limit, child.wait_with_output()).await {
-            Ok(output) => output?,
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    // Drain both pipes concurrently and wait for exit in one future: a
+    // sequential read would deadlock against a child that fills the pipe we
+    // are not reading. Captures are bounded, so a runaway writer cannot grow
+    // host memory before the wire-size check runs.
+    let wait = async {
+        let (out, err, status) = tokio::try_join!(
+            read_bounded(&mut stdout, MAX_EXEC_STREAM_BYTES),
+            read_bounded(&mut stderr, MAX_EXEC_STREAM_BYTES),
+            child.wait(),
+        )?;
+        Ok::<_, io::Error>((out, err, status))
+    };
+    let (out, err, truncated, status) = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, wait).await {
+            Ok(result) => {
+                let ((out, out_truncated), (err, err_truncated), status) = result?;
+                (out, err, out_truncated || err_truncated, status)
+            }
             Err(_) => {
-                // `wait_with_output` owns the child while it is polled. Kill its
+                // The wait future owns the child while it is polled. Kill its
                 // process group before dropping the cancelled future so a timed
                 // out command cannot outlive the request.
                 terminate_id(child_id).await;
@@ -99,21 +156,25 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
                     "stdout": "",
                     "stderr": "process timeout",
                     "exit_code": null,
-                    "timed_out": true
+                    "timed_out": true,
+                    "truncated": false
                 }));
             }
+        },
+        None => {
+            let ((out, out_truncated), (err, err_truncated), status) = wait.await?;
+            (out, err, out_truncated || err_truncated, status)
         }
-    } else {
-        child.wait_with_output().await?
     };
     Ok(json!({
-        "out": String::from_utf8_lossy(&output.stdout),
-        "err": String::from_utf8_lossy(&output.stderr),
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
-        "exit_code": output.status.code(),
+        "out": String::from_utf8_lossy(&out),
+        "err": String::from_utf8_lossy(&err),
+        "stdout": String::from_utf8_lossy(&out),
+        "stderr": String::from_utf8_lossy(&err),
+        "exit_code": status.code(),
         "error": null,
-        "timed_out": false
+        "timed_out": false,
+        "truncated": truncated
     }))
 }
 

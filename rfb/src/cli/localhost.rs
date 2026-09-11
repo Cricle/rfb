@@ -26,6 +26,13 @@ pub fn require_localhost(base_url: &str) -> Result<String, CliError> {
             "URL must target localhost only: {base_url}"
         )));
     }
+    // A base URL with a path would be concatenated into every request path
+    // ("http://127.0.0.1:8889/x" + "/v1/snapshots") and silently 404.
+    if !parsed.path().is_empty() && parsed.path() != "/" {
+        return Err(validation(format!(
+            "URL must not include a path: {base_url}"
+        )));
+    }
     Ok(trimmed)
 }
 

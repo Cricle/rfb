@@ -157,7 +157,13 @@ impl ForkdClient {
                 "forkd URL must include http(s) scheme and host".into(),
             ));
         }
-        let client = Client::builder().timeout(timeout).build()?;
+        let client = Client::builder()
+            .timeout(timeout)
+            // The controller is a loopback-only service: following redirects
+            // would let it bounce requests to arbitrary hosts (and 301/302
+            // would silently rewrite POST into GET).
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -180,11 +186,34 @@ impl ForkdClient {
         }
     }
 
+    /// Read a response body with a hard size cap: the client is loopback-only
+    /// in normal use, but a broken/hostile controller must not OOM the CLI.
+    async fn read_body_capped(mut response: reqwest::Response) -> Result<String, ForkdClientError> {
+        const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+        if let Some(length) = response.content_length() {
+            if length > MAX_BODY_BYTES as u64 {
+                return Err(ForkdClientError::Decode(
+                    "controller response too large".into(),
+                ));
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > MAX_BODY_BYTES {
+                return Err(ForkdClientError::Decode(
+                    "controller response too large".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+
     async fn parse<T: for<'de> Deserialize<'de>>(
         response: reqwest::Response,
     ) -> Result<T, ForkdClientError> {
         let status = response.status();
-        let body = response.text().await?;
+        let body = Self::read_body_capped(response).await?;
         if !status.is_success() {
             let message = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()

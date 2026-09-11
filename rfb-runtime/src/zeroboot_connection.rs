@@ -398,12 +398,28 @@ async fn handle_fs(
         Ok(v) => v,
         Err(_) => return Ok(Some(fail_closed_error(request_id, "invalid Fs payload"))),
     };
+    // filesystem_rpc performs blocking filesystem work (tree walks, recursive
+    // size accounting, file copies). The guest runtime is current_thread, so
+    // running it inline would stall every other session and all timers for
+    // the duration of the walk — move it to the blocking pool instead.
     let result = {
         let normalized = normalize_workspace_path(&fs.path);
-        service
-            .lock()
-            .await
-            .filesystem_rpc(fs.op, &normalized, &fs.data)
+        let service = Arc::clone(service);
+        let (op, data) = (fs.op, fs.data);
+        match tokio::task::spawn_blocking(move || {
+            let mut guard = service.blocking_lock();
+            guard.filesystem_rpc(op, &normalized, &data)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(Some(fail_closed_error(
+                    request_id,
+                    &format!("fs rpc task failed: {error}"),
+                )));
+            }
+        }
     };
     match result {
         Ok(payload) => Ok(Some(Frame {

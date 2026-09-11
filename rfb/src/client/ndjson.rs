@@ -113,5 +113,7 @@ pub(super) fn stream_event(value: Value) -> Result<Option<StreamEvent>, RfbError
             }));
         }
     }
-    Err(RfbError::Decode("invalid guest stream event".to_owned()))
+    // PROTOCOL.md §2.5: unrecognized event keys are ignored (None) so future
+    // frame additions do not break existing clients.
+    Ok(None)
 }

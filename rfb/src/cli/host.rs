@@ -4,7 +4,7 @@
 //! "can I run a real VM here?" decisions, replacing the per-script heuristics
 //! that used to live in `preflight.sh` and `setup-runtime.sh`.
 
-use crate::cli::error::{usage, CliError};
+use crate::cli::error::{no_vm, usage, CliError};
 use crate::cli::tool::{host_kind, kvm_available, HostKind};
 use serde_json::{json, Value};
 
@@ -94,38 +94,41 @@ pub fn require_arch(arch: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Require a real VM-capable Linux/WSL host (KVM + x86_64).
+/// Require a real VM-capable Linux/WSL host (KVM + x86_64). Missing VM
+/// prerequisites carry the documented exit-12 contract (`EXIT_NOVM`), not the
+/// usage exit code — acceptance gates and CI assert on it.
 pub fn require_vm_host() -> Result<HostCapabilities, CliError> {
     let caps = detect();
     if !matches!(caps.kind, HostKind::Linux | HostKind::Wsl) {
-        return Err(usage("a Linux/WSL host is required for VM operations"));
+        return Err(no_vm("a Linux/WSL host is required for VM operations"));
     }
     if caps.arch != "x86_64" {
-        return Err(usage(
+        return Err(no_vm(
             "x86_64 host architecture is required for VM operations",
         ));
     }
     if !caps.kvm {
-        return Err(usage("/dev/kvm is unavailable or not read-write"));
+        return Err(no_vm("/dev/kvm is unavailable or not read-write"));
     }
     Ok(caps)
 }
 
 /// Run the read-only preflight gate. `require_vm` makes blocked prerequisites
-/// a hard error (exit `EXIT_EXTERNAL=5`); otherwise the caller reports SKIP.
+/// a hard error carrying the documented `EXIT_NOVM=12` contract; otherwise the
+/// caller reports SKIP.
 pub fn preflight(require_vm: bool) -> Result<HostCapabilities, CliError> {
     let caps = detect();
     if !matches!(caps.kind, HostKind::Linux | HostKind::Wsl) {
         if require_vm {
-            return Err(usage("Linux/WSL required"));
+            return Err(no_vm("Linux/WSL required"));
         }
         return Ok(caps);
     }
     if caps.arch != "x86_64" && require_vm {
-        return Err(usage("x86_64 required"));
+        return Err(no_vm("x86_64 required"));
     }
     if !caps.kvm && require_vm {
-        return Err(usage("/dev/kvm is unavailable or not read-write"));
+        return Err(no_vm("/dev/kvm is unavailable or not read-write"));
     }
     Ok(caps)
 }

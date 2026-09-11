@@ -13,7 +13,11 @@ pub(super) fn fs_path(path: &str) -> Result<(), RfbError> {
     if path.is_empty()
         || path.len() > MAX_GUEST_PATH_BYTES
         || path.as_bytes().contains(&0)
-        || (path.starts_with('/') && !path.starts_with("/workspace"))
+        // PROTOCOL.md §2.3: an absolute fs path must be /workspace itself or
+        // a child of it — "/workspacefoo" is NOT inside the workspace.
+        || (path.starts_with('/')
+            && path != "/workspace"
+            && !path.starts_with("/workspace/"))
         || path.contains('\\')
         || path.split('/').any(|component| component == "..")
     {
