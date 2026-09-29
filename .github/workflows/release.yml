@@ -39,7 +39,7 @@ jobs:
   crates:
     name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     # Only the crates job creates the GitHub Release.
     permissions:
       contents: write
@@ -163,6 +163,23 @@ jobs:
           fi
       - name: Build CLI
         run: cargo build -p rfb-sdk --features cli --release
+      # 沙箱 pid1（内嵌 RustPython/Lua 的 musl 多调用二进制）：SDK 使用者的
+      # "pid1 模式"——拿到这两个文件 + `rfb-cli image build-rootfs` 即可现场
+      # 做出自定义 rootfs，全程无 cargo。上传前 gzip：28+19MB → ~21MB；
+      # 不能用 upx——build-rootfs --with-python 靠二进制内的 RustPython
+      # 明文 marker 校验特性，压缩会破坏它。
+      - name: "Build sandbox pid1 (musl full: python + lua)"
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release -p rfb-runtime \
+            --target x86_64-unknown-linux-musl \
+            --features cli,rustpython,mlua
+          gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-runtime \
+            > dist/rfb-runtime.gz
+          gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-busybox \
+            > dist/rfb-busybox.gz
       - name: Package and checksum
         env:
           TAG: ${{ github.ref_name }}
@@ -175,12 +192,16 @@ jobs:
           tar -C dist -czf "dist/rfb-${TAG}.tar.gz" rfb-cli SHA256SUMS
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-cli-linux-x64" >> dist/SHA256SUMS
+          sha256sum "dist/rfb-runtime.gz" >> dist/SHA256SUMS
+          sha256sum "dist/rfb-busybox.gz" >> dist/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           files: |
             dist/rfb-${{ github.ref_name }}.tar.gz
             dist/rfb-cli-linux-x64
+            dist/rfb-runtime.gz
+            dist/rfb-busybox.gz
             dist/SHA256SUMS
           generate_release_notes: true
       # CLI 二进制供 npm / nuget job 打包（rfb-cli / Rfb.Cli；两者都是
