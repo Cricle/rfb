@@ -100,7 +100,11 @@
           <plugin>
             <groupId>org.sonatype.central</groupId>
             <artifactId>central-publishing-maven-plugin</artifactId>
-            <version>0.6.0</version>
+            <!-- 0.6.0 cannot parse the Central API's newer deployment
+                 response (UnrecognizedPropertyException on the added
+                 "warnings" field) and dies AFTER the bundle is uploaded,
+                 failing the job while Central auto-publishes anyway. -->
+            <version>0.11.0</version>
             <extensions>true</extensions>
             <configuration>
               <publishingServerId>central</publishingServerId>
