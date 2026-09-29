@@ -3,6 +3,7 @@ BOTH transports (ndjson default and zbrt) with identical result shapes."""
 
 import json
 import socket
+import time
 import unittest
 
 import rfb_sdk
@@ -356,6 +357,13 @@ class FacadeZbrtTests(FacadeMixin, unittest.TestCase):
         # non-empty env object are rejected.
         sandbox = self._sandbox()
         sandbox.stream(["echo"], pty=False, env={})
+        # stream() returns after writing Execute; the fake guest's handler
+        # thread records it asynchronously (ThreadingTCPServer accepts on a
+        # ~50 ms poll), so wait for the record instead of racing its
+        # scheduler.
+        deadline = time.monotonic() + 5
+        while not self.guest.received_executes and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertEqual(len(self.guest.received_executes), 1)
 
     def test_stream_output_then_exit(self):
