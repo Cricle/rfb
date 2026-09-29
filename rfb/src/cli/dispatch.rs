@@ -7,7 +7,7 @@ use crate::cli::commands::{
     BenchCommand, CommandLine, ForkdCommand, ImageCommand, RunTarget, SkillsCommand,
 };
 #[cfg(unix)]
-use crate::cli::commands::{Rfb1Command, WebCommand, ZerobootCommand};
+use crate::cli::commands::{Rfb1Command, WebCommand};
 use crate::cli::error::{render_output, validation, CliError};
 use crate::cli::forkd;
 use crate::cli::host;
@@ -38,7 +38,7 @@ pub fn run(cli: crate::cli::commands::Cli) -> Result<(), CliError> {
         #[cfg(unix)]
         CommandLine::Rfb1 { command } => rfb1(cli.json, command),
         #[cfg(unix)]
-        CommandLine::Zeroboot { command } => zeroboot(cli.json, command),
+        CommandLine::Zeroboot { command } => crate::cli::zeroboot::dispatch(cli.json, command),
         CommandLine::Cleanup(args) => {
             let value = cleanup::cleanup(&args.target, args.dry_run, args.yes)?;
             render_output(cli.json, value, "cleanup".to_owned());
@@ -286,6 +286,12 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
             render_output(json_out, output.value, output.text);
             Ok(())
         }
+        #[cfg(unix)]
+        ForkdCommand::BackendUp(args) => {
+            let value = block_on(forkd::backend_up(&args))?;
+            render_output(json_out, value, "backend ready".to_owned());
+            Ok(())
+        }
         ForkdCommand::SnapshotInfo(args) => {
             let output = forkd::snapshot_info(&args)?;
             render_output(json_out, output.value, output.text);
@@ -310,23 +316,6 @@ fn rfb1(json_out: bool, command: Rfb1Command) -> Result<(), CliError> {
                 args.require_vm,
             )?;
             render_output(json_out, value, "rfb1 acceptance".to_owned());
-            Ok(())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn zeroboot(json_out: bool, command: ZerobootCommand) -> Result<(), CliError> {
-    match command {
-        ZerobootCommand::Verify(args) => {
-            let value = crate::cli::zeroboot::verify(
-                &args.kernel,
-                &args.rootfs,
-                &args.firecracker,
-                args.require_vm,
-                args.bench,
-            )?;
-            render_output(json_out, value, "zeroboot verify".to_owned());
             Ok(())
         }
     }
@@ -557,7 +546,7 @@ fn mem_available_mib() -> Option<u64> {
 ///
 /// Runtime construction is fallible; returning a CLI error keeps the binary
 /// from panicking with exit 101 when the host cannot create its executor.
-fn block_on<F, T>(future: F) -> Result<T, CliError>
+pub(crate) fn block_on<F, T>(future: F) -> Result<T, CliError>
 where
     F: std::future::Future<Output = Result<T, CliError>>,
 {

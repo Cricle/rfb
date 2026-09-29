@@ -27,3 +27,5 @@ pub mod tool;
 pub mod web_bench;
 #[cfg(unix)]
 pub mod zeroboot;
+#[cfg(unix)]
+pub mod zeroboot_backend;

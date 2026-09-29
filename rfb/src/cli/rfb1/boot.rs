@@ -37,7 +37,10 @@ pub fn firecracker_version_ok(firecracker: &str) -> bool {
     );
     text.lines()
         .next()
-        .map(|line| line.contains("v1.12."))
+        // v1.12.x is the resx-pinned baseline; v1.16.x additionally works on
+        // hosts (WSL2 nested KVM) where v1.12 snapshot restore panics the
+        // guest kernel. Older than v1.12 fails at the API stage.
+        .map(|line| line.contains("v1.12.") || line.contains("v1.16."))
         .unwrap_or(false)
 }
 
@@ -169,7 +172,7 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
     }
     if !firecracker_version_ok(firecracker) {
         return Err(validation(
-            "Firecracker v1.12.x is required (older releases fail at API stage)",
+            "Firecracker v1.12.x or v1.16.x is required (older releases fail at the API stage)",
         ));
     }
     fs::create_dir_all(work_dir).map_err(|error| io(error.to_string()))?;

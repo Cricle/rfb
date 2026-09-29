@@ -54,7 +54,7 @@ pub enum CommandLine {
     Zeroboot {
         /// ZeroBoot acceptance/benchmark subcommand.
         #[command(subcommand)]
-        command: ZerobootCommand,
+        command: crate::cli::zeroboot::ZerobootCommand,
     },
     /// Scoped artifact cleanup in an rfb-runtime tree.
     Cleanup(CleanupArgs),
@@ -151,6 +151,10 @@ pub enum ForkdCommand {
     SandboxDestroy(ForkdSandboxDestroyArgs),
     /// Create a snapshot through the official `forkd` binary (thin wrapper).
     SnapshotCreate(ForkdSnapshotCreateArgs),
+    /// Bring a local forkd backend up in one command: pid1 → rootfs (no
+    /// cargo), leftover cleanup, TAP, controller process, snapshot ready.
+    #[cfg(unix)]
+    BackendUp(ForkdBackendUpArgs),
     /// Show snapshot info through the official `forkd` binary (thin wrapper).
     SnapshotInfo(ForkdSnapshotInfoArgs),
     /// Delete a snapshot through the official `forkd` binary (thin wrapper).
@@ -163,14 +167,6 @@ pub enum ForkdCommand {
 pub enum Rfb1Command {
     /// Run RFB1 StartTurn/full-protocol acceptance against a real Firecracker v1.12.x VM.
     Acceptance(Rfb1AcceptanceArgs),
-}
-
-/// ZeroBoot ZBRT real-VM verification subcommands.
-#[cfg(unix)]
-#[derive(Subcommand, Debug)]
-pub enum ZerobootCommand {
-    /// Run ZeroBoot ZBRT VERSION=1 full-protocol verification (echo/true/false/concurrent/malformed).
-    Verify(ZerobootVerifyArgs),
 }
 
 /// A single image manifest path argument.
@@ -672,7 +668,50 @@ pub struct ForkdSnapshotCreateArgs {
     pub require_provenance: bool,
 }
 
-/// Arguments for `rfb-cli forkd snapshot-info`.
+/// Arguments for `rfb-cli forkd backend-up`.
+#[cfg(unix)]
+#[derive(clap::Args, Debug)]
+pub struct ForkdBackendUpArgs {
+    /// Ready rootfs ext4 to serve (mutually exclusive with --pid1-dir).
+    #[arg(long, value_name = "EXT4")]
+    pub rootfs: Option<PathBuf>,
+    /// Directory holding the pid1 binaries (rfb-runtime + rfb-busybox
+    /// beside it); the rootfs is built from them into the state dir —
+    /// no cargo needed (image build-rootfs only assembles the ext4).
+    #[arg(long, value_name = "DIR")]
+    pub pid1_dir: Option<PathBuf>,
+    /// Install /bin/python3 (requires the pid1 built with the rustpython
+    /// feature).
+    #[arg(long)]
+    pub with_python: bool,
+    /// Install /bin/lua (requires the pid1 built with the mlua feature).
+    #[arg(long)]
+    pub with_lua: bool,
+    /// Allow a dynamically-linked pid1 in the built rootfs (development
+    /// builds; production images must be static musl).
+    #[arg(long)]
+    pub allow_dynamic: bool,
+    /// Guest kernel image (vmlinux).
+    #[arg(long, value_name = "VMLINUX")]
+    pub kernel: PathBuf,
+    /// Shared TAP device to create/bring up.
+    #[arg(long, default_value = "forkd-tap0")]
+    pub tap: String,
+    /// Controller bind address (loopback only: the daemon refuses
+    /// unauthenticated non-loopback binds).
+    #[arg(long, default_value = "127.0.0.1:8889")]
+    pub bind: String,
+    /// Snapshot tag to create (or wait for when already ready).
+    #[arg(long, default_value = "sample")]
+    pub tag: String,
+    /// Working state directory (controller state/logs, built rootfs);
+    /// defaults to ~/.local/share/rfb/backend.
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Fail closed unless the created snapshot reports complete provenance.
+    #[arg(long)]
+    pub require_provenance: bool,
+}
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotInfoArgs {
     /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
@@ -728,25 +767,4 @@ pub struct Rfb1AcceptanceArgs {
     /// Exit non-zero if prerequisites are missing.
     #[arg(long, help = "Exit non-zero if prerequisites are missing")]
     pub require_vm: bool,
-}
-
-/// Arguments for the ZeroBoot ZBRT real-VM verification.
-#[cfg(unix)]
-#[derive(clap::Args, Debug)]
-pub struct ZerobootVerifyArgs {
-    /// Kernel image path (default `/boot/vmlinux`).
-    #[arg(long, default_value = "/boot/vmlinux")]
-    pub kernel: PathBuf,
-    /// Rootfs ext4 image path (default `/tmp/rootfs.ext4`).
-    #[arg(long, default_value = "/tmp/rootfs.ext4")]
-    pub rootfs: PathBuf,
-    /// Firecracker binary to use (default `firecracker`).
-    #[arg(long, default_value = "firecracker")]
-    pub firecracker: String,
-    /// Exit non-zero if prerequisites are missing.
-    #[arg(long, help = "Exit non-zero if prerequisites are missing")]
-    pub require_vm: bool,
-    /// Run the 100-sample round-trip benchmark.
-    #[arg(long, help = "Run the 100-sample round-trip benchmark")]
-    pub bench: bool,
 }

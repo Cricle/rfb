@@ -12,6 +12,8 @@
 //! - cleanup is scoped to sandboxes created by the current invocation.
 
 mod acceptance;
+#[cfg(unix)]
+mod backend_up;
 mod benchmark;
 mod binding;
 mod preflight;
@@ -21,6 +23,8 @@ mod snapshot_paths;
 mod workload;
 
 pub use acceptance::acceptance;
+#[cfg(unix)]
+pub use backend_up::backend_up;
 pub use benchmark::benchmark;
 pub use binding::{load_snapshot_binding, snapshot_bind, BindingOutput};
 pub use preflight::{client_from_env, preflight, preflight_checks, preflight_text, PreflightCheck};
