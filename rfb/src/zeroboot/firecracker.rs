@@ -154,15 +154,22 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// One booted Firecracker microVM: the child process handle plus the sockets
+/// it was started with. Dropping it does not kill the VM — call [`Self::kill`]
+/// (the ZeroBoot provider drives the lifecycle).
 pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
     vsock_uds_path: Option<String>,
 }
 
+/// Firecracker vsock device configuration: the guest-visible CID and the
+/// host-side Unix socket the relay listens on.
 #[derive(Clone, Debug)]
 pub struct VsockConfig {
+    /// Virtio-vsock context id the guest sees.
     pub guest_cid: u32,
+    /// Host-side UDS path Firecracker proxies guest connections to.
     pub uds_path: String,
 }
 
@@ -396,6 +403,8 @@ impl FirecrackerVm {
         Ok(resp)
     }
 
+    /// Kill the Firecracker child and reap it. Idempotent and best-effort:
+    /// an already-exited child reports through `let _ =`.
     pub fn kill(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
@@ -697,6 +706,7 @@ fn baked_vsock_uds_path(vmstate_path: &str) -> Result<String> {
 }
 
 impl FirecrackerVm {
+    /// Host-side vsock relay UDS this VM was booted with, when any.
     pub fn vsock_uds_path(&self) -> Option<&str> {
         self.vsock_uds_path.as_deref()
     }

@@ -100,7 +100,7 @@ pub struct RustApps {
     pub apps: Vec<String>,
 }
 
-/// Parse a `build.rfb` script body into a [`BuildScript`], enforcing the
+/// Parse a `build.rfb` script body into a `BuildScript`, enforcing the
 /// schema tag and the mode vocabulary. Exposed for tests and diagnostics.
 pub fn parse_script(text: &str) -> Result<BuildScript, CliError> {
     let script: BuildScript = toml::from_str(text)

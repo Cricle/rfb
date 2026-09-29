@@ -4,23 +4,29 @@
 //! Each node is a standard forkd controller (`forkd-controller serve`, the
 //! same endpoint a single-host deployment uses) reachable over HTTP. The
 //! provider schedules each create onto a node, fails over to the remaining
-//! nodes on node-level faults, and trips a node after [`FAILURE_TRIP`]
-//! consecutive failures. The returned [`ClusterSandbox`] wraps the plain
-//! [`ForkdSandbox`]: exec/stream/filesystem route to the sandbox's guest
-//! address directly (never through the controller), teardown deletes the
-//! sandbox on the node that owns it, and dropping the handle releases the
-//! node's in-flight slot.
+//! nodes on node-level faults, and trips a node after
+//! [`FAILURE_TRIP`](crate::cluster::FAILURE_TRIP)
+//! consecutive failures. The returned
+//! [`ClusterSandbox`](crate::cluster::ClusterSandbox) wraps the plain
+//! [`ForkdSandbox`](crate::forkd::ForkdSandbox): exec/stream/filesystem route
+//! to the sandbox's guest address directly (never through the controller),
+//! teardown deletes the sandbox on the node that owns it, and dropping the
+//! handle releases the node's in-flight slot.
 //!
 //! # Scheduling signals are per-process
 //!
 //! `inflight` counts sandboxes this provider created and has not seen dropped
-//! (RAII guard) or explicitly released ([`ClusterProvider::release`]); it is a
-//! scheduling hint, never cluster truth. One process (or one shared
-//! [`ClusterProvider`] handle) should own the schedule loop: with several
-//! independent process schedulers, least-in-flight degrades to loose
-//! round-robin. Use [`ClusterProvider::list_all`] plus
-//! [`ClusterProvider::delete_on`] against the controllers themselves to find
-//! and clean up orphans, for example after an owner process died.
+//! (RAII guard) or explicitly released
+//! ([`ClusterProvider::release`](crate::cluster::ClusterProvider::release));
+//! it is a scheduling hint, never cluster truth. One process (or one shared
+//! [`ClusterProvider`](crate::cluster::ClusterProvider) handle) should own
+//! the schedule loop: with several independent process schedulers,
+//! least-in-flight degrades to loose round-robin. Use
+//! [`ClusterProvider::list_all`](crate::cluster::ClusterProvider::list_all)
+//! plus
+//! [`ClusterProvider::delete_on`](crate::cluster::ClusterProvider::delete_on)
+//! against the controllers themselves to find and clean up orphans, for
+//! example after an owner process died.
 //!
 //! # Failure classification
 //!
@@ -36,13 +42,15 @@
 //!
 //! # Half-open recovery
 //!
-//! After [`FAILURE_TRIP`] consecutive failures a node is skipped, but only
-//! until its recovery gate elapses: at most once per `recovery_interval`
-//! (default [`DEFAULT_RECOVERY_INTERVAL`], 30 s) a single create is let
-//! through as a lazy half-open probe. A successful probe clears the counter;
-//! a failed one only re-arms the gate. [`ClusterProvider::probe`] forces the
-//! same check immediately (and never counts a failure). No background task is
-//! involved: probes happen on the create path.
+//! After [`FAILURE_TRIP`](crate::cluster::FAILURE_TRIP) consecutive failures
+//! a node is skipped, but only until its recovery gate elapses: at most once
+//! per `recovery_interval` (default
+//! [`DEFAULT_RECOVERY_INTERVAL`](crate::cluster::DEFAULT_RECOVERY_INTERVAL),
+//! 30 s) a single create is let through as a lazy half-open probe. A
+//! successful probe clears the counter; a failed one only re-arms the gate.
+//! [`ClusterProvider::probe`](crate::cluster::ClusterProvider::probe) forces
+//! the same check immediately (and never counts a failure). No background
+//! task is involved: probes happen on the create path.
 //!
 //! # Reconciliation after indeterminate failures
 //!
@@ -56,10 +64,12 @@
 //!
 //! # In-flight accounting is RAII
 //!
-//! Dropping the [`ClusterSandbox`] returned by create releases the node's
-//! in-flight slot. [`ClusterProvider::release`] exists only for callers that
-//! hold a bare [`ForkdSandbox`]; it decrements saturating, so a double release
-//! can never underflow the counter.
+//! Dropping the [`ClusterSandbox`](crate::cluster::ClusterSandbox) returned
+//! by create releases the node's in-flight slot.
+//! [`ClusterProvider::release`](crate::cluster::ClusterProvider::release)
+//! exists only for callers that hold a bare
+//! [`ForkdSandbox`](crate::forkd::ForkdSandbox); it decrements saturating, so
+//! a double release can never underflow the counter.
 
 use crate::core::{
     check_create_resources, check_create_spec, guest, BackendKind, BoxFuture, Capability,

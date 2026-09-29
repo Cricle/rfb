@@ -38,6 +38,7 @@ pub mod cluster;
 #[cfg(feature = "forkd")]
 #[path = "forkd/controller.rs"]
 mod controller;
+/// Firecracker microVM boot driver behind the ZeroBoot backend.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 #[path = "zeroboot/firecracker.rs"]
 pub mod firecracker;

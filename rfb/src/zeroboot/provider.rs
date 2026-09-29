@@ -441,7 +441,7 @@ impl ZeroBootSession {
     /// ZeroBoot rootfs images) is accepted for backward compatibility.
     ///
     /// Takes `&Arc<Self>` so the turn/inflight ownership can be moved into an
-    /// RAII [`TurnGuard`]: an abandoned future (dropped mid-exchange) cleans
+    /// RAII turn guard: an abandoned future (dropped mid-exchange) cleans
     /// up its own registration instead of leaking it for the session lifetime.
     ///
     /// # Errors

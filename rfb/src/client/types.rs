@@ -51,7 +51,7 @@ pub struct StreamEvent {
     pub code: Option<i32>,
 }
 
-/// Guest transport used by a [`Sandbox`](super::Sandbox). Both transports
+/// Guest transport used by a [`Sandbox`](crate::Sandbox). Both transports
 /// expose identical facade method shapes; `Ndjson` is the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GuestTransport {
