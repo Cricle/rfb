@@ -72,7 +72,7 @@ jobs:
       - name: Verify resx checksums and install forkd binaries
         run: |
           set -euo pipefail
-          sha256sum -c resx/SHA256SUMS
+          grep -vF "resx/rootfs/forkd-agent.ext4" resx/SHA256SUMS | sha256sum -c -
           # Windows 检出等场景可能丢失可执行位，统一恢复（controller 启动与
           # rfb-cli 委托 forkd 都要求可直接执行）。
           chmod +x resx/forkd/forkd resx/forkd/forkd-controller
@@ -126,6 +126,7 @@ jobs:
             target/x86_64-unknown-linux-musl/release/rfb-runtime \
             resx/rootfs/forkd-agent.ext4 --mode forkd-agent --force
           ./target/release/rfb-cli image check-kernel resx/kernel/vmlinux-arcbox-0.0.24
+          sha256sum -c resx/SHA256SUMS
 
       # build.rfb 声明式脚本：一键构建带 python/lua 解释器、离线站点包、
       # 预编译 Rust 应用与附加文件的自定义镜像（examples/full/full.rfb 与
