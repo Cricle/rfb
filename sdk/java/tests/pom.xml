@@ -12,7 +12,7 @@
 
   <groupId>io.github.cricle</groupId>
   <artifactId>rfb-sdk-tests</artifactId>
-  <version>0.0.1</version>
+  <version>0.0.2</version>
   <packaging>jar</packaging>
 
   <name>rfb-sdk-tests</name>
@@ -30,7 +30,11 @@
     <dependency>
       <groupId>io.github.cricle</groupId>
       <artifactId>rfb-sdk</artifactId>
-      <version>0.0.1</version>
+      <!-- Must track the main pom's version: tests compile against the
+           installed jar, and a stale pin silently resolves an OLD rfb-sdk
+           from Maven Central in a clean CI container (missing the newest
+           symbols). release_contract.rs asserts this version. -->
+      <version>0.0.2</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>

@@ -57,13 +57,20 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # 版本一致性门（tag == 全部发布清单版本）：只校验三个 crate 会放过
-          # SDK 渠道的"部分 bump"——各渠道的 already-published guard 只查
-          # 存在性、不查一致性，版本漂移会让新 tag 悄悄发布旧版本依赖。这里
-          # 比对六处清单（workspace Cargo.toml / pyproject.toml / package.json
-          # / pom.xml / 两个 csproj）与三个 crate，收集全部失配后一次性报错
-          # （消息列出每一个不一致文件）并 exit 1。
+          # 版本一致性门（tag == sdk/VERSION == 全部发布清单版本）：只校验三个
+          # crate 会放过 SDK 渠道的"部分 bump"——各渠道的 already-published
+          # guard 只查存在性、不查一致性，版本漂移会让新 tag 悄悄发布旧版本
+          # 依赖。锚点是 sdk/VERSION（唯一手写版本号；传播用
+          # scripts/sync-versions.sh），比对九处清单（sdk/VERSION /
+          # workspace Cargo.toml / pyproject.toml / package.json / pom.xml /
+          # tests pom 两处 / 两个 csproj / rust 示例依赖）与三个 crate，收集
+          # 全部失配后一次性报错（消息列出每一个不一致文件）并 exit 1。
           expected="${TAG#v}"
+          canonical=$(tr -d '[:space:]' < sdk/VERSION)
+          if [ "$expected" != "$canonical" ]; then
+            echo "::error title=version-mismatch::tag $TAG 与 sdk/VERSION ($canonical) 不一致：先 scripts/sync-versions.sh $expected 再重试"
+            exit 1
+          fi
           crate_versions=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print("\n".join("%s %s" % (p["name"], p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"] in ("rfb-runtime", "rfb-sdk", "rfb-rig")))')
           problems=$(CRATE_VERSIONS="$crate_versions" python3 - "$expected" <<'PY'
           import json, os, re, sys
