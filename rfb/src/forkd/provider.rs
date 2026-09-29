@@ -250,6 +250,16 @@ impl ForkdClient {
         self.controller.snapshot_info(tag).await
     }
 
+    /// List every snapshot known to the controller (cluster preflight uses
+    /// this to cross-check digests per node).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>, ForkdClientError> {
+        self.controller.list_snapshots().await
+    }
+
     /// Whether the named snapshot exists and is ready/bootable.
     ///
     /// # Errors

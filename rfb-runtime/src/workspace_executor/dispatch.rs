@@ -1,6 +1,7 @@
 //! Structured filesystem RPCs: `ls`, `find`, `grep`, and the dispatch that
 //! turns a structured prompt into terminal guest events.
 
+use super::filesystem::FILE_RPC_MAX_BYTES;
 use super::WorkspaceGuestExecutor;
 use crate::runtime_service::GuestEvent;
 use crate::session::SessionRequest;
@@ -98,7 +99,7 @@ impl WorkspaceGuestExecutor {
         let max = a
             .get("max_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(self.limits.max_event_bytes as u64) as usize;
+            .unwrap_or(FILE_RPC_MAX_BYTES as u64) as usize;
         let offset = a.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let (data, truncated, total) = self.filesystem_read_offset(path, max, offset)?;
         // total_bytes is the whole-file size, so hosts can detect truncation
@@ -236,11 +237,14 @@ impl WorkspaceGuestExecutor {
                 break 'outer;
             }
             // Per-file cap BEFORE reading (mirrors the forkd agent's
-            // GREP_SCAN_CAP): the workspace tmpfs allows 256 MiB files, and
-            // materializing one whole would OOM a 512 MiB guest VM (PID-1 is
-            // the runtime — an OOM kill takes the sandbox down). Skip
-            // oversized files instead; the aggregate max_bytes budget keeps
-            // small-file scans bounded.
+            // GREP_SCAN_CAP): the /workspace tmpfs is sized from the guest's
+            // memory (40% of MemTotal, clamped to 64 MiB..1 GiB — see
+            // `resources::derive_workspace_bytes`), so the largest possible
+            // file is on the order of the guest's total RAM. Materializing
+            // one whole would OOM the VM (PID-1 is the runtime — an OOM kill
+            // takes the sandbox down). Skip oversized files instead; the
+            // aggregate max_bytes budget keeps small-file scans bounded, and
+            // GREP_FILE_SCAN_CAP stays far below even the 64 MiB tmpfs floor.
             if meta.len() > GREP_FILE_SCAN_CAP {
                 continue;
             }

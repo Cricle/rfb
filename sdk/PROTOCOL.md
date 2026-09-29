@@ -37,7 +37,8 @@ snapshot tag 同样逐字 percent-encode 后拼入 path。
 
 认证：token 非空才带 `Authorization: Bearer <token>`。非 2xx 抛 HTTP 状态类错误
 （`UNIFIED_API.md §7`），message 取 body JSON 的 `error` 字段，否则取前 1024 字符。客户端
-维护一条 keep-alive 连接；**复用中的陈旧连接（对端已关）重试一次**再失败。
+维护一条 keep-alive 连接；复用中的陈旧连接（对端已关）**仅对幂等方法（GET/HEAD/DELETE）
+自动重试一次**，POST 不重放（对端可能已执行，避免重复创建沙箱）。
 
 ### 1.3 DTO 字段名（serde(default)：缺失字段取默认值，不报错）
 
@@ -60,6 +61,12 @@ JSON 行，空行（keepalive）跳过。**任一行长度 > 1 MiB 或未以 `\n
 §2.4 任一**终结键**即停止读取（取最后一行为结果）：`exit_code` `pong` `results` `entries`
 `matches` `data` `content` `output` `status` `ok` `healthy` `done` `cancelled` `bytes_written`。
 任一响应行含字符串型 `error` 键 → Remote（fail closed）；对端先关 → Remote；连接失败 → Transport。
+
+读预算：带 `timeout` 的 `exec`/`eval` 响应读预算 = 客户端基准超时 + 请求 `timeout` 秒数
++ 5 s 余量（`EXEC_READ_MARGIN`，`rfb/src/forkd/guest.rs`；另见 `sdk/shared/README.md §3`），
+保证 guest 自己的超时错误先于客户端读超时到达；未带 `timeout` 的请求读预算 = 基准超时。
+若 agent 配置了认证，连接建立后的**首帧**必须先是 auth 行（见 §2.6），否则该连接上的任何
+动作都会被拒绝。
 
 ### 2.2 动作（请求行字段）
 
@@ -101,6 +108,21 @@ JSON 数组或 UTF-8 字符串（二者皆收）；缺省读作空。
 结束）→ `done:true`（Exit 无码）→ 输出键 `stdout`（旧 `out`）/ `stderr`（旧 `err`）→ 其余忽略。
 输入：`{"in": text}`；停止：`{"action":"stop"}`（幂等）。
 
+### 2.6 agent 认证（可选 `FORKD_AGENT_TOKEN`）
+
+触发：agent 启动时环境变量 `FORKD_AGENT_TOKEN` **非空**（空白视为未设）——此时每条新连接都
+先过认证门；未设 = 历史开放行为，wire 无任何变化。
+
+- **首帧**：客户端必须在连接建立后 **10 s**（`AUTH_TIMEOUT`）内发送一行紧凑 JSON
+  `{"action":"auth","token":"<token>"}`；该帧不算业务动作。
+- **成功**：agent 回 `{"action":"auth","ok":true}`，连接随后进入正常动作分发（§2.2）。
+- **失败**：首帧非法 JSON 或 `action != "auth"` → `{"error":"authentication required"}`；
+  token 不匹配 → `{"action":"auth","ok":false,"error":"authentication failed"}`；首帧超时 /
+  EOF / 行超限 → 不回帧直接关闭。任一失败后连接关闭，业务动作一律不执行。
+
+SDK 侧约定：需要访问受保护 agent 的客户端读同名环境变量，连接后先发 auth 行再发业务动作
+（Python / Node.js 已实现；Rust / C# / Java 的接入状态见 `UNIFIED_API.md §10`）。
+
 ## 3. ZBRT v1（ZeroBoot 二进制帧）
 
 ### 3.1 帧头（28 字节，大端）
@@ -121,7 +143,7 @@ JSON 数组或 UTF-8 字符串（二者皆收）；缺省读作空。
 | kind | 名称 | payload |
 |---|---|---|
 | 1 / 2 | Hello / HelloAck | `client:str, cap_count:u8, caps:[str]` |
-| 3 | Execute | `argc:u8, argv:[str], cwd_flag+cwd, stdin:bytes, timeout_ms:u32`（argc>255 拒绝） |
+| 3 | Execute | `argc:u8, argv:[str], cwd_flag+cwd, stdin:bytes, timeout_ms:u32`（argv 超过 255 条时 SDK 侧**本地 Validation、零帧上线**，见 §3.4） |
 | 4 | Output | `stream:u8(0=stdout,1=stderr), data:bytes` |
 | 5 | Exit | `code:i32, signal_flag+signal:u32` —— **终结** |
 | 6 / 7 | Cancel / CancelAck | `reason_flag+reason, target_flag+16B`（旧 payload 无 target 字节，解码为 None）；**CancelAck payload 必须为空** |
@@ -138,19 +160,36 @@ read：`{"offset":…,"max_bytes":…}`；write：`{"data":[…],"append":…,"m
 
 ### 3.4 会话语义
 
-每次请求新连接 + 新 16 字节 request_id；回复的 request_id 必须匹配，否则 Decode。Output 帧严格
-先于恰好一个终结帧（Exit 或 Error）；host 无自发超时取消（读停顿按传输超时抛 Transport）。eval
-无专用 opcode，且参考 guest 把 Execute 原样当 `exec` 执行——SDK 侧 `eval` 在 ZBRT 下
-**本地 fail closed**（ValidationError，零帧上线），见 `sdk/shared/README.md §1`。
+**连接后必须先 Hello（强制握手）**：每条连接的第一个帧必须是 `Hello`——`client` 名非空即可
+由各 SDK 自定（Rust 基准 `rfb-sdk`，Python `rfb-sdk-python`；guest 只校验非空），capabilities
+= `ZBRT_V1_CAPABILITIES` 全集（`execute` `stream` `deadline` `health` `cancel` `filesystem`）；
+guest 回 request_id 匹配的 `HelloAck` 后连接才可用。**未握手的业务帧一律被拒**：
+`Error(code=1, "protocol handshake required")`，不会到达 runtime service；客户端侧握手失败
+（被拒 / 非 HelloAck / HelloAck 载荷非法）统一抛 Transport，业务帧一个不发。
+
+请求 id 与连接拓扑：每个请求新 16 字节 request_id；回复的 request_id 必须匹配，否则 Decode。
+请求可在新连接上发出，也可在同一连接上顺序复用——本仓库 Rust 基准：`exec`/`stream` 每个 turn
+新连接，`health` 与 fs RPC（Fs/FsResult）复用一条惰性建立的**控制连接**；控制连接上的交换失败
+→ 丢弃该连接、重连（重新 Hello）并把该请求重试一次，guest 回的 `Error` 是请求的确定答复（不
+重试）。Output 帧严格先于恰好一个终结帧（Exit 或 Error）；一个 Execute turn 的 stdout+stderr
+**聚合超过 16 MiB → Remote**（客户端护栏）。host 无自发超时取消：读停顿超过客户端超时 →
+Transport（基准实现逐帧使用客户端超时，不因 guest-side `timeout_ms` 放宽；NDJSON 侧的 exec
+读预算公式见 §2.1）。eval 无专用 opcode，且参考 guest 把 Execute 原样当 `exec` 执行——SDK 侧
+`eval` 在 ZBRT 下**本地 fail closed**（ValidationError，零帧上线），见 `sdk/shared/README.md §1`。
 stdin 只在 Execute payload 里——已提交的 turn 无法再注入输入（send_input 抛 Remote）。stop：
 Cancel（reason=`"stop"`，target=本请求 id）→ 等空 CancelAck，期间到达的 Output 先缓冲、Exit
 则视作已终结。
 
 ## 4. 黄金向量
 
-8 个 ZBRT 向量：HELLO、HELLOACK、EXECUTE、OUTPUT、EXIT、CANCEL、CANCEL_LEGACY、ERROR，
-request_id 统一 `000102030405060708090a0b0c0d0e0f`；每个 SDK 测试必须**编码与解码双向**逐字节
-命中（Python `tests/test_zbrt_codec.py`、Java `ZbrtFrameCodecTest`、C# `GoldenVectorTests`）。
+向量文件唯一存放于 [`shared/conformance/zbrt_vectors.json`](shared/conformance/zbrt_vectors.json)
+（schema、加载约定与新增流程见 [`shared/conformance/README.md`](shared/conformance/README.md)）：
+8 个 ZBRT 向量 HELLO、HELLOACK、EXECUTE、OUTPUT、EXIT、CANCEL、CANCEL_LEGACY、ERROR，
+request_id 统一 `000102030405060708090a0b0c0d0e0f`；另含 `rejects` 严格解码拒绝用例
+（单字节翻转 `hello` 帧后 decode 必须失败）。每个 SDK 测试必须**从该文件就地加载**（不复制）
+并**编码与解码双向**逐字节命中（Rust `rfb/tests/client_codec.rs`、Python `tests/test_zbrt_codec.py`、
+Java `ZbrtFrameCodecTest`、C# `GoldenVectorTests`、Node.js `src/test/zbrt.test.ts`）。
+新增/修改向量必须同步本节清单与 §3.2。
 
 ## 5. RFB1（framed vsock，runtime 协议；非 SDK 传输）
 

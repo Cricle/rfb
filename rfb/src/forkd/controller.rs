@@ -9,6 +9,10 @@ pub enum ForkdClientError {
     /// The controller request failed at the transport level.
     #[error("forkd request failed: {0}")]
     Transport(#[from] reqwest::Error),
+    /// The controller request deadline elapsed (UNIFIED_API.md §7: every
+    /// timeout is transport-class on the SDK side).
+    #[error("forkd request timed out")]
+    Timeout,
     /// The controller returned a non-success HTTP status.
     #[error("forkd returned {status}: {message}")]
     Http {
@@ -20,6 +24,10 @@ pub enum ForkdClientError {
     /// The controller response could not be decoded or failed validation.
     #[error("invalid forkd response: {0}")]
     Decode(String),
+    /// A failure the controller itself reported (the request reached forkd
+    /// and forkd rejected it outside HTTP status semantics).
+    #[error("forkd reported failure: {0}")]
+    Remote(String),
 }
 
 #[derive(Clone)]
@@ -309,7 +317,7 @@ impl ForkdClient {
             let snapshots = self.list_snapshots().await?;
             if let Some(snapshot) = snapshots.iter().find(|s| s.tag == tag) {
                 if snapshot.status.eq_ignore_ascii_case("failed") {
-                    return Err(ForkdClientError::Decode(format!(
+                    return Err(ForkdClientError::Remote(format!(
                         "forkd snapshot `{tag}` is Failed"
                     )));
                 }
@@ -319,9 +327,7 @@ impl ForkdClient {
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(ForkdClientError::Decode(format!(
-                    "forkd snapshot `{tag}` did not become Ready before timeout"
-                )));
+                return Err(ForkdClientError::Timeout);
             }
             tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
         }

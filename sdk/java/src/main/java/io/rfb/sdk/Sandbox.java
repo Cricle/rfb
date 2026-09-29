@@ -150,7 +150,7 @@ public final class Sandbox {
         for (String arg : args) {
             argv.add(arg);
         }
-        JsonNode v = ndjsonRequest(action);
+        JsonNode v = ndjsonRequest(action, timeoutS);
         return new ExecResult(
                 statusCode(v, -1),
                 // UNIFIED_API.md §4: the current keys win when both are present.
@@ -467,6 +467,25 @@ public final class Sandbox {
 
     private JsonNode ndjsonRequest(ObjectNode action) {
         return GuestNdjson.last(GuestNdjson.request(guestAddress, timeout, action), "guest");
+    }
+
+    /** Fixed margin on top of the exec read budget (Python {@code _guest.py} baseline). */
+    private static final long NDJSON_EXEC_READ_MARGIN_MS = 5_000L;
+
+    /**
+     * NDJSON exec read budget: client timeout + exec deadline + 5 s
+     * (cross-language contract §5, mirroring Python {@code _effective_timeout})
+     * so the guest's own timeout error surfaces instead of the client's.
+     */
+    private JsonNode ndjsonRequest(ObjectNode action, double execTimeoutS) {
+        return GuestNdjson.last(GuestNdjson.request(guestAddress, execReadBudget(execTimeoutS), action),
+                "guest");
+    }
+
+    private Duration execReadBudget(double execTimeoutS) {
+        return timeout
+                .plusMillis((long) Math.ceil(execTimeoutS * 1000.0))
+                .plusMillis(NDJSON_EXEC_READ_MARGIN_MS);
     }
 
     /** RFB durations round up to whole seconds, minimum 1. */

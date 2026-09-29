@@ -15,6 +15,18 @@ internal sealed record ZbrtExecOutcome(int ExitCode, byte[] Stdout, byte[] Stder
 /// </summary>
 internal sealed class ZbrtTcpClient : IDisposable
 {
+    /// <summary>Client name sent in the mandatory connection Hello.</summary>
+    private const string HelloClientName = "rfb-sdk-csharp";
+
+    /// <summary>ZBRT v1 capabilities declared by this SDK (PROTOCOL.md §3.4).</summary>
+    internal static readonly string[] V1Capabilities =
+        { "execute", "stream", "deadline", "health", "cancel", "filesystem" };
+
+    /// <summary>Aggregate cap on one exec turn's captured output (mirrors the
+    /// Rust baseline MAX_GUEST_PAYLOAD_BYTES: a chatty guest must not grow
+    /// host memory without bound).</summary>
+    private const long MaxTurnOutputBytes = 16L * 1024 * 1024;
+
     private readonly string _host;
     private readonly int _port;
     private readonly TimeSpan _timeout;
@@ -55,9 +67,54 @@ internal sealed class ZbrtTcpClient : IDisposable
         _tcp = tcp;
         tcp.NoDelay = true;
         _stream = tcp.GetStream();
+
+        // Cross-language contract: every ZBRT connection opens with a mandatory
+        // Hello → HelloAck handshake before any request. A peer that cannot
+        // complete it is a transport failure.
+        await HandshakeAsync().ConfigureAwait(false);
     }
 
-    /// <summary>Optional handshake: Hello → HelloAck.</summary>
+    /// <summary>
+    /// Mandatory Hello → HelloAck handshake (PROTOCOL.md §3.4). Any failure —
+    /// I/O, a reply that is not a valid HelloAck, or a stale frame from an old
+    /// turn — is raised as a TransportException and resets the connection.
+    /// </summary>
+    private async Task HandshakeAsync()
+    {
+        ZbrtFrame reply;
+        try
+        {
+            reply = await RoundTripAsync(
+                ZbrtFrameCodec.HelloFrame(NewRequestId(), HelloClientName, V1Capabilities))
+                .ConfigureAwait(false);
+            _ = ZbrtFrameCodec.DecodeHelloAck(reply.Payload);
+        }
+        catch (TransportException)
+        {
+            ResetConnection();
+            throw;
+        }
+        catch (RfbException e)
+        {
+            // Decode-class handshake failures (bad payload, id mismatch) mean
+            // the peer cannot speak the handshake either → transport class.
+            ResetConnection();
+            throw new TransportException($"guest hello failed: {e.Message}", e);
+        }
+
+        if (reply.Kind != ZbrtKind.HelloAck)
+        {
+            ResetConnection();
+            throw new TransportException(
+                $"guest hello failed: unexpected frame kind {reply.Kind} (expected HelloAck)");
+        }
+    }
+
+    /// <summary>
+    /// Explicit Hello → HelloAck round trip (ConnectAsync already performs the
+    /// mandatory handshake with the SDK client name; this sends another Hello,
+    /// which the guest answers like any request).
+    /// </summary>
     public async Task<ZbrtHelloAck> HelloAsync(string client, IReadOnlyList<string> capabilities)
     {
         await ConnectAsync().ConfigureAwait(false);
@@ -82,6 +139,7 @@ internal sealed class ZbrtTcpClient : IDisposable
 
             var stdout = new List<byte>();
             var stderr = new List<byte>();
+            var totalOutput = 0L;
             while (true)
             {
                 var frame = await ReadFrameAsync().ConfigureAwait(false);
@@ -91,6 +149,12 @@ internal sealed class ZbrtTcpClient : IDisposable
                     case ZbrtKind.Output:
                         {
                             var (stream, data) = ZbrtFrameCodec.DecodeOutput(frame.Payload);
+                            totalOutput += data.Length;
+                            if (totalOutput > MaxTurnOutputBytes)
+                            {
+                                throw new RemoteException("guest output exceeded the 16 MiB limit");
+                            }
+
                             if (stream == 0)
                             {
                                 stdout.AddRange(data);
@@ -118,10 +182,11 @@ internal sealed class ZbrtTcpClient : IDisposable
                 }
             }
         }
-        catch (TransportException)
+        catch (Exception e) when (e is TransportException or RemoteException or DecodeException)
         {
-            // A timed-out read leaves the connection mid-turn: drop it so the
-            // next request cannot consume stale frames.
+            // An aborted turn (timed-out read, remote error, oversized output,
+            // desync) leaves unread frames buffered on the socket: drop it so
+            // the next request cannot consume stale frames.
             ResetConnection();
             throw;
         }

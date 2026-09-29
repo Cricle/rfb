@@ -2,6 +2,7 @@ package io.rfb.sdk.internal;
 
 import io.rfb.sdk.DecodeError;
 import io.rfb.sdk.RemoteError;
+import io.rfb.sdk.RfbError;
 import io.rfb.sdk.TransportError;
 
 import java.io.BufferedInputStream;
@@ -15,12 +16,15 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
  * One ZBRT v1 session over a TCP socket (PROTOCOL.md §3.4, mirroring
- * {@code zeroboot_connection.rs} semantics): fresh 128-bit request id per
- * request, Output frames strictly before exactly one terminal frame, idempotent
- * Cancel with empty-payload CancelAck, Error frames raise {@link RemoteError}.
+ * {@code zeroboot_connection.rs} semantics): mandatory Hello handshake on
+ * connect (client name {@code rfb-sdk-java}), fresh 128-bit request id per
+ * request, Output frames strictly before exactly one terminal frame,
+ * idempotent Cancel with empty-payload CancelAck, Error frames raise
+ * {@link RemoteError}, and a 16 MiB cap on one exec turn's aggregated output.
  * INTERNAL.
  */
 public final class ZbrtConnection implements AutoCloseable {
@@ -28,6 +32,9 @@ public final class ZbrtConnection implements AutoCloseable {
     public static final List<String> V1_CAPABILITIES =
             Collections.unmodifiableList(Arrays.asList(
                     "execute", "stream", "deadline", "health", "cancel", "filesystem"));
+
+    /** Client name sent in the mandatory Hello handshake. */
+    public static final String CLIENT_NAME = "rfb-sdk-java";
 
     /** Shared per-process source: SecureRandom.nextBytes is thread-safe. */
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -42,12 +49,31 @@ public final class ZbrtConnection implements AutoCloseable {
             this.in = new BufferedInputStream(socket.getInputStream());
             this.out = socket.getOutputStream();
         } catch (IOException e) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-                // best effort
-            }
+            closeQuietly();
             throw new TransportError("zbrt stream setup failed: " + e.getMessage(), e);
+        }
+        handshake();
+    }
+
+    /**
+     * Mandatory Hello handshake: every connection sends Hello first and must
+     * receive a well-formed HelloAck before anything else may be exchanged.
+     * Any failure (Error reply, unexpected frame, decode failure, EOF) is
+     * transport-class — the guest is unusable before it answers.
+     */
+    private void handshake() {
+        byte[] id = newRequestId();
+        try {
+            writeFrame(new ZbrtFrame(ZbrtFrame.KIND_HELLO, 0, id,
+                    ZbrtCodec.encodeHello(CLIENT_NAME, V1_CAPABILITIES)));
+            ZbrtFrame frame = readReply(id);
+            if (frame.kind() != ZbrtFrame.KIND_HELLO_ACK) {
+                throw new DecodeError("expected HelloAck, got frame kind " + frame.kind());
+            }
+            ZbrtCodec.decodeHelloAck(frame.payload());
+        } catch (RfbError e) {
+            closeQuietly();
+            throw new TransportError("zbrt hello handshake failed: " + e.getMessage(), e);
         }
     }
 
@@ -58,7 +84,7 @@ public final class ZbrtConnection implements AutoCloseable {
         return id;
     }
 
-    /** Optional Hello handshake; the guest is auto-ready without it. */
+    /** Re-run the Hello handshake under a different client name. */
     public ZbrtCodec.HelloAck hello(String clientName) {
         byte[] id = newRequestId();
         writeFrame(new ZbrtFrame(ZbrtFrame.KIND_HELLO, 0, id,
@@ -72,11 +98,13 @@ public final class ZbrtConnection implements AutoCloseable {
 
     /**
      * Run one command: collect Output frames (0=stdout, 1=stderr) until exactly
-     * one terminal frame — Exit (completed/cancelled) or Error (raise).
-     * {@code timeoutMs} is sent on the wire as the guest-side deadline; a read
-     * stall at the connection timeout is a transport-level failure
-     * ({@link TransportError}) — the client never cancels on its own (the
-     * Rust baseline surfaces timeouts the same way).
+     * one terminal frame — Exit (completed/cancelled) or Error (raise). The
+     * turn's aggregated output (stdout+stderr) is capped at 16 MiB; exceeding
+     * it raises {@link RemoteError} (mirrors the Rust client's
+     * {@code MAX_EXEC_BYTES} guard). {@code timeoutMs} is sent on the wire as
+     * the guest-side deadline; a read stall at the connection timeout is a
+     * transport-level failure ({@link TransportError}) — the client never
+     * cancels on its own (the Rust baseline surfaces timeouts the same way).
      */
     public Exec execute(List<String> argv, String cwd, byte[] stdin, long timeoutMs) {
         byte[] id = newRequestId();
@@ -84,11 +112,16 @@ public final class ZbrtConnection implements AutoCloseable {
                 ZbrtCodec.encodeExecute(argv, cwd, stdin == null ? new byte[0] : stdin, timeoutMs)));
         ByteArrayOutputStream stdoutBuf = new ByteArrayOutputStream();
         ByteArrayOutputStream stderrBuf = new ByteArrayOutputStream();
+        long totalOutput = 0;
         while (true) {
             ZbrtFrame frame = ZbrtFrame.decode(in);
             requireId(frame, id);
             if (frame.kind() == ZbrtFrame.KIND_OUTPUT) {
                 ZbrtCodec.Output output = ZbrtCodec.decodeOutput(frame.payload());
+                totalOutput += output.data().length;
+                if (totalOutput > ZbrtFrame.MAX_PAYLOAD) {
+                    throw new RemoteError("guest output exceeded the 16 MiB limit");
+                }
                 if (output.stream() == 0) {
                     stdoutBuf.write(output.data(), 0, output.data().length);
                 } else {
@@ -146,13 +179,32 @@ public final class ZbrtConnection implements AutoCloseable {
         private final byte[] requestId;
         private volatile boolean stopped = false;
         private volatile boolean terminal = false;
+        private volatile boolean startedSent = false;
+        // Straggler Output frames — and an Exit that arrived during the stop
+        // drain before the CancelAck — buffered so nextEvent() delivers them
+        // instead of losing the turn's terminal (Python stop() semantics).
+        private final ConcurrentLinkedDeque<Event> pending = new ConcurrentLinkedDeque<>();
 
         ZbrtStreamSession(byte[] requestId) {
             this.requestId = requestId;
         }
 
-        /** Next event frame: Output or terminal Exit; null only if we already terminated. */
+        /**
+         * Next event frame. The first call on a turn synthesizes the
+         * {@code started} event (ZBRT v1 has no started frame; mirrors the
+         * Rust client). Buffered straggler Output frames — and an Exit cached
+         * by {@link #stop()} — are delivered before new frames are read. Null
+         * only once the turn terminated and every buffered event was consumed.
+         */
         public Event nextEvent() {
+            if (!startedSent) {
+                startedSent = true;
+                return Event.started();
+            }
+            Event buffered = pending.poll();
+            if (buffered != null) {
+                return buffered;
+            }
             if (terminal) {
                 return null;
             }
@@ -173,16 +225,43 @@ public final class ZbrtConnection implements AutoCloseable {
             throw unexpected(frame, "Output/Exit");
         }
 
-        /** Idempotent stop: Cancel targeting this request, expecting CancelAck. */
+        /**
+         * Idempotent stop: the Cancel frame reuses THIS request's id in the
+         * header and targets it in the payload, so the guest's CancelAck (and
+         * the cancel-induced terminal) route back to this turn and the guest's
+         * target-match check passes (Rust {@code send_cancel_target}). The
+         * drain keeps straggler Output frames and caches an Exit that arrives
+         * before the CancelAck — the turn's single terminal is never dropped
+         * (which would deadlock a later {@link #nextEvent()}).
+         */
         public void stop() {
             if (terminal || stopped) {
                 return;
             }
             stopped = true;
-            // sendCancel writes the targeted Cancel and consumes the CancelAck.
-            // The guest then delivers this turn's single terminal (Exit) which
-            // nextEvent() reports to the caller.
-            sendCancel(null, requestId);
+            writeFrame(new ZbrtFrame(ZbrtFrame.KIND_CANCEL, 0, requestId,
+                    ZbrtCodec.encodeCancel("stop", requestId)));
+            while (true) {
+                ZbrtFrame frame = ZbrtFrame.decode(in);
+                requireId(frame, requestId);
+                if (frame.kind() == ZbrtFrame.KIND_CANCEL_ACK) {
+                    return;
+                }
+                if (frame.kind() == ZbrtFrame.KIND_OUTPUT) {
+                    ZbrtCodec.Output output = ZbrtCodec.decodeOutput(frame.payload());
+                    pending.add(new Event(output.stream(), output.data(), null));
+                } else if (frame.kind() == ZbrtFrame.KIND_EXIT) {
+                    ZbrtCodec.Exit exit = ZbrtCodec.decodeExit(frame.payload());
+                    terminal = true;
+                    pending.add(new Event(-1, new byte[0], exit.code()));
+                    return;
+                } else if (frame.kind() == ZbrtFrame.KIND_ERROR) {
+                    terminal = true;
+                    throw errorFrame(frame);
+                } else {
+                    throw unexpected(frame, "CancelAck");
+                }
+            }
         }
 
         public byte[] requestId() {
@@ -192,6 +271,9 @@ public final class ZbrtConnection implements AutoCloseable {
 
     /** One ZbrtStreamSession event: stream 0=stdout 1=stderr, or code != null → Exit. */
     public static final class Event {
+        /** Stream marker of the synthesized session-start event (no wire frame). */
+        public static final int STREAM_STARTED = -2;
+
         private final int stream;
         private final byte[] data;
         private final Integer code;
@@ -202,9 +284,18 @@ public final class ZbrtConnection implements AutoCloseable {
             this.code = code;
         }
 
+        /** The synthesized session-start event (ZBRT v1 carries none on the wire). */
+        public static Event started() {
+            return new Event(STREAM_STARTED, new byte[0], null);
+        }
+
         public int stream() { return stream; }
         public byte[] data() { return data; }
         public Integer code() { return code; }
+
+        public boolean isStarted() {
+            return stream == STREAM_STARTED;
+        }
 
         public boolean isExit() {
             return code != null;
@@ -354,6 +445,15 @@ public final class ZbrtConnection implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // best effort
+        }
+    }
+
+    /** Best-effort socket close on constructor/handshake failure paths. */
+    private void closeQuietly() {
         try {
             socket.close();
         } catch (IOException ignored) {

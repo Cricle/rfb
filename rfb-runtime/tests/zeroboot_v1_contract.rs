@@ -69,18 +69,33 @@ fn v1_exec_contract_preserves_args_cwd_stdin_and_both_streams() {
     let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
     let mut s = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
     hello(&mut s);
-    // stdin is deliberately null: cat must observe EOF; cwd is workspace-relative.
+    // sh/printf are POSIX tools; Windows has neither on PATH, so the stdout/
+    // stderr passthrough contract runs through cmd there (args are kept free
+    // of spaces so the Windows command line needs no quoting; the cwd check
+    // and the stdin-EOF check stay POSIX-only).
+    #[cfg(windows)]
+    let prompt = exec(
+        &["cmd", "/c", "echo", "hello", "&&", "echo", "err>&2"],
+        "sub",
+    );
+    // cmd echoes the space before `&&`, so stdout is "hello \r\n".
+    #[cfg(windows)]
+    let (want_stdout_suffix, want_stderr) = ("hello \r\n", "err\r\n");
+    #[cfg(not(windows))]
+    let prompt = exec(
+        &[
+            "sh",
+            "-c",
+            "printf '%s' \"$PWD\"; printf err >&2; cat >/dev/null",
+        ],
+        "sub",
+    );
+    #[cfg(not(windows))]
+    let (want_stdout_suffix, want_stderr) = ("/sub", "err");
     let r = s.handle(ControlMessage::StartTurn(SessionRequest {
         session_id: "s".into(),
         request_id: "r".into(),
-        prompt: exec(
-            &[
-                "sh",
-                "-c",
-                "printf '%s' \"$PWD\"; printf err >&2; cat >/dev/null",
-            ],
-            "sub",
-        ),
+        prompt,
     }));
     let events: Vec<_> = r
         .iter()
@@ -97,10 +112,10 @@ fn v1_exec_contract_preserves_args_cwd_stdin_and_both_streams() {
         .collect();
     assert!(terminals
         .iter()
-        .any(|e| e.stream == TerminalStream::Stdout && e.data.ends_with("/sub")));
+        .any(|e| e.stream == TerminalStream::Stdout && e.data.ends_with(want_stdout_suffix)));
     assert!(terminals
         .iter()
-        .any(|e| e.stream == TerminalStream::Stderr && e.data == "err"));
+        .any(|e| e.stream == TerminalStream::Stderr && e.data == want_stderr));
     assert_eq!(
         events
             .iter()
@@ -136,11 +151,14 @@ fn v1_files_and_path_limits_are_confined() {
         .as_slice(),
         [RuntimeMessage::Error { .. }]
     ));
+    // The wire contract caps one file write at 51200 bytes (PROTOCOL.md);
+    // max_event_bytes no longer gates file writes (large payloads are the
+    // caller's job to shard).
     assert!(matches!(
         s.handle(ControlMessage::WriteWorkspaceFile(FileWriteRequest {
             request_id: "w2".into(),
             path: "ok".into(),
-            content: b"12345".to_vec()
+            content: vec![b'x'; 50 * 1024 + 1]
         }))
         .as_slice(),
         [RuntimeMessage::Error { .. }]

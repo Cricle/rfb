@@ -150,21 +150,26 @@ export class RfbClient {
     return infos.map((info) => new Sandbox(info, this, TRANSPORT_NDJSON, this.timeoutS * 1000));
   }
 
-  /** Snapshot detail: /info → legacy endpoint; both 404 → null. */
+  /**
+   * Snapshot detail: /info → legacy endpoint; both 404 → null. The tag is
+   * validated non-empty only and percent-encoded verbatim into the path
+   * (PROTOCOL.md §1.1), so tags like "base.v2" / "snap:1" stay legal.
+   */
   async snapshot(tag: string): Promise<SnapshotSummary | null> {
-    validation.sandboxId(tag);
-    const preferred = await this.#send('GET', `/v1/snapshots/${tag}/info`);
+    validation.snapshotTag(tag);
+    const encoded = encodeURIComponent(tag);
+    const preferred = await this.#send('GET', `/v1/snapshots/${encoded}/info`);
     if (preferred.status !== 404) {
       return this.#parseJson<SnapshotSummary>(this.#expectOk(preferred));
     }
-    const legacy = await this.#send('GET', `/v1/snapshots/${tag}`);
+    const legacy = await this.#send('GET', `/v1/snapshots/${encoded}`);
     if (legacy.status === 404) return null;
     return this.#parseJson<SnapshotSummary>(this.#expectOk(legacy));
   }
 
   /** Poll every 100 ms until status=ready and bootable=true; failed → RemoteError. */
   async waitSnapshot(tag: string, timeoutS: number = DEFAULT_WAIT_TIMEOUT_S): Promise<SnapshotSummary> {
-    validation.sandboxId(tag);
+    validation.snapshotTag(tag);
     validation.timeoutS(timeoutS);
     const deadline = Date.now() + timeoutS * 1000;
     while (true) {
@@ -199,7 +204,7 @@ export class RfbClient {
       liveFork = false,
       hugepages = false,
     } = options;
-    validation.sandboxId(tag);
+    validation.snapshotTag(tag);
     if (transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT) {
       throw new ValidationError(`invalid transport: ${transport}`);
     }

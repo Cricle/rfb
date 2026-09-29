@@ -20,7 +20,7 @@
 # 用法 B —— CI/容器（debian:12 镜像，仓库检出到工作目录）：
 #   docker run --rm -v "$PWD":/repo -w /repo debian:12 \
 #     bash sdk/e2e/debian-e2e.sh
-#   # GitHub Actions 用法见 .github/workflows/sdk-e2e.yml（脚本会自动识别
+#   # GitHub Actions 用法见 .github/workflows/ci.yml 的 sdk job（脚本会自动识别
 #   # 非 WSL 环境，走同一套 apt + dotnet-install 依赖流程）
 #
 # 环境变量：

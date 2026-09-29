@@ -7,11 +7,18 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Single-file read/write cap for the structured file RPCs. This is the wire
+/// contract value (sdk/PROTOCOL.md: read/write payloads ≤ 51200 bytes; the
+/// forkd agent's `rfb::guest::limits::MAX_GUEST_RESULT_BYTES`), not the
+/// (much larger) event/frame cap: both transports must refuse the same
+/// oversized file operations.
+pub(super) const FILE_RPC_MAX_BYTES: usize = 50 * 1024;
+
 impl WorkspaceGuestExecutor {
     /// Typed read (host control message): fails closed when the file exceeds
     /// `max_bytes`; truncation semantics only exist on the structured path.
     pub(super) fn filesystem_read(&self, request: &FileReadRequest) -> Result<Vec<u8>, String> {
-        if request.max_bytes == 0 || request.max_bytes > self.limits.max_event_bytes {
+        if request.max_bytes == 0 || request.max_bytes > FILE_RPC_MAX_BYTES {
             return Err("invalid max_bytes".into());
         }
         let path = self
@@ -39,7 +46,7 @@ impl WorkspaceGuestExecutor {
         max_bytes: usize,
         offset: u64,
     ) -> Result<(Vec<u8>, bool, u64), String> {
-        if max_bytes == 0 || max_bytes > self.limits.max_event_bytes {
+        if max_bytes == 0 || max_bytes > FILE_RPC_MAX_BYTES {
             return Err("invalid max_bytes".into());
         }
         let path = self
@@ -61,18 +68,26 @@ impl WorkspaceGuestExecutor {
     }
 
     pub(super) fn filesystem_write(&self, request: &FileWriteRequest) -> Result<(), String> {
-        if request.content.len() > self.limits.max_event_bytes {
-            return Err("file exceeds max_event_bytes".into());
+        if request.content.len() > FILE_RPC_MAX_BYTES {
+            return Err(format!(
+                "file exceeds the {}-byte file rpc limit",
+                FILE_RPC_MAX_BYTES
+            ));
         }
         let path = self
             .policy
             .workspace_path(&request.path)
             .map_err(|e| e.to_string())?;
-        let existing = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         let mut cache = self
             .workspace_size_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The existing size is measured while the cache lock is held: taking
+        // it before the lock would let a concurrent writer on the same
+        // workspace root rename its file in between, and both writers would
+        // then subtract the same `existing` from the shared total — double
+        // counting the delta and letting the workspace exceed its limit.
+        let existing = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         // The recursive walk is O(workspace); cache it and patch by delta on
         // each write (full walks only after an invalidation, e.g. `exec`).
         let used = match *cache {

@@ -30,6 +30,17 @@ export interface GuestAddress {
   port: number;
 }
 
+/**
+ * FORKD_AGENT_TOKEN (cross-language contract §11): when set to a non-empty
+ * value, every guest NDJSON connection must authenticate with
+ * `{"action":"auth","token":…}` immediately after connect and only proceed
+ * once `{"action":"auth","ok":true}` comes back. Unset/blank = no auth.
+ */
+export function agentAuthToken(): string | null {
+  const token = process.env.FORKD_AGENT_TOKEN;
+  return token === undefined || token.trim().length === 0 ? null : token;
+}
+
 /** Parse "host:port" (IPv6 literals allowed); throws ValidationError. */
 export function parseAddress(address: string): GuestAddress {
   if (typeof address !== 'string' || address.length === 0) {
@@ -61,7 +72,9 @@ export interface NdjsonExchange {
 /**
  * Send one action object and collect JSON response lines until a terminal
  * key. Any response line carrying a string `error` raises RemoteError
- * immediately.
+ * immediately. `timeoutMs` is the whole read budget — for exec/eval the
+ * caller passes client timeout + exec deadline + a 5 s margin so the guest's
+ * own timeout error is what surfaces (Python `_guest.py` baseline).
  */
 export function request(
   host: string,
@@ -74,6 +87,12 @@ export function request(
     const responses: Record<string, unknown>[] = [];
     let buffer = Buffer.alloc(0);
     let settled = false;
+    const agentToken = agentAuthToken();
+    let awaitingAuth = agentToken !== null;
+
+    const sendLine = (value: Record<string, unknown>): void => {
+      socket.write(Buffer.from(JSON.stringify(value) + '\n', 'utf8'));
+    };
 
     const fail = (error: Error) => {
       if (!settled) {
@@ -101,7 +120,12 @@ export function request(
 
     socket.on('connect', () => {
       socket.setNoDelay(true);
-      socket.write(Buffer.from(JSON.stringify(action) + '\n', 'utf8'));
+      if (agentToken === null) {
+        sendLine(action);
+      } else {
+        // Agent auth first; the real action goes out only after ok=true.
+        sendLine({ action: 'auth', token: agentToken });
+      }
     });
 
     socket.on('data', (chunk: Buffer) => {
@@ -138,6 +162,17 @@ export function request(
         }
         if (value && typeof value.error === 'string') {
           fail(new RemoteError(value.error));
+          return;
+        }
+        if (awaitingAuth) {
+          // Intercept before the terminal-key check: the ack itself carries
+          // `ok`, which would otherwise end the exchange prematurely.
+          if (value && value.action === 'auth' && value.ok === true) {
+            awaitingAuth = false;
+            sendLine(action);
+            continue;
+          }
+          fail(new RemoteError('agent auth failed'));
           return;
         }
         responses.push(value);

@@ -32,8 +32,11 @@ pub fn init_pid1_with_console(attach_console: bool) -> std::io::Result<()> {
     mount_if_needed("devtmpfs", "/dev", "devtmpfs")?;
     // The 8 MiB rootfs cannot hold investigation artifacts. Mount a bounded
     // in-memory tmpfs for the workspace so log/SQL dumps can be archived
-    // without filling the image. Data is ephemeral (per-sandbox), matching the
-    // sandbox lifecycle.
+    // without filling the image. The size is derived from the guest's total
+    // memory (40% of MemTotal, clamped to 64 MiB..1 GiB) — the same source as
+    // `RuntimeLimits::max_workspace_bytes` — so the executor-side limit can
+    // never exceed the kernel-enforced tmpfs cap. Data is ephemeral
+    // (per-sandbox), matching the sandbox lifecycle.
     mount_workspace_tmpfs()?;
     if attach_console {
         let tty = fs::OpenOptions::new()
@@ -97,9 +100,12 @@ fn mount_workspace_tmpfs() -> std::io::Result<()> {
     let target = std::ffi::CString::new("/workspace").expect("static path");
     let source = std::ffi::CString::new("tmpfs").expect("static source");
     let fstype = std::ffi::CString::new("tmpfs").expect("static fstype");
+    // Same derived value the executor enforces (40% of MemTotal clamped to
+    // 64 MiB..1 GiB; `/proc` is already mounted above), so a policy error can
+    // never turn into raw ENOSPC from the mount. Both sides are MiB-aligned.
     let options = std::ffi::CString::new(format!(
         "size={}m,mode=0755",
-        crate::resources::WORKSPACE_TMPFS_BYTES / (1024 * 1024)
+        crate::resources::workspace_tmpfs_bytes() / (1024 * 1024)
     ))
     .expect("static options");
     // SAFETY: pointers reference live CStrings held until after the call;

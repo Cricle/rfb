@@ -1,6 +1,7 @@
 package io.rfb.sdk;
 
 import io.rfb.sdk.internal.ZbrtCodec;
+import io.rfb.sdk.internal.ZbrtConnection;
 import io.rfb.sdk.internal.ZbrtFrame;
 
 import java.io.BufferedInputStream;
@@ -69,15 +70,57 @@ final class FakeZbrtServer implements AutoCloseable {
     private final List<Socket> sockets = new ArrayList<>();
     private final List<Throwable> handlerFailures = java.util.Collections.synchronizedList(new ArrayList<>());
     private volatile boolean closed = false;
+    // Mandatory Hello handshake (cross-language contract §1): every client
+    // connection opens with Hello before any request frame. The fake answers
+    // it automatically so per-connection handlers still see ONLY the request
+    // frames they script; the client identity is recorded for assertions.
+    private final boolean autoAckHello;
+    private final List<String> helloClients =
+            java.util.Collections.synchronizedList(new ArrayList<>());
+    private final List<List<String>> helloCapabilities =
+            java.util.Collections.synchronizedList(new ArrayList<>());
 
     FakeZbrtServer(ConnHandler... perConnectionHandlers) throws IOException {
+        this(true, perConnectionHandlers);
+    }
+
+    /** {@code autoAckHello=false} hands the raw first frame (Hello) to the handler. */
+    FakeZbrtServer(boolean autoAckHello, ConnHandler... perConnectionHandlers) throws IOException {
         this.serverSocket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+        this.autoAckHello = autoAckHello;
         for (ConnHandler handler : perConnectionHandlers) {
             handlers.add(handler);
         }
         Thread acceptor = new Thread(this::acceptLoop, "fake-zbrt-acceptor");
         acceptor.setDaemon(true);
         acceptor.start();
+    }
+
+    /** Client name of the most recent auto-acked Hello, or null. */
+    String lastHelloClient() {
+        synchronized (helloClients) {
+            return helloClients.isEmpty() ? null : helloClients.get(helloClients.size() - 1);
+        }
+    }
+
+    /** Capabilities of the most recent auto-acked Hello, or null. */
+    List<String> lastHelloCapabilities() {
+        synchronized (helloCapabilities) {
+            return helloCapabilities.isEmpty()
+                    ? null : helloCapabilities.get(helloCapabilities.size() - 1);
+        }
+    }
+
+    private void ackHello(FrameIO io) throws IOException {
+        ZbrtFrame hello = io.read();
+        if (hello.kind() != ZbrtFrame.KIND_HELLO) {
+            throw new IOException("expected Hello as the first frame, got kind " + hello.kind());
+        }
+        ZbrtCodec.HelloAck ack = ZbrtCodec.decodeHelloAck(hello.payload());
+        helloClients.add(ack.server);
+        helloCapabilities.add(ack.capabilities);
+        io.write(io.reply(hello, ZbrtFrame.KIND_HELLO_ACK,
+                ZbrtCodec.encodeHelloAck("rfb-zeroboot-guest", ZbrtConnection.V1_CAPABILITIES)));
     }
 
     String address() {
@@ -95,7 +138,11 @@ final class FakeZbrtServer implements AutoCloseable {
                 ConnHandler handler = handlers.size() > 1 ? handlers.remove(0) : handlers.get(0);
                 pool.submit(() -> {
                     try (socket) {
-                        handler.handle(new FrameIO(socket));
+                        FrameIO io = new FrameIO(socket);
+                        if (autoAckHello) {
+                            ackHello(io);
+                        }
+                        handler.handle(io);
                     } catch (IOException ignored) {
                         // client went away — fine for a fake
                     } catch (Throwable failure) {

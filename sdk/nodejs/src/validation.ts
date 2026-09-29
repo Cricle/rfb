@@ -78,6 +78,17 @@ export function evalCode(code: string): void {
   }
 }
 
+/**
+ * forkd snapshot tag used in URL paths: only non-empty is required (PROTOCOL.md
+ * §1.1 — tags are percent-encoded verbatim, unlike sandbox ids which are
+ * restricted to `[A-Za-z0-9_-]`).
+ */
+export function snapshotTag(tag: string): void {
+  if (typeof tag !== 'string' || tag.length === 0) {
+    throw new ValidationError('snapshot tag must not be empty');
+  }
+}
+
 /** forkd sandbox id used in URL paths: non-empty, ≤ 128, only [A-Za-z0-9_-]. */
 export function sandboxId(id: string): void {
   if (

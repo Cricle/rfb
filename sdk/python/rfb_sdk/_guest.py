@@ -6,6 +6,7 @@ mapping of responses. This module is NOT part of the public API.
 
 import json
 import math
+import os
 import socket
 
 from .errors import DecodeError, RemoteError, TransportError
@@ -13,6 +14,16 @@ from ._zbrt import _parse_host_port
 from .models import StreamEvent, StreamEventKind
 
 MAX_LINE_BYTES = 1024 * 1024
+
+# When this environment variable is set to a non-empty value, every guest
+# agent TCP connection starts with one auth line before any real request.
+AGENT_TOKEN_ENV = "FORKD_AGENT_TOKEN"
+
+
+def _agent_token():
+    """Configured agent token, or None when auth is disabled (empty = unset)."""
+    token = os.environ.get(AGENT_TOKEN_ENV)
+    return token if token else None
 
 # A response line containing any of these keys is terminal (PROTOCOL.md 2.1).
 TERMINAL_KEYS = frozenset(
@@ -105,6 +116,37 @@ class _GuestNdjsonClient:
             raise RemoteError(error)
         return value
 
+    def _authenticate(self, sock, rfile) -> None:
+        """Send the agent auth line when FORKD_AGENT_TOKEN is configured.
+
+        The auth line is the FIRST line on the connection, before any real
+        request; the agent must answer ``{"action":"auth","ok":true}``. A
+        rejection (or any non-auth reply) raises RemoteError so callers see
+        the RfbError hierarchy (UNIFIED_API.md §7). With no token configured
+        the wire behavior is unchanged.
+        """
+        token = _agent_token()
+        if token is None:
+            return
+        line = json.dumps(
+            {"action": "auth", "token": token}, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        try:
+            sock.sendall(line)
+        except OSError as e:
+            raise TransportError(f"guest write failed: {e}") from e
+        while True:
+            raw = self._read_line(rfile)
+            if raw is None:
+                continue  # blank keepalive line
+            break
+        value = self._decode_line(raw)
+        if value.get("action") == "auth" and value.get("ok") is True:
+            return
+        error = value.get("error")
+        detail = f": {error}" if isinstance(error, str) and error else ""
+        raise RemoteError(f"guest agent auth failed{detail}")
+
     def _request(self, action: dict, timeout_s=None) -> list:
         timeout = self._effective_timeout(timeout_s)
         try:
@@ -114,12 +156,13 @@ class _GuestNdjsonClient:
             raise TransportError(f"guest connect failed: {e}") from e
         try:
             sock.settimeout(timeout)
+            rfile = sock.makefile("rb")
+            self._authenticate(sock, rfile)
             line = json.dumps(action, separators=(",", ":")).encode("utf-8") + b"\n"
             try:
                 sock.sendall(line)
             except OSError as e:
                 raise TransportError(f"guest write failed: {e}") from e
-            rfile = sock.makefile("rb")
             responses = []
             while True:
                 raw = self._read_line(rfile)
@@ -175,20 +218,24 @@ class _GuestNdjsonClient:
             raise TransportError(f"guest connect failed: {e}") from e
         try:
             sock.settimeout(self._timeout_s)
+            rfile = sock.makefile("rb")
+            self._authenticate(sock, rfile)
             line = json.dumps(action, separators=(",", ":")).encode("utf-8") + b"\n"
             sock.sendall(line)
         except OSError as e:
             sock.close()
             raise TransportError(f"guest write failed: {e}") from e
-        return _NdjsonStream(sock)
+        # Reuse the already-buffered reader so bytes read ahead of the auth
+        # exchange cannot be lost between two makefile() handles.
+        return _NdjsonStream(sock, rfile)
 
 
 class _NdjsonStream:
     """Interactive stream over one NDJSON TCP connection."""
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, rfile=None):
         self._sock = sock
-        self._rfile = sock.makefile("rb")
+        self._rfile = rfile if rfile is not None else sock.makefile("rb")
         self._stopped = False
         self._terminal = False
         self._closed = False

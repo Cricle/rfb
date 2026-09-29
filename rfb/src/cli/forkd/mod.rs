@@ -32,4 +32,6 @@ pub use snapshot::{
     find_resx, provenance_state, resolve_forkd_bin, sanitize_snapshot_info, snapshot_create,
     snapshot_delete, snapshot_info, SnapshotOutput,
 };
+#[doc(hidden)]
+pub(crate) use snapshot_paths::forkd_snapshots_root;
 pub use workload::workload;

@@ -21,7 +21,8 @@ use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use crate::protocol::{
-    write_frame_async, Error as ProtocolError, Exit, Frame, Hello, HelloAck, Kind, Output,
+    read_frame_async, write_frame_async, Error as ProtocolError, Exit, Frame, Hello, HelloAck,
+    Kind, Output,
 };
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use crate::vsock::connect_firecracker_uds;
@@ -29,8 +30,6 @@ use crate::vsock::connect_firecracker_uds;
 use std::os::unix::io::AsRawFd;
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use std::path::Path;
-#[cfg(all(feature = "zeroboot", target_os = "linux"))]
-use tokio::io::AsyncReadExt;
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use tokio::sync::mpsc;
 
@@ -236,7 +235,13 @@ pub struct ZeroBootSession {
     /// Write half of the relay stream, guarded for short write bursts.
     writer: tokio::sync::Mutex<tokio::io::WriteHalf<tokio::net::UnixStream>>,
     /// Per-request response channels, keyed by the 128-bit wire request id.
-    inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::UnboundedSender<Frame>>>>,
+    inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>>,
+    /// Request id of the operation currently holding the guest's single turn
+    /// (`exec`/`stream`). `cancel_active` targets exactly this request, so a
+    /// cancel can never claim to have stopped a request whose host-side
+    /// future is already gone (the old "first inflight entry" heuristic raced
+    /// both registrations and abandoned futures).
+    active_turn: tokio::sync::Mutex<Option<[u8; 16]>>,
     /// Serializes turn-occupying operations (`exec`/`stream`): the ZeroBoot
     /// V1 guest runs a single turn per connection, so concurrent occupants
     /// would fail closed with "a turn is already active". Queuing here turns
@@ -249,6 +254,10 @@ pub struct ZeroBootSession {
     _reader: Option<tokio::task::JoinHandle<()>>,
     /// VM work directory kept alive for the session's lifetime.
     _work: Option<tempfile::TempDir>,
+    /// flock'd `work.lock` inside the work directory: a live process holds
+    /// LOCK_EX, so the process-startup scavenger can reclaim work dirs whose
+    /// owner died (the kernel releases flock when the holder's fd is gone).
+    _work_lock: Option<std::fs::File>,
     /// Backing Firecracker VM kept alive for the session's lifetime.
     _vm: Option<crate::firecracker::FirecrackerVm>,
 }
@@ -349,16 +358,18 @@ impl ZeroBootSession {
     /// the demultiplexing reader, and prepare the request map.
     fn with_stream(stream: tokio::net::UnixStream) -> Self {
         let (reader, writer) = tokio::io::split(stream);
-        let inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::UnboundedSender<Frame>>>> =
+        let inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let reader_task = spawn_reader(reader, inflight.clone());
         Self {
             writer: tokio::sync::Mutex::new(writer),
             inflight,
+            active_turn: tokio::sync::Mutex::new(None),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             negotiated: Vec::new(),
             _reader: Some(reader_task),
             _work: None,
+            _work_lock: None,
             _vm: None,
         }
     }
@@ -429,21 +440,41 @@ impl ZeroBootSession {
     /// captured streams. A legacy single-frame `Result` payload (used by older
     /// ZeroBoot rootfs images) is accepted for backward compatibility.
     ///
+    /// Takes `&Arc<Self>` so the turn/inflight ownership can be moved into an
+    /// RAII [`TurnGuard`]: an abandoned future (dropped mid-exchange) cleans
+    /// up its own registration instead of leaking it for the session lifetime.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
-    pub async fn exec(&self, request: Execute) -> std::result::Result<ExecResult, SessionError> {
-        // Hold the turn lock for the whole command: a concurrent exec or
-        // stream queues here instead of failing against the guest's
-        // single-turn contract.
-        let _turn = self.turn_lock.lock().await;
+    pub async fn exec(
+        self: &Arc<Self>,
+        request: Execute,
+    ) -> std::result::Result<ExecResult, SessionError> {
         let request_id = new_request_id();
         let payload = request.encode().map_err(protocol_error)?;
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(u64::from(request.timeout_ms))
             + EXEC_DEADLINE_MARGIN;
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        // Hold the turn lock for the whole command: a concurrent exec or
+        // stream queues here instead of failing against the guest's
+        // single-turn contract. Owned guard so it can live inside TurnGuard.
+        let turn = self.turn_lock.clone().lock_owned().await;
+        // Bounded demux channel: a stalled (or abandoned) consumer cannot
+        // grow host memory without bound; the reader drops overflow instead.
+        let (tx, mut rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
         self.inflight.lock().await.insert(request_id, tx);
+        // Publish the turn id only after the inflight registration, so a
+        // racing cancel_active can never target a request that has no channel.
+        *self.active_turn.lock().await = Some(request_id);
+        let turn_guard = TurnGuard {
+            session: Arc::clone(self),
+            _inflight: InflightGuard {
+                inflight: Arc::clone(&self.inflight),
+                request_id,
+            },
+            _turn: turn,
+        };
         let write_result = {
             let mut writer = self.writer.lock().await;
             write_frame_async(
@@ -459,9 +490,9 @@ impl ZeroBootSession {
             .map_err(map_io_error)
         };
         if let Err(error) = write_result {
-            // The request never reached the wire; do not leak the inflight
-            // entry (and its channel) for the rest of the session.
-            self.inflight.lock().await.remove(&request_id);
+            // The request never reached the wire; TurnGuard's drop removes
+            // both the inflight entry and the active turn registration.
+            drop(turn_guard);
             return Err(error);
         }
         let mut stdout = Vec::new();
@@ -532,7 +563,7 @@ impl ZeroBootSession {
                 }
             }
         };
-        self.inflight.lock().await.remove(&request_id);
+        drop(turn_guard);
         result
     }
 
@@ -566,12 +597,13 @@ impl ZeroBootSession {
         }
     }
 
-    /// Send a targeted Cancel for this session's in-flight request, if one
-    /// exists, and wait for its CancelAck. Returns whether a cancel was
-    /// actually sent: an idle session has nothing to cancel (the guest would
-    /// only acknowledge idempotently), so the caller can aggregate
-    /// `CancelResult.cancelled` honestly instead of claiming success from an
-    /// idle sibling while a busy connection keeps running.
+    /// Send a targeted Cancel for the request that currently holds this
+    /// session's guest turn, if one exists, and report whether a cancel was
+    /// actually sent. The target is the session's published `active_turn` id —
+    /// not a heuristic over the inflight map — so an idle session (no active
+    /// turn) reports `false` honestly and an abandoned future can no longer be
+    /// "cancelled" after its host-side waiter is gone: `TurnGuard` clears the
+    /// id when the turn discharges or the future drops.
     ///
     /// # Errors
     ///
@@ -580,9 +612,9 @@ impl ZeroBootSession {
         &self,
         reason: Option<String>,
     ) -> std::result::Result<bool, SessionError> {
-        let target = match self.inflight.lock().await.keys().next().copied() {
-            Some(id) => id,
-            None => return Ok(false),
+        let target = *self.active_turn.lock().await;
+        let Some(target) = target else {
+            return Ok(false);
         };
         // Fire-and-read-on-target: the CancelAck (and the cancel-induced
         // terminal) are routed by the TARGET request id into the active
@@ -673,11 +705,21 @@ impl ZeroBootSession {
             + Duration::from_millis(u64::from(request.timeout_ms))
             + EXEC_DEADLINE_MARGIN;
         // The stream occupies the guest's single turn until its terminal
-        // frame; the guard is stored in the returned ZeroBootStream and
-        // released when the stream terminates (or is dropped).
-        let turn_guard = self.turn_lock.clone().lock_owned().await;
-        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+        // frame; the TurnGuard (turn lock + inflight + active-turn id) is
+        // stored in the returned ZeroBootStream and released when the stream
+        // terminates — or on drop, so an abandoned stream cleans itself up.
+        let turn = self.turn_lock.clone().lock_owned().await;
+        let (tx, rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
         self.inflight.lock().await.insert(request_id, tx);
+        *self.active_turn.lock().await = Some(request_id);
+        let turn_guard = TurnGuard {
+            session: Arc::clone(self),
+            _inflight: InflightGuard {
+                inflight: Arc::clone(&self.inflight),
+                request_id,
+            },
+            _turn: turn,
+        };
         let write_result = {
             let mut writer = self.writer.lock().await;
             write_frame_async(
@@ -693,9 +735,9 @@ impl ZeroBootSession {
             .map_err(map_io_error)
         };
         if let Err(error) = write_result {
-            // The stream request never reached the wire; drop the inflight
-            // entry so it cannot outlive the failed call.
-            self.inflight.lock().await.remove(&request_id);
+            // The stream request never reached the wire; TurnGuard's drop
+            // removes the inflight entry and the active turn registration.
+            drop(turn_guard);
             return Err(error);
         }
         Ok(ZeroBootStream {
@@ -705,7 +747,7 @@ impl ZeroBootSession {
             deadline,
             terminated: false,
             pending: std::collections::VecDeque::new(),
-            _turn_guard: Some(turn_guard),
+            guard: Some(turn_guard),
             _slot: None,
             output_bytes: 0,
         })
@@ -751,8 +793,16 @@ impl ZeroBootSession {
         deadline: Option<tokio::time::Instant>,
     ) -> std::result::Result<Frame, SessionError> {
         let request_id = new_request_id();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let (tx, mut rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
         self.inflight.lock().await.insert(request_id, tx);
+        // RAII removal: the old manual cleanup at the end of this function
+        // never ran when the future itself was dropped mid-exchange, leaking
+        // the inflight entry (and every late frame routed to it) for the
+        // session's remaining lifetime.
+        let _inflight = InflightGuard {
+            inflight: Arc::clone(&self.inflight),
+            request_id,
+        };
         let write_result = {
             let mut writer = self.writer.lock().await;
             write_frame_async(
@@ -780,8 +830,75 @@ impl ZeroBootSession {
                 }
             }
         };
-        self.inflight.lock().await.remove(&request_id);
         result
+    }
+}
+
+/// Bound on one request's demux channel. Deep enough that a burst of Output
+/// frames never blocks the reader under normal pacing, shallow enough that a
+/// stalled consumer cannot grow host memory without bound (the reader drops
+/// overflow, rate-limited trace, instead of queueing forever).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const FRAME_CHANNEL_CAPACITY: usize = 256;
+
+/// RAII registration of one in-flight request's demux channel. Dropping it
+/// removes the inflight entry: inline when the map lock is uncontended (the
+/// common case at termination time), or via a spawned task when the reader
+/// task is currently routing a frame — mirroring the old `unregister`
+/// fallback so cleanup never blocks a drop.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+struct InflightGuard {
+    inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>>,
+    request_id: [u8; 16],
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.try_lock() {
+            inflight.remove(&self.request_id);
+            return;
+        }
+        // Contended (reader task routing a frame): fall back to a task.
+        let inflight = Arc::clone(&self.inflight);
+        let request_id = self.request_id;
+        tokio::spawn(async move {
+            inflight.lock().await.remove(&request_id);
+        });
+    }
+}
+
+/// RAII ownership of the guest's single turn for one request: the turn-lock
+/// guard, the request's inflight registration, and the session's published
+/// `active_turn` id. Dropping it releases all three in order (active turn
+/// cleared first, so a racing `cancel_active` never targets a request whose
+/// waiter is gone; then the inflight entry; then the turn lock).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+struct TurnGuard {
+    session: Arc<ZeroBootSession>,
+    _inflight: InflightGuard,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        let request_id = self._inflight.request_id;
+        if let Ok(mut active) = self.session.active_turn.try_lock() {
+            // Conditional clear: the spawned-task fallback below can land
+            // after a NEW turn already claimed the id slot.
+            if *active == Some(request_id) {
+                *active = None;
+            }
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        tokio::spawn(async move {
+            let mut active = session.active_turn.lock().await;
+            if *active == Some(request_id) {
+                *active = None;
+            }
+        });
     }
 }
 
@@ -841,8 +958,14 @@ impl SessionPool {
         })
     }
 
-    /// Session for control RPCs (health, filesystem): they interleave with an
-    /// active turn on the same connection instead of occupying a slot.
+    /// Session for the health probe only. The guest answers Health directly
+    /// off its runtime service (before any turn takes the workspace executor
+    /// out — see rfb-runtime/src/runtime_service/mod.rs `filesystem_rpc`),
+    /// so health interleaves with an active turn on this connection instead
+    /// of claiming a pool slot. Filesystem RPCs run on the guest's workspace
+    /// executor and therefore fail while a turn is active on their
+    /// connection — they must route through [`SessionPool::acquire`] onto a
+    /// free connection, not here.
     fn primary(&self) -> &Arc<ZeroBootSession> {
         &self.sessions[0]
     }
@@ -889,13 +1012,33 @@ impl SessionPool {
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn spawn_reader(
     mut reader: tokio::io::ReadHalf<tokio::net::UnixStream>,
-    inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::UnboundedSender<Frame>>>>,
+    inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok(frame) = read_frame_unbounded(&mut reader).await {
+        let mut overflowed: u64 = 0;
+        loop {
+            // Canonical single-implementation frame decoder shared with the
+            // guest (`rfb::protocol` re-exports rfb-runtime's zeroboot
+            // protocol); the connection closing (or a protocol error) ends
+            // the demultiplexer.
+            let frame = match read_frame_async(&mut reader).await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
             let sender = inflight.lock().await.get(&frame.request_id).cloned();
             if let Some(sender) = sender {
-                let _ = sender.send(frame);
+                // Bounded channel: a stalled or abandoned consumer cannot
+                // grow host memory without bound. Overflow is dropped, with
+                // a rate-limited trace (first drop, then every 1024th) so a
+                // firehose guest cannot flood stderr either.
+                if sender.try_send(frame).is_err() {
+                    overflowed += 1;
+                    if overflowed == 1 || overflowed.is_multiple_of(1024) {
+                        eprintln!(
+                            "rfb zeroboot: request channel full, dropped {overflowed} frame(s) so far"
+                        );
+                    }
+                }
             } else {
                 // Late or unknown frames (e.g. racing a completed request) are
                 // dropped by design — but they are also the classic symptom of
@@ -918,39 +1061,11 @@ fn spawn_reader(
     })
 }
 
-/// Read one complete ZBRT frame without an idle timeout. The reader task stays
-/// alive across quiet periods and long-running commands; a closed connection
-/// surfaces as an error that ends the demultiplexer.
-#[cfg(all(feature = "zeroboot", target_os = "linux"))]
-async fn read_frame_unbounded<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::result::Result<Frame, SessionError> {
-    use crate::protocol::HEADER_LEN;
-    let mut header = [0u8; HEADER_LEN];
-    reader.read_exact(&mut header).await.map_err(map_io_error)?;
-    if header[..4] != crate::protocol::MAGIC || header[4] != crate::protocol::VERSION {
-        return Err(SessionError::Protocol(
-            "invalid ZBRT magic or version".into(),
-        ));
-    }
-    let length = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-    if length > crate::protocol::MAX_PAYLOAD {
-        return Err(SessionError::Protocol("ZBRT payload too large".into()));
-    }
-    let mut bytes = header.to_vec();
-    bytes.resize(HEADER_LEN + length, 0);
-    reader
-        .read_exact(&mut bytes[HEADER_LEN..])
-        .await
-        .map_err(map_io_error)?;
-    Frame::decode(&mut bytes.as_slice()).map_err(protocol_error)
-}
-
 /// Wait for the next frame of a request, bounded by the remaining exec
 /// deadline (or the fixed I/O timeout when no deadline is set).
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 async fn await_frame_bounded(
-    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
     deadline: &mut Option<tokio::time::Instant>,
     io_timeout: Duration,
 ) -> std::result::Result<Frame, SessionError> {
@@ -970,7 +1085,7 @@ async fn await_frame_bounded(
 /// Wait for the next frame of a request before `deadline`.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 async fn await_frame(
-    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
     deadline: tokio::time::Instant,
 ) -> std::result::Result<Frame, SessionError> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -996,7 +1111,7 @@ async fn await_frame(
 pub struct ZeroBootStream {
     session: Arc<ZeroBootSession>,
     request_id: [u8; 16],
-    rx: mpsc::UnboundedReceiver<Frame>,
+    rx: mpsc::Receiver<Frame>,
     /// Absolute deadline for every frame wait on this stream (output reads
     /// and the `stop` drain). Derived from the Execute request's timeout.
     deadline: tokio::time::Instant,
@@ -1004,11 +1119,12 @@ pub struct ZeroBootStream {
     /// Events decoded but not yet delivered (legacy `Result` frames expand to
     /// stdout/stderr chunks plus a terminal Exit).
     pending: std::collections::VecDeque<StreamEvent>,
-    /// Held while this stream occupies the guest's single turn. Released as
-    /// soon as the terminal frame discharges the turn (or on drop, which
-    /// frees the queue but leaves the guest turn active until the next
-    /// request fails closed — the pre-existing abandoned-stream behavior).
-    _turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Turn + inflight + active-turn ownership for this stream's request.
+    /// Released as soon as the terminal frame discharges the turn — or on
+    /// drop, which also unregisters the request and frees the queue (the
+    /// guest turn itself stays active until the next request fails closed —
+    /// the pre-existing abandoned-stream behavior).
+    guard: Option<TurnGuard>,
     /// Pool slot backing this stream; released when the stream discharges or
     /// drops, so another request can claim the connection.
     _slot: Option<PooledSession>,
@@ -1020,29 +1136,22 @@ pub struct ZeroBootStream {
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 impl ZeroBootStream {
-    fn unregister(&self) {
-        // Remove the inflight entry inline: the map lock is uncontended at
-        // termination time, and spawning a task per terminated stream just
-        // to delete one entry wastes a task and reorders the removal behind
-        // the scheduler.
-        let session = self.session.clone();
-        let request_id = self.request_id;
-        if let Ok(mut inflight) = session.inflight.try_lock() {
-            inflight.remove(&request_id);
-            return;
-        }
-        // Contended (reader task routing a frame): fall back to a task.
-        tokio::spawn(async move {
-            session.inflight.lock().await.remove(&request_id);
-        });
-    }
-
-    /// Mark the stream terminated and release its turn so a queued exec or
-    /// stream can start.
+    /// Mark the stream terminated and release its turn, inflight
+    /// registration, and pool slot so a queued exec or stream can start.
     fn discharge(&mut self) {
         self.terminated = true;
-        self._turn_guard = None;
+        self.guard = None;
         self._slot = None;
+    }
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl Drop for ZeroBootStream {
+    fn drop(&mut self) {
+        // Cleanup is delegated to the RAII fields: a stream that never
+        // reached its terminal frame is cleaned up here by `guard`
+        // (inflight entry + active turn + turn lock) and `_slot` (pool
+        // capacity). The pending queue and receiver drop with the struct.
     }
 }
 
@@ -1067,18 +1176,15 @@ impl GuestStream for ZeroBootStream {
                     // drains the inflight channels, so a missing frame means
                     // the session is gone. Surface as a clean stream end.
                     self.discharge();
-                    self.unregister();
                     return Ok(None);
                 }
                 Err(error) => {
                     self.discharge();
-                    self.unregister();
                     return Err(map_session_error(error));
                 }
             };
             if frame.request_id != self.request_id {
                 self.discharge();
-                self.unregister();
                 return Err(SandboxError::Transport(
                     "request_id mismatch on stream frame".into(),
                 ));
@@ -1093,7 +1199,6 @@ impl GuestStream for ZeroBootStream {
                         1 => StreamEvent::Stderr { data: output.data },
                         other => {
                             self.discharge();
-                            self.unregister();
                             return Err(SandboxError::Transport(format!(
                                 "unknown output stream id {other}"
                             )));
@@ -1103,7 +1208,6 @@ impl GuestStream for ZeroBootStream {
                     self.output_bytes = self.output_bytes.saturating_add(event_data_len(&event));
                     if self.output_bytes > MAX_EXEC_OUTPUT_BYTES {
                         self.discharge();
-                        self.unregister();
                         return Err(SandboxError::Transport(
                             "guest output exceeded the 16 MiB limit".into(),
                         ));
@@ -1114,7 +1218,6 @@ impl GuestStream for ZeroBootStream {
                     let exit = Exit::decode(&frame.payload)
                         .map_err(|e| SandboxError::Transport(format!("invalid Exit frame: {e}")))?;
                     self.discharge();
-                    self.unregister();
                     Ok(Some(StreamEvent::Exit {
                         code: Some(exit.code),
                     }))
@@ -1123,10 +1226,9 @@ impl GuestStream for ZeroBootStream {
                     let (code, out, err) = parse_legacy_result(&frame.payload)
                         .map_err(|e| SandboxError::Transport(e.to_string()))?;
                     self.discharge();
-                    self.unregister();
                     // Emit the captured streams first (stdout has wire
                     // priority), then the terminal Exit. These are queued
-                    // because unregister() drops the frame sender: reading
+                    // because discharge() drops the frame sender: reading
                     // them from the channel would report a clean end before
                     // the exit code is delivered.
                     if !out.is_empty() {
@@ -1142,7 +1244,6 @@ impl GuestStream for ZeroBootStream {
                 Kind::Error => {
                     let error = remote_error(&frame.payload);
                     self.discharge();
-                    self.unregister();
                     Err(match error {
                         SessionError::Remote { message, .. } => SandboxError::Execution(message),
                         other => SandboxError::Transport(other.to_string()),
@@ -1193,18 +1294,15 @@ impl GuestStream for ZeroBootStream {
                         // id); Exit / Error / Result are the terminal frames.
                         if matches!(frame.kind, Kind::Exit | Kind::Error | Kind::Result) {
                             self.discharge();
-                            self.unregister();
                             return Ok(());
                         }
                     }
                     Err(SessionError::Io(_)) => {
                         self.discharge();
-                        self.unregister();
                         return Ok(());
                     }
                     Err(error) => {
                         self.discharge();
-                        self.unregister();
                         return Err(map_session_error(error));
                     }
                 }
@@ -1258,7 +1356,27 @@ const VM_MEM_MIB_ENV: &str = "RFB_ZBRT_VM_MEM_MIB";
 fn vm_mem_mib() -> u32 {
     // Capacity-evaluation override: lets operators measure the real memory
     // floor of a ZBRT microVM without touching wire behavior or defaults.
-    env_positive(VM_MEM_MIB_ENV).unwrap_or(VM_MEM_MIB)
+    match env_positive(VM_MEM_MIB_ENV) {
+        Some(value) if value < 32 => {
+            eprintln!(
+                "rfb: {VM_MEM_MIB_ENV}={value} is below the 32 MiB sanity floor; \
+                 falling back to the default {VM_MEM_MIB} MiB"
+            );
+            VM_MEM_MIB
+        }
+        // The measured Firecracker floor is 48 MiB (below that the VM can
+        // fail its machine-config or OOM at boot); honor the override for
+        // capacity probing but say so in the logs.
+        Some(value) if value < 48 => {
+            eprintln!(
+                "rfb: {VM_MEM_MIB_ENV}={value} is below the measured Firecracker \
+                 floor of 48 MiB; honoring it, but the VM may fail to boot"
+            );
+            value
+        }
+        Some(value) => value,
+        None => VM_MEM_MIB,
+    }
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
@@ -1486,6 +1604,9 @@ async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
         .as_ref()
         .and_then(|path| path.to_str())
         .ok_or(Error::InvalidConfiguration("rootfs path is required"))?;
+    // Fail closed when the configured Firecracker binary contradicts a
+    // neighboring SHA256SUMS manifest, before any process is spawned.
+    verify_firecracker(config)?;
     let work = tempfile::Builder::new()
         .prefix("rfb-zeroboot-")
         .tempdir()
@@ -1495,6 +1616,9 @@ async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
         .to_str()
         .ok_or_else(|| Error::Backend("invalid work path".into()))?
         .to_owned();
+    // Liveness marker: the scavenger reclaims this dir only if it can take
+    // this flock, which is impossible while we hold it.
+    let work_lock = create_work_lock(&work_path)?;
     let (vm, uds) = tokio::task::spawn_blocking({
         let firecracker = firecracker.to_owned();
         let kernel = kernel.to_owned();
@@ -1525,8 +1649,10 @@ async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
         .map_err(|e| Error::Backend(format!("ZeroBoot session open failed: {e}")))?;
     // Ownership of the VM and its work dir stays with the primary session:
     // dropping it tears the VM down, and the rest of the pool only holds
-    // connections into it.
+    // connections into it. The work lock rides along so the directory cannot
+    // be scavenged while any session of this pool is alive.
     primary._work = Some(work);
+    primary._work_lock = Some(work_lock);
     primary._vm = Some(vm);
     let mut sessions = vec![Arc::new(primary)];
     sessions.extend(open_extra_sessions(&uds, config.guest_port).await?);
@@ -1572,6 +1698,28 @@ const SNAPSHOT_IDENTITY_VERSION: u32 = 2;
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn file_sha256(path: &Path) -> String {
     use sha2::{Digest, Sha256};
+    // Process-level (len, mtime) cache: hot creates re-fingerprint the same
+    // 3 assets (kernel/rootfs/firecracker) on every boot_and_open /
+    // ensure_parent_snapshot, and the rootfs is hundreds of MiB. A stat pair
+    // is orders of magnitude cheaper than re-hashing; any write bumps mtime
+    // (or length), which invalidates the entry.
+    type Cache = std::sync::Mutex<HashMap<PathBuf, (u64, u128, String)>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let lock_cache = || CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.len(), mtime_nanos(&meta)));
+    let cache_key = stamp.map(|(len, mtime)| (path.to_path_buf(), len, mtime));
+    if let Some((key_path, len, mtime)) = &cache_key {
+        let cache = lock_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_len, cached_mtime, hash)) = cache.get(key_path) {
+            if *cached_len == *len && *cached_mtime == *mtime {
+                return hash.clone();
+            }
+        }
+    }
     let mut hasher = Sha256::new();
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1584,11 +1732,29 @@ fn file_sha256(path: &Path) -> String {
             Ok(n) => hasher.update(&chunk[..n]),
         }
     }
-    hasher
+    let hash: String = hasher
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect()
+        .collect();
+    if let Some((key_path, len, mtime)) = cache_key {
+        lock_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key_path, (len, mtime, hash.clone()));
+    }
+    hash
+}
+
+/// Nanosecond modification time of `meta`, 0 when the platform cannot report
+/// it (used only as a cache-invalidation stamp, never as a security signal).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn mtime_nanos(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0)
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
@@ -1673,30 +1839,212 @@ impl SnapshotDirLock {
                 .open(&path)
         }
         .map_err(|e| Error::Backend(format!("open snapshot lock {}: {e}", path.display())))?;
-        // SAFETY: flock(2) on an owned fd; LOCK_EX blocks until competing
-        // holders (same or other processes) release.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(Error::Backend(format!(
-                "flock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
+        // Bounded non-blocking flock loop: a stale lock holder is impossible
+        // (the kernel releases flock when the owner's fds close), so a wait
+        // here is genuine contention with a live create/restore. Hot creates
+        // serialize at ~100 ms per shard; a two-minute wait means the holder
+        // is wedged, and a clean error beats hanging the caller forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            // SAFETY: flock(2) on an owned fd.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Backend(format!(
+                        "flock {} timed out after 120s: a competing snapshot holder is wedged",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            return Err(Error::Backend(format!("flock {}: {error}", path.display())));
         }
         Ok(Self { _file: file })
     }
 }
 
+/// Create `dir` (and its parents) and force mode 0700 immediately, failing
+/// closed. Snapshot directories hold VM memory and guest secrets, so a chmod
+/// that cannot be applied aborts the create instead of leaving a window (or a
+/// permanently permissive directory).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn create_dir_private(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Error::Backend(format!("create {}: {e}", dir.display())))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::Backend(format!("chmod 0700 {}: {e}", dir.display())))
+}
+
+/// Create and LOCK_EX `<work_path>/work.lock`, returning the owning fd. A live
+/// process holds this flock for the session's lifetime, which is exactly what
+/// makes the process-startup scavenger safe: it only reclaims directories
+/// whose lock it can take without blocking.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn create_work_lock(work_path: &str) -> Result<std::fs::File> {
+    let path = Path::new(work_path).join("work.lock");
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+    }
+    .map_err(|e| Error::Backend(format!("create work lock {}: {e}", path.display())))?;
+    // SAFETY: flock(2) on an owned fd; LOCK_EX blocks only against the
+    // scavenger's non-blocking probe (which is designed to lose).
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(Error::Backend(format!(
+            "flock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(file)
+}
+
+/// Fail closed when the configured Firecracker binary contradicts a
+/// neighboring `SHA256SUMS` manifest (see
+/// [`crate::zeroboot::verify_firecracker_binary`]).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn verify_firecracker(config: &Config) -> Result<()> {
+    let path = config
+        .firecracker
+        .as_ref()
+        .ok_or(Error::InvalidConfiguration("Firecracker path is required"))?;
+    match super::verification::verify_firecracker_binary(path) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(Error::Backend(error)),
+    }
+}
+
+/// Reclaim stale directories directly under `root`. Each candidate directory
+/// is probed by taking a NON-BLOCKING `LOCK_EX` flock on its `<lock_name>`
+/// file: success proves no live process owns the directory (the kernel drops
+/// flocks with the owning fd), so it is removed and counted. Busy locks —
+/// and directories with no lock file, e.g. a create interrupted before the
+/// lock landed — are left alone. IO errors are logged, never propagated; the
+/// scavenger runs on the create path and must not fail a sandbox create.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+#[doc(hidden)]
+pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "rfb zeroboot: scavenge cannot list {}: {error}",
+                root.display()
+            );
+            return 0;
+        }
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let lock_path = dir.join(lock_name);
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            // No lock file: not (yet) one of our live directories — keep it.
+            Err(_) => continue,
+        };
+        // SAFETY: flock(2) on an owned fd; LOCK_NB never blocks.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            // Live holder (or a transient error): leave the directory alone.
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed += 1,
+            Err(error) => eprintln!("rfb zeroboot: scavenge {} failed: {error}", dir.display()),
+        }
+    }
+    removed
+}
+
+/// Process-startup scavenger: once per process, reclaim orphaned session work
+/// directories in the system temp dir (`rfb-zeroboot-*`, lock `work.lock`)
+/// and stale fork checkpoint dirs under the snapshot base (`fork-*` per
+/// shard, lock `fork.lock`). Repeated calls report the first call's count.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+#[doc(hidden)]
+pub fn scavenge_stale_state(snapshot_base: Option<&std::path::Path>) -> usize {
+    static SCAVENGED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SCAVENGED.get_or_init(|| {
+        let mut removed = scavenge_stale_in(&std::env::temp_dir(), "work.lock");
+        if let Some(base) = snapshot_base {
+            // Sharded layouts keep their fork dirs under `shard-N/`; the
+            // single-shard layout keeps them directly under the base.
+            removed += scavenge_stale_in(base, "fork.lock");
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && entry.file_name().to_string_lossy().starts_with("shard-") {
+                        removed += scavenge_stale_in(&path, "fork.lock");
+                    }
+                }
+            }
+        }
+        removed
+    })
+}
+
 /// Tighten snapshot permissions: `memory.bin`/`vmstate` contain a full copy
 /// of the VM's memory (guest secrets included) and must not be world-readable.
-/// The chmod is verified: a filesystem that rejects it (or a racing actor
-/// that re-widens the mode) is reported, never silently accepted — the
-/// snapshot files hold guest memory on a shared tmpfs.
+///
+/// Directory hardening (`parent`, `parent/work` — and transitively every
+/// fork checkpoint dir this is called on) is fail-closed: a chmod that fails
+/// or verifies with a wider mode is an `Err`, because a shared tmpfs dir
+/// exposing VM memory is exactly the state this function exists to prevent.
+/// File hardening stays best-effort (eprintln + verification warning) so a
+/// quirky filesystem cannot wedge the create path — the enclosing directory
+/// is already 0700 there.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-fn harden_snapshot_permissions(parent: &std::path::Path) {
+fn harden_snapshot_permissions(parent: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let tighten = |path: &std::path::Path, mode: u32| {
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+    let tighten_dir = |path: &std::path::Path| -> Result<()> {
+        if !path.is_dir() {
+            // Fork checkpoints have no `work/` subdir; nothing to harden.
+            return Ok(());
+        }
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            return Err(Error::Backend(format!(
+                "snapshot dir chmod failed on {}: {error}",
+                path.display()
+            )));
+        }
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.permissions().mode() & 0o777 != 0o700 => Err(Error::Backend(format!(
+                "snapshot dir {} keeps permissive mode {:o} (expected 700)",
+                path.display(),
+                meta.permissions().mode() & 0o777
+            ))),
+            Ok(_) => Ok(()),
+            Err(error) => Err(Error::Backend(format!(
+                "snapshot dir mode verify failed on {}: {error}",
+                path.display()
+            ))),
+        }
+    };
+    let tighten_file = |path: &std::path::Path| {
+        if !path.is_file() {
+            return;
+        }
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             eprintln!(
                 "rfb: snapshot permission hardening failed on {}: {error}",
                 path.display()
@@ -1704,12 +2052,11 @@ fn harden_snapshot_permissions(parent: &std::path::Path) {
             return;
         }
         match std::fs::metadata(path) {
-            Ok(meta) if meta.permissions().mode() & 0o777 != mode => {
+            Ok(meta) if meta.permissions().mode() & 0o777 != 0o600 => {
                 eprintln!(
-                    "rfb: snapshot {} keeps permissive mode {:o} (expected {:o})",
+                    "rfb: snapshot {} keeps permissive mode {:o} (expected 600)",
                     path.display(),
-                    meta.permissions().mode() & 0o777,
-                    mode
+                    meta.permissions().mode() & 0o777
                 );
             }
             Ok(_) => {}
@@ -1721,14 +2068,12 @@ fn harden_snapshot_permissions(parent: &std::path::Path) {
             }
         }
     };
-    tighten(parent, 0o700);
-    tighten(&parent.join("work"), 0o700);
+    tighten_dir(parent)?;
+    tighten_dir(&parent.join("work"))?;
     for name in ["vmstate", "memory.bin", "identity.json"] {
-        let path = parent.join(name);
-        if path.is_file() {
-            tighten(&path, 0o600);
-        }
+        tighten_file(&parent.join(name));
     }
+    Ok(())
 }
 
 /// Return the parent snapshot paths for `dir`, creating the snapshot on first
@@ -1767,13 +2112,16 @@ async fn ensure_parent_snapshot(
         let _ = std::fs::remove_dir_all(&parent);
     }
     let (firecracker, kernel, rootfs) = vm_paths(config)?;
-    std::fs::create_dir_all(&parent).map_err(|e| Error::Backend(e.to_string()))?;
+    // Fail closed before booting the parent when a neighboring SHA256SUMS
+    // manifest lists this binary with a different digest.
+    verify_firecracker(config)?;
+    create_dir_private(&parent)?;
     let work_path = parent
         .join("work")
         .to_str()
         .ok_or_else(|| Error::Backend("parent work path is not valid UTF-8".into()))?
         .to_owned();
-    std::fs::create_dir_all(&work_path).map_err(|e| Error::Backend(e.to_string()))?;
+    create_dir_private(std::path::Path::new(&work_path))?;
     let (mut vm, _uds) = tokio::task::spawn_blocking({
         let firecracker = firecracker.clone();
         let kernel = kernel.clone();
@@ -1836,9 +2184,14 @@ async fn ensure_parent_snapshot(
     })
     .await
     .map_err(|e| Error::Backend(format!("ZeroBoot parent snapshot writer failed: {e}")))??;
-    std::fs::write(&identity_path, snapshot_identity(config))
-        .map_err(|e| Error::Backend(e.to_string()))?;
-    harden_snapshot_permissions(&parent);
+    // identity.json doubles as the snapshot's completeness marker (written
+    // after both snapshot files). Harden BEFORE checking the write result: a
+    // failed prepare must not leave a readable half-snapshot behind either —
+    // the chmod is fail-closed, the write error is reported only after it.
+    let identity_result = std::fs::write(&identity_path, snapshot_identity(config))
+        .map_err(|e| Error::Backend(e.to_string()));
+    harden_snapshot_permissions(&parent)?;
+    identity_result?;
     Ok((vmstate, mem))
 }
 
@@ -1861,6 +2214,10 @@ async fn restore_and_open(
 ) -> Result<Vec<Arc<ZeroBootSession>>> {
     use std::sync::atomic::Ordering;
     let (vmstate, mem) = ensure_parent_snapshot(config, dir).await?;
+    // Re-harden before any restore touches the snapshot: the cached-snapshot
+    // early return skips ensure_parent_snapshot's own hardening, and a
+    // permissive mode must fail the restore rather than be tolerated.
+    harden_snapshot_permissions(&dir.join("parent"))?;
     let (firecracker, _kernel, rootfs) = vm_paths(config)?;
     let work = tempfile::Builder::new()
         .prefix("rfb-zeroboot-")
@@ -1871,6 +2228,8 @@ async fn restore_and_open(
         .to_str()
         .ok_or_else(|| Error::Backend("invalid work path".into()))?
         .to_owned();
+    // Liveness marker for the scavenger, exactly like the cold-boot path.
+    let work_lock = create_work_lock(&work_path)?;
     let mode = RESTORE_MODE.load(Ordering::Relaxed);
     // Bare restore (patched build) reuses the parent's baked rootfs — the
     // per-create staging copy would be discarded, so skip it entirely. The
@@ -1925,6 +2284,7 @@ async fn restore_and_open(
             ))
         })?;
     primary._work = Some(work);
+    primary._work_lock = Some(work_lock);
     primary._vm = Some(vm);
     let mut sessions = vec![Arc::new(primary)];
     sessions.extend(open_extra_sessions(&uds, config.guest_port).await?);
@@ -2007,6 +2367,18 @@ impl ZeroBootProvider {
     ) -> BoxFuture<'a, std::result::Result<ZeroBootSandbox, ProviderError>> {
         Box::pin(async move {
             crate::core::check_create_spec(&spec, self.capabilities())?;
+            // ZeroBoot has no per-sandbox sizing knob on the create path
+            // (memory/vcpu come from RFB_ZBRT_* process-wide env), so every
+            // declared resource constraint fails closed instead of being
+            // silently ignored.
+            crate::core::check_create_resources(&spec, false)?;
+            #[cfg(all(feature = "zeroboot", target_os = "linux"))]
+            {
+                // Reclaim work/snapshot directories whose owning process died
+                // (their flocks were dropped by the kernel). Once per process,
+                // and only directories whose lock is provably unheld.
+                let _ = scavenge_stale_state(snapshot_dir().as_deref());
+            }
             match self.unavailable() {
                 Ok(()) => {}
                 Err(Error::Unsupported(capability)) => {
@@ -2099,6 +2471,10 @@ pub struct ZeroBootSandbox {
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 struct ForkCheckpoint {
     dir: PathBuf,
+    /// flock'd `<dir>/fork.lock`: the live-process liveness marker the
+    /// process-startup scavenger probes, held for as long as any sibling
+    /// restored from this checkpoint is alive.
+    _lock: std::fs::File,
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
@@ -2133,12 +2509,17 @@ impl ZeroBootSandbox {
             request.validate().map_err(SandboxError::InvalidSpec)?;
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                check_supported(self.pool.primary(), capability)?;
+                // Filesystem RPCs execute on the guest's workspace executor,
+                // which a running turn has taken out of its connection's
+                // runtime service. Routing through the pool claims a free
+                // connection instead of failing (or queueing) behind the
+                // primary session's active turn.
+                let slot = self.pool.acquire().await;
+                check_supported(slot.session(), capability)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
-                let data = self
-                    .pool
-                    .primary()
+                let data = slot
+                    .session()
                     .fs(op, &path, payload)
                     .await
                     .map_err(map_session_error)?;
@@ -2210,12 +2591,47 @@ impl ZeroBootSandbox {
         // identity.json}. The fork checkpoint must adopt it exactly, or the
         // restore silently boots a fresh (stateless) parent instead.
         let checkpoint = fork_dir.join("parent");
-        std::fs::create_dir_all(&checkpoint)
-            .map_err(|e| ProviderError::Unavailable(format!("create fork dir: {e}")))?;
+        create_dir_private(&checkpoint).map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+        // fork_dir itself must be owner-only before the memory files land in
+        // its subtree; a chmod failure aborts the fork (fail-closed).
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&fork_dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(error) =
+                std::fs::set_permissions(&fork_dir, std::fs::Permissions::from_mode(0o700))
+            {
+                let _ = std::fs::remove_dir_all(&fork_dir);
+                return Err(ProviderError::Unavailable(format!(
+                    "fork dir chmod failed on {}: {error}",
+                    fork_dir.display()
+                )));
+            }
         }
+        // Liveness marker: created before the (possibly slow) checkpoint so a
+        // concurrently starting process can never reclaim this dir mid-fork.
+        let fork_lock = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = fork_dir.join("fork.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&fork_dir);
+                    ProviderError::Unavailable(format!("create fork lock {}: {e}", path.display()))
+                })?;
+            // SAFETY: flock(2) on an owned fd.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = std::fs::remove_dir_all(&fork_dir);
+                return Err(ProviderError::Unavailable(format!(
+                    "flock {}: {error}",
+                    path.display()
+                )));
+            }
+            file
+        };
         let vmstate = checkpoint.join("vmstate");
         let mem = checkpoint.join("memory.bin");
         let path_str = |path: &std::path::Path| {
@@ -2257,12 +2673,20 @@ impl ZeroBootSandbox {
                 "fork checkpoint failed: {error}"
             )));
         }
-        harden_snapshot_permissions(&checkpoint);
+        // The checkpoint holds guest memory: a chmod that cannot be enforced
+        // aborts the fork instead of publishing a readable checkpoint.
+        if let Err(error) = harden_snapshot_permissions(&checkpoint) {
+            let _ = std::fs::remove_dir_all(&fork_dir);
+            return Err(ProviderError::Unavailable(format!(
+                "fork checkpoint hardening failed: {error}"
+            )));
+        }
         // The original VM is now paused with its connections reset; tear it
         // down and restore two fresh children from the checkpoint instead.
         drop(pool);
         let checkpoint_guard = Arc::new(ForkCheckpoint {
             dir: fork_dir.clone(),
+            _lock: fork_lock,
         });
         let mut restored = Vec::with_capacity(2);
         for _ in 0..2 {
@@ -2401,6 +2825,13 @@ impl Sandbox for ZeroBootSandbox {
         Box::pin(async move {
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
+                // Health intentionally stays on the primary session: the guest
+                // answers it directly off its runtime service (its workspace
+                // executor is untouched — see
+                // rfb-runtime/src/runtime_service/mod.rs `filesystem_rpc`),
+                // so a probe interleaves with an active turn instead of
+                // claiming a pool slot. Filesystem RPCs do NOT share that
+                // property and route through `SessionPool::acquire` instead.
                 check_supported(self.pool.primary(), Capability::Health)?;
                 self.pool
                     .primary()
@@ -2448,11 +2879,15 @@ impl Sandbox for ZeroBootSandbox {
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
                 check_supported(self.pool.primary(), Capability::Cancel)?;
-                // The target lives on whichever connection is running it: fan
-                // the cancel out over every session, but only connections
-                // with an in-flight request actually send a Cancel — an idle
-                // session's idempotent ack must not claim success for a busy
-                // sibling, and a cancel never stops early on the first ack.
+                // The target lives on whichever connection is running it. The
+                // request's id is advisory/diagnostic only (it rides along as
+                // the cancel reason): the provider cancels BROADLY — every
+                // session that currently holds an active turn is targeted —
+                // rather than trusting the caller's id to name the right
+                // connection. Only connections with an in-flight request
+                // actually send a Cancel; an idle session reports `false` so
+                // an idempotent ack cannot claim success for a busy sibling,
+                // and the fan-out never stops early on a first ack.
                 let mut targeted = false;
                 let mut last_error = None;
                 for session in self.pool.all() {

@@ -25,11 +25,12 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 
 | 参数 | 缺省解析 |
 |---|---|
-| `base_url` | env `FORKD_URL` → `http://127.0.0.1:8889`；仅接受 http/https 且带 host |
+| `base_url` | env `FORKD_URL` → `http://127.0.0.1:8889`（未设**或空白**都回退默认）；仅接受 http/https 且带 host，否则本地 Validation |
 | `token` | env `FORKD_TOKEN`；**非空才带** `Authorization: Bearer` 头 |
 | `timeout_s` | 10 秒；必须 `> 0`（Java/C# 另拒绝 NaN/Inf），否则 Validation 错误 |
 
-超时覆盖一次 HTTP 请求（连接 + 读）全程。环境变量总表见 §10。
+超时覆盖一次 HTTP 请求（连接 + 读）全程。环境变量总表见 §10。guest 侧可选的 agent 认证
+（`FORKD_AGENT_TOKEN`：配置后每条 guest 连接必须先发 auth 首帧）见 §10 与 `PROTOCOL.md §2.6`。
 
 ## 3. controller 生命周期（快照 / 沙箱）
 
@@ -47,8 +48,8 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 
 | 方法 | 签名要点 | 行为要点 |
 |---|---|---|
-| `ping()` | → `bool` | NDJSON：仅 `pong==true` 算健康（`healthy` 字段不作数）；ZBRT：HealthAck 的 `healthy` |
-| `exec(args, cwd="/", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
+| `ping()` | → `bool` | NDJSON：仅 `pong==true` 算健康（`healthy` 字段不作数；应答另含附加键 `protocol_version`=1，客户端忽略未知键）；ZBRT：HealthAck 的 `healthy` |
+| `exec(args, cwd="/", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；ZBRT 的 `argc` 是单字节，`>255` 本地 Validation（零帧，连 TCP 都不建）；单 turn stdout+stderr 聚合 `>16 MiB` → Remote；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
 | `eval(code, cwd=None, timeout_s=None)` | code 去空白非空、≤ 1 MiB；timeout > 0 | 输出映射 `stdout`（`output`，旧 `out` 等价），`stderr` 恒空，exit 取 `status`（旧 `exit_code` 等价，缺省 0）；**ZBRT 下本地 fail closed**（ValidationError，零帧上线：v1 无 eval opcode，见 `sdk/shared/README.md §1`） |
 | `ls(path=".")` / `find(path, pattern)` / `grep(path, pattern)` | fs 路径 + pattern 校验 | `max_results=1000`（grep 另 `max_bytes=51200`）；find 返回 `[str]`，grep 返回 `[GrepMatch]` |
 | `read(path, offset=None, max_bytes=None)` | `max_bytes` 必须 `1..=51200` | → `FileRead{data, truncated, total_bytes}` |
@@ -62,7 +63,7 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 
 | 方法 | 语义 |
 |---|---|
-| `next_event()` → `StreamEvent(kind, data, code)` 或 `None` | 干净关闭（终结 Exit 后或对端断开）→ `None`；NDJSON 事件映射见 `PROTOCOL.md §2.5`（旧 `out`/`err` 键照收）；ZBRT：Output(0/1) → stdout/stderr，Exit → exit(code)，Error → Remote |
+| `next_event()` → `StreamEvent(kind, data, code)` 或 `None` | 干净关闭（终结 Exit 后或对端断开）→ `None`；NDJSON 事件映射见 `PROTOCOL.md §2.5`（旧 `out`/`err` 键照收）；ZBRT：**连接建立即发送 Hello 强制握手**（未握手帧被 guest 拒绝），ZBRT 无 started 帧，**首次 `next_event` 由客户端合成 `started`**（§9 场景 6），Output(0/1) → stdout/stderr，Exit → exit(code)，Error → Remote |
 | `send_input(text)` | 发 `{"in": text}`；仅 NDJSON 支持（ZBRT v1 无输入通道 → Remote）；终结/停止后 → Remote |
 | `stop()` | 幂等：NDJSON 发 `{"action":"stop"}`；ZBRT 发 Cancel（target=本请求 id）并等空 CancelAck，期间到的 Output 先缓冲 |
 
@@ -80,11 +81,11 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 
 | 类别 | 何时抛 | Rust | Python | Java | C# |
 |---|---|---|---|---|---|
-| Transport | 连接/读写失败、**一切超时**（请求、wait_snapshot、ZBRT 读停顿） | `RfbError::Transport` | `TransportError` | `TransportError` | `TransportException` |
+| Transport | 连接/读写失败、**一切超时**（controller 请求超时 `ForkdClientError::Timeout`、wait_snapshot 超时、ZBRT 读停顿、ZBRT 握手失败） | `RfbError::Transport` | `TransportError` | `TransportError` | `TransportException` |
 | Http | forkd controller 返回非 2xx（携带 status + message） | `RfbError::Http` | `HttpStatusError` | `HttpStatusError` | `HttpStatusException` |
 | Decode | 响应/帧无法解码，含严格 codec 拒绝（坏 magic/版本/flags/未知 kind/截断/尾随/超限）、缺结果字段 | `RfbError::Decode` | `DecodeError` | `DecodeError` | `DecodeException` |
-| Remote | 对端报错：guest `error` 行、ZBRT Error 帧、controller body `error` 字段、“sandbox not found”、快照 `failed`、对端提前关闭 | `RfbError::Remote` | `RemoteError` | `RemoteError` | `RemoteException` |
-| Validation | 发送前本地校验失败（§4/`PROTOCOL.md §2.3`）——**fail closed，零网络流量** | `RfbError::Validation` | `ValidationError` | `ValidationError` | `ValidationException` |
+| Remote | 对端报错：guest `error` 行、ZBRT Error 帧、controller body `error` 字段、controller 客户端分类为 Remote 的对端失败（`ForkdClientError::Remote`）、“sandbox not found”、快照 `failed`、对端提前关闭、ZBRT 单 turn 聚合输出 >16 MiB | `RfbError::Remote` | `RemoteError` | `RemoteError` | `RemoteException` |
+| Validation | 发送前本地校验失败（§4/`PROTOCOL.md §2.3`）——非法 `base_url`/transport、空 argv、ZBRT argc>255、ZBRT pty/env、eval over ZBRT 等；**fail closed，零网络流量** | `RfbError::Validation` | `ValidationError` | `ValidationError` | `ValidationException` |
 
 Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆盖。
 
@@ -92,13 +93,15 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 
 | 项 | 值 |
 |---|---|
-| controller URL / 端口 | env `FORKD_URL` → `http://127.0.0.1:8889` |
-| controller 超时 | 10 s（每请求） |
+| controller URL / 端口 | env `FORKD_URL` → `http://127.0.0.1:8889`（未设或空白都回退默认） |
+| controller 超时 | 10 s（每请求；超时属 Transport 类） |
 | `wait_snapshot` 预算 / 轮询间隔 | 60 s / 100 ms |
 | `exec` 超时 / cwd | 60 s / `"/"`（Java NDJSON 缺省 cwd 为 `/workspace`，见 §11） |
 | guest 端口 | NDJSON agent TCP **8888**；ZBRT vsock **5000**（→ TCP relay） |
 | 工作区根 | `/workspace`（agent 侧可用 `RFB_AGENT_WORKSPACE` 覆盖） |
 | 单帧 / 单行上限 | ZBRT payload ≤ **16 MiB**；NDJSON 行 ≤ **1 MiB** |
+| ZBRT 单 turn 聚合输出 | stdout+stderr ≤ **16 MiB**，超限 → Remote |
+| guest agent 认证 | `FORKD_AGENT_TOKEN` 非空才启用；首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
 | 路径 / pattern | 4096 / 1024 字节（UTF-8） |
 | 结果数 / 结果与写入负载 | 1000 条 / 51200 字节（50 KiB） |
 | eval 代码 | 1 MiB |
@@ -114,16 +117,17 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 3. `write("notes.txt", b"hello")` → `read` 回读字节相等（append 可选）；
 4. `ls / find / grep` 返回同形结果；
 5. `eval("1+1")` → stdout 承载输出（NDJSON）；ZBRT 下本地 fail closed（Validation，零帧，见 §1）；
-6. `stream`：started → stdout（send_input 回显）→ stop → exit；
+6. `stream`：started → stdout（send_input 回显）→ stop → exit（ZBRT 没有 started 帧，门面在首次 `next_event` 合成 `started`，见 §5）；
 7. `delete()` → 2xx/404 均成功；
-8. 全部校验失败路径（空 argv、逃逸路径、超限、非法 transport、ZBRT pty/env）在**发送前**抛 Validation。
+8. 全部校验失败路径（空 argv、逃逸路径、超限、非法 transport、ZBRT argc>255、ZBRT pty/env）在**发送前**抛 Validation。
 
 ## 10. 环境变量
 
 | 变量 | 谁读 | 作用 |
 |---|---|---|
-| `FORKD_URL` | 四语言 `RfbClient` 缺省构造；`rfb-cli forkd *` | controller 地址（默认 `http://127.0.0.1:8889`） |
-| `FORKD_TOKEN` | 四语言 `RfbClient` 缺省构造 | Bearer token（非空才发头） |
+| `FORKD_URL` | 四语言 `RfbClient` 缺省构造；`rfb-cli forkd *` | controller 地址（默认 `http://127.0.0.1:8889`；未设或空白都回退默认） |
+| `FORKD_TOKEN` | 四语言 `RfbClient` 缺省构造 | controller Bearer token（非空才发头） |
+| `FORKD_AGENT_TOKEN` | forkd agent（guest 侧，启用连接认证）；Python/Node.js SDK guest 客户端（配置后每连接先发 auth 首帧）；Rust/C#/Java 客户端尚未接入 | guest NDJSON 连接认证；非空 = 强制首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
 | `FORKD_KERNEL` / `FORKD_ROOTFS` / `FORKD_BIN` | `rfb-cli forkd snapshot-*` | 快照创建的内核 / rootfs / 官方 forkd 二进制路径覆盖 |
 | `RFB_RUNTIME_BIN` | 部署流水线（约定注入点，仓库内代码不读） | 预编译静态 rfb-runtime 二进制路径 |
 | `RFB_AGENT_WORKSPACE` | rfb-runtime agent | guest 工作区根覆盖（默认 `/workspace`，供宿主侧契约测试用） |
@@ -138,3 +142,6 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
   `/workspace`（agent 会拒绝 `/` 作为 cwd）。建议显式传 cwd。
 - **stream `done` 事件**：C#/Java 把 `{"done":true}` 映射为无码 Exit；Python 目前忽略该行
   （依赖其 `done` 终结键语义在请求路径终止）。
+- **agent 认证接入**：`FORKD_AGENT_TOKEN` 的 agent 侧门禁已强制（`PROTOCOL.md §2.6`）；客户端侧
+  Python/Node.js 已发送 auth 首帧，当前 Rust/C#/Java 尚未接入——agent 配置了 token 时这些语言的
+  guest 连接会被 `{"error":"authentication required"}` 拒绝（§10）。

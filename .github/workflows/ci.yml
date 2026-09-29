@@ -5,12 +5,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# 触发约定：main 推送由 e2e.yml 负责跑真机 E2E；本工作流跑其余分支的推送与
-# 所有 PR 的 Rust 门禁（fmt/clippy/test/doc，全部 --all-features），以及
+# 触发约定：main 推送同时跑本工作流与 e2e.yml（真机 E2E 只在 e2e.yml 里跑）；
+# 本工作流跑所有分支的推送（含 main）与所有 PR 的 Rust 门禁
+# （fmt/clippy/test/doc，全部 --all-features），以及
 # SDK 全量 build + 四套件测试（Python / C# / Java / Node.js，debian:12 干净容器）。
 on:
   push:
-    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 
@@ -64,7 +64,7 @@ jobs:
           set -uo pipefail
           log=/tmp/clippy.log
           set +e
-          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$log"
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
@@ -73,6 +73,29 @@ jobs:
             bash scripts/ci-annotate.sh ci-clippy /tmp/clippy-errs.txt 0
             exit "$rc"
           fi
+      # feature 矩阵：--all-features 只能证明“全开”可编译，单个 feature 的
+      # lean 组合（no-default-features + 单 feature）可能因 cfg 门控/可选依赖
+      # 漏配而漏编译（clippy/test 只跑 all-features，覆盖不到）。这里逐条跑
+      # 最小组合，任一条失败立即停止（set -e + 循环内不吞错）。
+      - name: Feature matrix (lean per-feature compile gates)
+        run: |
+          set -euo pipefail
+          specs=(
+            "-p rfb-sdk --no-default-features"
+            "-p rfb-sdk --no-default-features --features forkd"
+            "-p rfb-sdk --no-default-features --features zeroboot"
+            "-p rfb-runtime --no-default-features"
+            "-p rfb-runtime --no-default-features --features guest"
+            "-p rfb-runtime --no-default-features --features host-vsock"
+            "-p rfb-runtime --no-default-features --features firecracker"
+            "-p rfb-runtime --no-default-features --features forkd"
+            "-p rfb-runtime --no-default-features --features zeroboot"
+          )
+          for spec in "${specs[@]}"; do
+            echo "== cargo check --locked $spec =="
+            # shellcheck disable=SC2086 —— spec 是本步骤内的受控字面量，需要分词
+            cargo check --locked $spec
+          done
       # 失败现场要能被公开 API 读到（日志下载需 token）：失败时把 FAILED
       # 测试名、failures 块与 panic 信息拆成 ::error:: 注解带出。
       - name: Tests
@@ -80,7 +103,7 @@ jobs:
           set -uo pipefail
           log=/tmp/cargo-test.log
           set +e
-          cargo test --workspace --all-features 2>&1 | tee "$log"
+          cargo test --workspace --all-features --locked 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
@@ -106,7 +129,7 @@ jobs:
           log=/tmp/doc.log
           set +e
           RUSTDOCFLAGS='-D missing_docs -D warnings' \
-            cargo doc --workspace --all-features --lib --no-deps 2>&1 | tee "$log"
+            cargo doc --workspace --all-features --locked --lib --no-deps 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
@@ -246,4 +269,4 @@ jobs:
       # Dependabot may try to bump past the declared MSRV; this job fails before the
       # version reaches CI's all-features build.
       - name: cargo check –all-features
-        run: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features --locked

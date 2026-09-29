@@ -453,6 +453,7 @@ fn doctor(json_out: bool) -> Result<(), CliError> {
     let caps = host::detect();
     let tools = tool::tool_matrix();
     let profiles = image_build::profile_summary();
+    let diagnostics = runtime_diagnostics();
     if json_out {
         let platform = match caps.kind {
             tool::HostKind::Linux => "linux",
@@ -469,6 +470,7 @@ fn doctor(json_out: bool) -> Result<(), CliError> {
             "protocol": ["rfb1", "zbrt"],
             "capabilities": ["execute"],
             "profiles": profiles,
+            "runtime_hygiene": diagnostics,
         });
         render_output(json_out, value, String::new());
     } else {
@@ -485,8 +487,70 @@ fn doctor(json_out: bool) -> Result<(), CliError> {
                     .join(", "))
                 .unwrap_or_default()
         );
+        println!("runtime hygiene: {}", diagnostics_text(&diagnostics));
     }
     Ok(())
+}
+
+/// Doctor's runtime-hygiene report: residual ZeroBoot work/fork directories
+/// (running the provider scavenger here surfaces *and* clears them), whether
+/// the forkd snapshots data directory exists and is writable, and — on Linux —
+/// the RAM headroom that bounds the guest workspace tmpfs.
+fn runtime_diagnostics() -> serde_json::Value {
+    // Scavenge is idempotent (OnceLock) and never fails the doctor: it only
+    // removes work/fork dirs whose liveness lock is free. Linux-only: the
+    // liveness locks (flock) and the guest layout only exist there.
+    #[cfg(all(feature = "zeroboot", target_os = "linux"))]
+    let stale_removed = crate::zeroboot::scavenge_stale_state(None);
+    #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
+    let stale_removed = 0;
+    let snapshots = crate::cli::forkd::forkd_snapshots_root();
+    let snapshots_writable = snapshots.as_ref().map(|dir| {
+        std::fs::create_dir_all(dir).is_ok()
+            && std::fs::write(dir.join(".rfb-doctor-probe"), b"probe").is_ok()
+            && std::fs::remove_file(dir.join(".rfb-doctor-probe")).is_ok()
+    });
+    json!({
+        "stale_work_dirs_removed": stale_removed,
+        "snapshots_dir": snapshots.as_ref().map(|p| p.display().to_string()),
+        "snapshots_writable": snapshots_writable,
+        "mem_available_mib": mem_available_mib(),
+    })
+}
+
+/// One-line text rendering of [`runtime_diagnostics`] for the human output.
+fn diagnostics_text(diagnostics: &serde_json::Value) -> String {
+    let removed = diagnostics["stale_work_dirs_removed"].as_u64().unwrap_or(0);
+    let snapshots = diagnostics["snapshots_dir"].as_str().map_or_else(
+        || "unresolved (XDG_DATA_HOME/HOME unset)".to_owned(),
+        |dir| match diagnostics["snapshots_writable"].as_bool() {
+            Some(true) => format!("{dir} (writable)"),
+            Some(false) => format!("{dir} (NOT writable)"),
+            None => format!("{dir} (not checked)"),
+        },
+    );
+    let mem = diagnostics["mem_available_mib"]
+        .as_u64()
+        .map_or_else(|| "n/a".to_owned(), |mib| format!("{mib} MiB"));
+    format!("{removed} stale work dir(s) removed; snapshots: {snapshots}; mem available: {mem}")
+}
+
+/// Linux-only: RAM available for new tmpfs mounts (the guest workspace tmpfs
+/// competes with everything else for the same pages).
+#[cfg(target_os = "linux")]
+fn mem_available_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.trim().strip_suffix(" kB"))
+        .and_then(|kb| kb.trim().parse::<u64>().ok())
+        .map(|kb| kb / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mem_available_mib() -> Option<u64> {
+    None
 }
 
 /// Run an async command on a current-thread runtime.

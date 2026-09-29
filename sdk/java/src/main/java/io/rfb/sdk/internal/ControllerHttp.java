@@ -28,6 +28,10 @@ import java.util.List;
 public final class ControllerHttp {
     public static final String DEFAULT_URL = "http://127.0.0.1:8889";
 
+    /** Methods safe to replay once after a stale-connection failure. */
+    private static final java.util.Set<String> IDEMPOTENT_METHODS =
+            new java.util.HashSet<>(Arrays.asList("GET", "HEAD", "DELETE"));
+
     private final String baseUrl;
     private final String token;
     private final Duration timeout;
@@ -132,44 +136,80 @@ public final class ControllerHttp {
         return new ArrayList<>(Arrays.asList(arr));
     }
 
+    /**
+     * Send one request on a pooled keep-alive connection. The
+     * {@code HttpURLConnection} is intentionally NOT disconnected after a
+     * successful exchange: the JDK returns it to its keep-alive cache so the
+     * next sequential request reuses the same TCP connection (one accept for
+     * N sequential requests, like the Rust reqwest pool).
+     *
+     * <p>Idempotent methods (GET/HEAD/DELETE) that fail on a stale pooled
+     * connection are retried exactly once on a fresh connection; POST is never
+     * replayed (a duplicated create would be a real side effect). Read/connect
+     * timeouts are not connection-staleness and are surfaced as-is.
+     */
     private HttpResult send(String method, String pathAndQuery, byte[] body, String contentType) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(baseUrl + pathAndQuery);
-            conn = (HttpURLConnection) url.openConnection();
-            int timeoutMs = (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
-            conn.setConnectTimeout(timeoutMs);
-            conn.setReadTimeout(timeoutMs);
-            conn.setRequestMethod(method);
-            if (token != null) {
-                conn.setRequestProperty("Authorization", "Bearer " + token);
-            }
-            if (body != null) {
-                conn.setDoOutput(true);
-                if (contentType != null) {
-                    conn.setRequestProperty("Content-Type", contentType);
+        boolean idempotent = IDEMPOTENT_METHODS.contains(method);
+        IOException lastFailure = null;
+        int attempts = idempotent ? 2 : 1;
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            HttpURLConnection conn = null;
+            try {
+                conn = open(method, pathAndQuery, body, contentType);
+                int status = conn.getResponseCode();
+                try (InputStream stream =
+                        status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
+                    return new HttpResult(status, readAll(stream));
                 }
-            }
-            if (body != null) {
-                java.io.OutputStream out = conn.getOutputStream();
-                try {
-                    out.write(body);
-                } finally {
-                    out.close();
+            } catch (IOException e) {
+                lastFailure = e;
+                if (conn != null) {
+                    // A failed exchange must never go back into the pool.
+                    conn.disconnect();
                 }
-            }
-            int status = conn.getResponseCode();
-            try (InputStream stream =
-                    status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
-                return new HttpResult(status, readAll(stream));
-            }
-        } catch (IOException e) {
-            throw new TransportError("forkd request failed: " + e.getMessage(), e);
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
+                if (!idempotent || e instanceof java.net.SocketTimeoutException) {
+                    break;
+                }
+                // Stale keep-alive connection: retry once on a fresh one.
             }
         }
+        throw new TransportError("forkd request failed: " + lastFailure.getMessage(), lastFailure);
+    }
+
+    /** Open and write one request; the connection stays pooled on success. */
+    private HttpURLConnection open(String method, String pathAndQuery, byte[] body, String contentType)
+            throws IOException {
+        URL url = new URL(baseUrl + pathAndQuery);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        int timeoutMs = (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestMethod(method);
+        if (token != null) {
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+        }
+        if (body != null || "POST".equals(method)) {
+            // Fixed-length streaming mode writes the body unbuffered AND makes
+            // the JDK skip its transparent replay of a POST whose pooled
+            // connection died before the status line
+            // (sun.net.www.http.HttpClient checks `streaming` before retrying).
+            // Without it a dead pooled connection would silently duplicate
+            // non-idempotent POSTs.
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(body == null ? 0 : body.length);
+            if (contentType != null) {
+                conn.setRequestProperty("Content-Type", contentType);
+            }
+            java.io.OutputStream out = conn.getOutputStream();
+            try {
+                if (body != null) {
+                    out.write(body);
+                }
+            } finally {
+                out.close();
+            }
+        }
+        return conn;
     }
 
     private static String readAll(InputStream in) throws IOException {

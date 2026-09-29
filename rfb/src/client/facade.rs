@@ -43,24 +43,48 @@ impl RfbClient {
         token: Option<String>,
         timeout: Duration,
     ) -> Result<Self, RfbError> {
+        let base_url = base_url.into();
+        Self::validate_base_url(&base_url)?;
         Ok(Self {
             http: crate::controller::ForkdClient::new(base_url, token, timeout)?,
             timeout,
         })
     }
 
+    /// Local, fail-closed base URL check (UNIFIED_API.md §2): absolute
+    /// http/https URL with a host. Invalid URLs raise `Validation` here — at
+    /// this layer — instead of the controller client's decode class, so all
+    /// four language SDKs see the same error class before any request is built.
+    fn validate_base_url(base_url: &str) -> Result<(), RfbError> {
+        let parsed = url::Url::parse(base_url)
+            .map_err(|_| RfbError::Validation("forkd base_url is not a valid URL".to_owned()))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(RfbError::Validation(
+                "forkd base_url must include an http(s) scheme and host".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a client from the environment: `FORKD_URL`
-    /// (default `http://127.0.0.1:8889`), `FORKD_TOKEN` (non-empty enables the
-    /// bearer header), 10 second default timeout.
+    /// (default `http://127.0.0.1:8889`; an unset **or blank** value falls
+    /// back to the default, matching the other language SDKs), `FORKD_TOKEN`
+    /// (non-empty enables the bearer header), 10 second default timeout.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn from_env() -> Result<Self, RfbError> {
-        Ok(Self {
-            http: crate::controller::ForkdClient::from_env()?,
-            timeout: default_guest_timeout(),
-        })
+        const DEFAULT_URL: &str = "http://127.0.0.1:8889";
+        let url = std::env::var("FORKD_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_URL.to_owned());
+        let token = std::env::var("FORKD_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Self::new(url, token, default_guest_timeout())
     }
 
     /// `GET /v1/snapshots`.
@@ -260,12 +284,22 @@ impl ConnectTarget for &str {
 
 /// Facade over one live sandbox. All guest operations are available in
 /// identical shapes on both [`GuestTransport`]s.
+///
+/// Over ZBRT, every connection starts with the mandatory `Hello` handshake;
+/// clones of a facade share one long-lived control connection for `ping`/fs
+/// ops (opened lazily, closed when the last clone drops), while `exec` and
+/// `stream` each open their own connection per turn.
 #[derive(Clone)]
 pub struct GuestSandbox {
     http: crate::controller::ForkdClient,
     info: SandboxInfo,
     transport: GuestTransport,
     timeout: Duration,
+    /// Long-lived ZBRT adapter shared by all clones of this facade (holds the
+    /// reusable control connection). Constructed eagerly but opens no TCP
+    /// connection until the first ZBRT operation.
+    #[cfg(feature = "zeroboot")]
+    zbrt: zbrt::ZbrtGuest,
 }
 
 impl GuestSandbox {
@@ -275,11 +309,15 @@ impl GuestSandbox {
         transport: GuestTransport,
         timeout: Duration,
     ) -> Self {
+        #[cfg(feature = "zeroboot")]
+        let zbrt = zbrt::ZbrtGuest::new(info.guest_addr.clone(), timeout);
         Self {
             http,
             info,
             transport,
             timeout,
+            #[cfg(feature = "zeroboot")]
+            zbrt,
         }
     }
 
@@ -327,10 +365,7 @@ impl GuestSandbox {
                 timeout: self.timeout,
             }),
             #[cfg(feature = "zeroboot")]
-            GuestTransport::Zbrt => GuestOps::Zbrt(zbrt::ZbrtGuest {
-                address: self.info.guest_addr.clone(),
-                timeout: self.timeout,
-            }),
+            GuestTransport::Zbrt => GuestOps::Zbrt(self.zbrt.clone()),
         }
     }
 

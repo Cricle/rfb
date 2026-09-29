@@ -13,11 +13,57 @@ use socket::{
 };
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub use socket::{parse_api_response, read_http_response, readiness_error};
+
+/// `PR_SET_PDEATHSIG(SIGKILL)` arming for the Firecracker child.
+///
+/// Without it, an orchestrator that dies without an orderly `kill()` leaves
+/// Firecracker running (and holding KVM/vsock resources) until the host is
+/// rebooted. The hook also re-checks the parent pid: the parent may already
+/// have died between `fork` and `exec`, in which case the child must not
+/// `exec` at all.
+///
+/// The `libc` crate is only pulled in by the `guest`/`forkd` features, so the
+/// three libc symbols needed here are declared directly instead of expanding
+/// the feature graph for one syscall.
+#[cfg(target_os = "linux")]
+mod pdeathsig {
+    use std::io;
+
+    extern "C" {
+        fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+        fn getppid() -> i32;
+        fn _exit(status: i32) -> !;
+    }
+
+    /// `prctl(2)` option: deliver a signal to this process when its parent dies.
+    const PR_SET_PDEATHSIG: i32 = 1;
+    /// The parent-death signal: the orphaned VM must not linger.
+    const SIGKILL: u64 = 9;
+
+    /// Run inside `CommandExt::pre_exec` (post-fork, pre-exec) so only
+    /// async-signal-safe libc calls are made. `parent_pid` is the pid recorded
+    /// by the parent immediately before `spawn`.
+    pub(super) fn arm(parent_pid: i32) -> io::Result<()> {
+        // SAFETY: PR_SET_PDEATHSIG takes an integer signal number as arg2.
+        if unsafe { prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: plain getppid query, no preconditions.
+        if unsafe { getppid() } != parent_pid {
+            // The parent died in the spawn race window: fail the child instead
+            // of exec'ing a Firecracker with no supervisor.
+            // SAFETY: _exit never returns and only affects this child.
+            unsafe { _exit(1) };
+        }
+        Ok(())
+    }
+}
 
 /// A running Firecracker VM with its API socket and vsock relay identity.
 pub struct FirecrackerVm {
@@ -183,13 +229,25 @@ impl FirecrackerVm {
             .truncate(true)
             .open(&log_path)
             .with_context(|| format!("open Firecracker log file {}", log_path.display()))?;
-        let process = Command::new("firecracker")
+        let mut command = Command::new(crate::config::firecracker_bin());
+        command
             .args(["--api-sock", &socket_path])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
-            .spawn()
-            .context("Failed to start Firecracker")?;
+            .stderr(Stdio::from(log));
+        #[cfg(target_os = "linux")]
+        {
+            let parent_pid = std::process::id() as i32;
+            // SAFETY: the hook runs in the forked child before exec and only
+            // calls async-signal-safe libc functions (prctl/getppid/_exit).
+            // `pre_exec` also forces fork+exec instead of the `posix_spawn`
+            // fast path, which is why the workspace executor avoids it; here
+            // it is required for PDEATHSIG and the VM boots once per sandbox.
+            unsafe {
+                command.pre_exec(move || pdeathsig::arm(parent_pid));
+            }
+        }
+        let process = command.spawn().context("Failed to start Firecracker")?;
         let mut process_guard = ChildGuard::new(process);
 
         // Wait until the API socket accepts a connection, not merely until its

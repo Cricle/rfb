@@ -519,6 +519,37 @@ pub(crate) fn check_create_spec(
     Ok(())
 }
 
+/// The shared fail-closed guard for spec fields that create paths cannot
+/// honor. A caller that declares a constraint the backend would silently
+/// ignore must get an error instead: `memory_mib_supported` selects whether
+/// `resources.memory_bytes` maps onto the provider's per-sandbox memory knob
+/// (forkd controllers take `memory_limit_mib`); when it does, the returned
+/// value is the ceiling in MiB. Everything else — `cpus`, `disk_bytes`,
+/// `pids`, and a per-sandbox `image` manifest — has no mapping on any current
+/// backend and is rejected.
+pub(crate) fn check_create_resources(
+    spec: &SandboxSpec,
+    memory_mib_supported: bool,
+) -> Result<Option<u64>, ProviderError> {
+    let resources = &spec.resources;
+    if resources.cpus.is_some() {
+        return Err(ProviderError::UnsupportedResource("cpus"));
+    }
+    if !memory_mib_supported && resources.memory_bytes.is_some() {
+        return Err(ProviderError::UnsupportedResource("memory_bytes"));
+    }
+    if resources.disk_bytes.is_some() {
+        return Err(ProviderError::UnsupportedResource("disk_bytes"));
+    }
+    if resources.pids.is_some() {
+        return Err(ProviderError::UnsupportedResource("pids"));
+    }
+    if spec.image.is_some() {
+        return Err(ProviderError::UnsupportedResource("image"));
+    }
+    Ok(resources.memory_bytes.map(|bytes| bytes.div_ceil(1 << 20)))
+}
+
 /// Error validating or interpreting an image manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
@@ -614,6 +645,10 @@ pub enum ProviderError {
     InvalidSpec(ContractError),
     /// The provider does not support a requested capability.
     UnsupportedCapability(Capability),
+    /// The provider cannot honor a requested spec field (resource limit or
+    /// image). Fail-closed: an unsupported constraint is an error, never a
+    /// silently ignored one.
+    UnsupportedResource(&'static str),
     /// The provider or its runtime is unavailable.
     Unavailable(String),
 }
@@ -623,6 +658,9 @@ impl fmt::Display for ProviderError {
         match self {
             Self::InvalidSpec(e) => write!(f, "invalid sandbox spec: {e}"),
             Self::UnsupportedCapability(c) => write!(f, "provider does not support {c:?}"),
+            Self::UnsupportedResource(field) => {
+                write!(f, "provider does not support spec field: {field}")
+            }
             Self::Unavailable(m) => write!(f, "provider unavailable: {m}"),
         }
     }

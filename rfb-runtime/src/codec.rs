@@ -205,7 +205,12 @@ impl FrameCodec {
             return Err(CodecError::Trailing);
         }
         let encoded = &bytes[HEADER_LEN..HEADER_LEN + len];
-        let payload = if compressed {
+        // Single-buffer decode: the frame body arrives in exactly one heap
+        // buffer (see `read_frame`/`read_frame_blocking`); the only extra
+        // allocation is the owned payload the returned `Frame` must carry.
+        // The value is deserialized from the borrowed slice so a failed
+        // decode allocates nothing and the copy exists purely for ownership.
+        let (payload, value) = if compressed {
             let mut decoder = zstd::stream::read::Decoder::new(encoded)
                 .map_err(|e| CodecError::Compression(e.to_string()))?;
             let mut payload =
@@ -217,12 +222,14 @@ impl FrameCodec {
             if payload.len() > self.max_payload {
                 return Err(CodecError::DecompressedTooLarge);
             }
-            payload
+            let value =
+                postcard::from_bytes(&payload).map_err(|e| CodecError::Serialize(e.to_string()))?;
+            (payload, value)
         } else {
-            encoded.to_vec()
+            let value =
+                postcard::from_bytes(encoded).map_err(|e| CodecError::Serialize(e.to_string()))?;
+            (encoded.to_vec(), value)
         };
-        let value =
-            postcard::from_bytes(&payload).map_err(|e| CodecError::Serialize(e.to_string()))?;
         Ok((
             Frame {
                 message_type,

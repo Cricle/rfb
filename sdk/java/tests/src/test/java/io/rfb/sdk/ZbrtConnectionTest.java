@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -50,6 +51,44 @@ class ZbrtConnectionTest {
             assertEquals("rfb-zeroboot-guest", ack.server);
             assertEquals(ZbrtConnection.V1_CAPABILITIES, ack.capabilities);
         }
+    }
+
+    @Test
+    void constructorSendsMandatoryHelloWithClientName() throws Exception {
+        // Cross-language contract §1: the connection opens with Hello
+        // (client="rfb-sdk-java") before anything else; the fake auto-acks.
+        try (ZbrtConnection conn = open(io -> {
+            // no request frames in this test
+        })) {
+            assertEquals(ZbrtConnection.CLIENT_NAME, server.lastHelloClient());
+            assertEquals(ZbrtConnection.V1_CAPABILITIES, server.lastHelloCapabilities());
+        }
+    }
+
+    @Test
+    void helloErrorFrameFailsHandshakeAsTransportError() throws Exception {
+        server = new FakeZbrtServer(false, io -> {
+            ZbrtFrame hello = io.read();
+            assertEquals(ZbrtFrame.KIND_HELLO, hello.kind());
+            io.write(FakeZbrtServer.errorFrame(hello.requestId(), 1, "hello required"));
+        });
+        TransportError error = assertThrows(TransportError.class,
+                () -> new ZbrtConnection(
+                        io.rfb.sdk.internal.GuestNdjson.parseAddress(server.address()),
+                        java.time.Duration.ofSeconds(5)));
+        assertTrue(error.getMessage().contains("hello"), "handshake failures must be transport-class");
+    }
+
+    @Test
+    void helloWrongReplyKindFailsHandshakeAsTransportError() throws Exception {
+        server = new FakeZbrtServer(false, io -> {
+            ZbrtFrame hello = io.read();
+            io.write(io.reply(hello, ZbrtFrame.KIND_HEALTH_ACK,
+                    ZbrtCodec.encodeHealth(true, "ready")));
+        });
+        assertThrows(TransportError.class, () -> new ZbrtConnection(
+                io.rfb.sdk.internal.GuestNdjson.parseAddress(server.address()),
+                java.time.Duration.ofSeconds(5)));
     }
 
     @Test
@@ -216,7 +255,7 @@ class ZbrtConnectionTest {
     }
 
     @Test
-    void streamSessionYieldsOutputEventsThenTerminalAndStopCancels() throws Exception {
+    void streamSessionYieldsStartedThenOutputThenTerminalAndStopCancels() throws Exception {
         try (ZbrtConnection conn = open(io -> {
             ZbrtFrame exec = io.read();
             assertEquals(ZbrtFrame.KIND_EXECUTE, exec.kind());
@@ -224,12 +263,20 @@ class ZbrtConnectionTest {
             ZbrtFrame cancel = io.read();
             assertEquals(ZbrtFrame.KIND_CANCEL, cancel.kind());
             ZbrtCodec.Cancel decoded = ZbrtCodec.decodeCancel(cancel.payload());
+            // Cross-language contract §4: Cancel reuses THIS turn's request id
+            // both in the header and as the target (guest target==active check).
+            assertArrayEquals(exec.requestId(), cancel.requestId());
             assertArrayEquals(exec.requestId(), decoded.target());
             io.write(io.reply(cancel, ZbrtFrame.KIND_CANCEL_ACK, new byte[0]));
             io.write(FakeZbrtServer.exitFrame(exec.requestId(), -1));
         })) {
             ZbrtConnection.ZbrtStreamSession session = conn.openStreamSession(
                     List.of("tail", "-f"), null, new byte[0], 0);
+            // Cross-language contract §2: the first nextEvent() synthesizes
+            // started (ZBRT v1 has no started frame on the wire).
+            ZbrtConnection.Event started = session.nextEvent();
+            assertTrue(started.isStarted());
+            assertEquals(ZbrtConnection.Event.STREAM_STARTED, started.stream());
             ZbrtConnection.Event chunk = session.nextEvent();
             assertEquals(0, chunk.stream());
             assertEquals("line", new String(chunk.data(), StandardCharsets.UTF_8));
@@ -237,6 +284,51 @@ class ZbrtConnectionTest {
             ZbrtConnection.Event exit = session.nextEvent();
             assertTrue(exit.isExit());
             assertEquals(Integer.valueOf(-1), exit.code());
+            assertNull(session.nextEvent());
+        }
+    }
+
+    @Test
+    void stopCachesExitThatArrivesBeforeCancelAck() throws Exception {
+        // Cross-language contract §3: an Exit racing the CancelAck during the
+        // stop drain must set terminal and be delivered by nextEvent() instead
+        // of being dropped (a dropped terminal deadlocked the caller).
+        try (ZbrtConnection conn = open(io -> {
+            ZbrtFrame exec = io.read();
+            ZbrtFrame cancel = io.read();
+            assertArrayEquals(exec.requestId(), cancel.requestId());
+            // Exit first, CancelAck second.
+            io.write(FakeZbrtServer.exitFrame(exec.requestId(), 7));
+            io.write(io.reply(cancel, ZbrtFrame.KIND_CANCEL_ACK, new byte[0]));
+        })) {
+            ZbrtConnection.ZbrtStreamSession session = conn.openStreamSession(
+                    List.of("tail", "-f"), null, new byte[0], 0);
+            session.stop(); // Exit wins the race; CancelAck stays on the wire
+            ZbrtConnection.Event started = session.nextEvent();
+            assertTrue(started.isStarted(), "started is synthesized on the first poll");
+            ZbrtConnection.Event exit = session.nextEvent();
+            assertTrue(exit.isExit(), "the cached Exit must be delivered");
+            assertEquals(Integer.valueOf(7), exit.code());
+            assertNull(session.nextEvent(), "a terminated turn yields no further events");
+            session.stop(); // idempotent after the cached Exit
+        }
+    }
+
+    @Test
+    void executeOutputOverTurnCapRaisesRemoteError() throws Exception {
+        // Cross-language contract §6: one turn aggregates at most 16 MiB of
+        // Output (stdout+stderr); exceeding it is a Remote-class error.
+        byte[] chunk = new byte[9 * 1024 * 1024];
+        Arrays.fill(chunk, (byte) 'x');
+        try (ZbrtConnection conn = open(io -> {
+            ZbrtFrame exec = io.read();
+            io.write(FakeZbrtServer.outputFrame(exec.requestId(), 0, chunk));
+            io.write(FakeZbrtServer.outputFrame(exec.requestId(), 0, chunk));
+        })) {
+            RemoteError error = assertThrows(RemoteError.class,
+                    () -> conn.execute(List.of("yes"), null, new byte[0], 0));
+            assertTrue(error.getMessage().contains("output exceeded"),
+                    "cap message must be recognizable cross-language: " + error.getMessage());
         }
     }
 

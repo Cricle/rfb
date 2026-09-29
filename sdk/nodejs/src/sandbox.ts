@@ -5,7 +5,7 @@
 import net from 'node:net';
 import type { RfbError } from './errors.js';
 import { DecodeError, RemoteError, TransportError, ValidationError } from './errors.js';
-import { parseAddress, request as ndjsonRequest } from './ndjson.js';
+import { parseAddress, request as ndjsonRequest, agentAuthToken } from './ndjson.js';
 import type { NdjsonExchange } from './ndjson.js';
 import * as validation from './validation.js';
 import { ZbrtConnection } from './zbrt-connection.js';
@@ -13,6 +13,23 @@ import { ZbrtConnection } from './zbrt-connection.js';
 
 export const TRANSPORT_NDJSON = 'ndjson';
 export const TRANSPORT_ZBRT = 'zbrt';
+
+/** Extra read budget over the client + exec deadline (Rust `EXEC_READ_MARGIN`). */
+const EXEC_READ_MARGIN_MS = 5_000;
+const MAX_U32 = 0xffff_ffff;
+
+/** exec/eval timeout on the wire: whole seconds, ceil, minimum 1 (PROTOCOL.md §2.2). */
+function timeoutSeconds(timeoutS: number): number {
+  return Math.max(1, Math.ceil(timeoutS));
+}
+
+/**
+ * ZBRT deadline in ms: whole seconds ×1000, clamped to u32::MAX (Rust
+ * `facade.rs` GuestOps::exec / ::eval ZBRT branch).
+ */
+function zbrtTimeoutMs(timeoutS: number): number {
+  return Math.min(timeoutSeconds(timeoutS) * 1000, MAX_U32);
+}
 
 /** Unified result of a guest exec/eval. */
 export interface ExecResult {
@@ -192,7 +209,7 @@ export class Sandbox {
           args,
           cwd,
           stdin ?? Buffer.alloc(0),
-          Math.ceil(timeoutS * 1000),
+          zbrtTimeoutMs(timeoutS),
         );
         return this.#execResult(exec.code, exec.stdout, exec.stderr, exec.timedOut);
       } finally {
@@ -205,12 +222,19 @@ export class Sandbox {
     if (stdin !== null && stdin.byteLength > 0) {
       throw new ValidationError('stdin is only supported over the ZBRT transport');
     }
-    const { last } = await this.#guestRequest({
-      action: 'exec',
-      cwd,
-      timeout: Math.ceil(timeoutS),
-      args,
-    });
+    const seconds = timeoutSeconds(timeoutS);
+    const { last } = await this.#guestRequest(
+      {
+        action: 'exec',
+        cwd,
+        timeout: seconds,
+        args,
+      },
+      // The read budget must cover the guest's own deadline, or a legitimately
+      // long exec would surface the client timeout instead of the guest's
+      // (Rust forkd/guest.rs EXEC_READ_MARGIN, Python _guest.py).
+      this.#guestTimeoutMs + seconds * 1000 + EXEC_READ_MARGIN_MS,
+    );
     return this.#execResult(statusCode(last, -1), valueBytes(firstOf(last, 'stdout', 'out')), valueBytes(firstOf(last, 'stderr', 'err')), last.timed_out === true);
   }
 
@@ -227,8 +251,17 @@ export class Sandbox {
     }
     const action: Record<string, unknown> = { action: 'eval', code };
     if (options.cwd !== undefined && options.cwd !== null) action.cwd = options.cwd;
-    if (options.timeoutS !== undefined && options.timeoutS !== null) action.timeout = Math.ceil(options.timeoutS);
-    const { last } = await this.#guestRequest(action);
+    const evalSeconds =
+      options.timeoutS !== undefined && options.timeoutS !== null
+        ? timeoutSeconds(options.timeoutS)
+        : null;
+    if (evalSeconds !== null) action.timeout = evalSeconds;
+    const { last } = await this.#guestRequest(
+      action,
+      evalSeconds === null
+        ? this.#guestTimeoutMs
+        : this.#guestTimeoutMs + evalSeconds * 1000 + EXEC_READ_MARGIN_MS,
+    );
     const out = valueBytes(firstOf(last, 'output', 'out'));
     // Rust baseline (ndjson::eval_result): `status` is the agent's current
     // eval key, `exit_code` the legacy alias.
@@ -299,8 +332,11 @@ export class Sandbox {
   /** Read a guest file: `{data, truncated, totalBytes}`. */
   async read(path: string, options: ReadOptions = {}): Promise<FileRead> {
     validation.filePath(path);
-    const maxBytes = options.maxBytes ?? validation.MAX_GUEST_RESULT_BYTES;
-    validation.limit(maxBytes, validation.MAX_GUEST_RESULT_BYTES);
+    // No implicit cap: absent max_bytes rides the wire as null (PROTOCOL.md
+    // §3.3) over ZBRT and as an omitted key over NDJSON (§2.2), letting the
+    // guest apply its own default — mirroring the other SDKs.
+    const maxBytes = options.maxBytes ?? null;
+    if (maxBytes !== null) validation.limit(maxBytes, validation.MAX_GUEST_RESULT_BYTES);
     if (this.transport === TRANSPORT_ZBRT) {
       const conn = await this.#zbrt();
       try {
@@ -314,7 +350,7 @@ export class Sandbox {
     }
     const action: Record<string, unknown> = { action: 'read', path };
     if (options.offset !== undefined && options.offset !== null) action.offset = options.offset;
-    if (options.maxBytes !== undefined) action.max_bytes = options.maxBytes;
+    if (maxBytes !== null) action.max_bytes = maxBytes;
     const { last } = await this.#guestRequest(action);
     const data = valueBytes(last.data);
     return {
@@ -394,9 +430,9 @@ export class Sandbox {
     return conn;
   }
 
-  async #guestRequest(action: Record<string, unknown>): Promise<NdjsonExchange> {
+  async #guestRequest(action: Record<string, unknown>, timeoutMs: number = this.#guestTimeoutMs): Promise<NdjsonExchange> {
     const { host, port } = parseAddress(this.guestAddr);
-    return ndjsonRequest(host, port, this.#guestTimeoutMs, action);
+    return ndjsonRequest(host, port, timeoutMs, action);
   }
 
   async #fsRequest(op: number, path: string, args: Record<string, unknown>): Promise<NdjsonExchange> {
@@ -440,6 +476,11 @@ class NdjsonGuestStream implements GuestStream {
   #terminal = false;
   #stopped = false;
   #failure: RfbError | null = null;
+  // Agent auth (FORKD_AGENT_TOKEN): the auth line goes out first; the real
+  // stream action and any early in/stop lines wait for the auth ack so they
+  // can never precede it on the wire.
+  #awaitingAuth = false;
+  #deferred: Buffer[] = [];
   readonly #address: string;
   readonly #action: Record<string, unknown>;
   readonly #timeoutMs: number;
@@ -469,7 +510,7 @@ class NdjsonGuestStream implements GuestStream {
       throw new RemoteError('guest stream is no longer running');
     }
     if (this.#socket === null) await this.#connect();
-    this.#socket?.write(Buffer.from(JSON.stringify({ in: text }) + '\n', 'utf8'));
+    this.#writeLine(Buffer.from(JSON.stringify({ in: text }) + '\n', 'utf8'));
   }
 
   /** Idempotent stop: terminates the child; the exit frame follows. */
@@ -477,13 +518,37 @@ class NdjsonGuestStream implements GuestStream {
     if (this.#stopped || this.#terminal || this.#closed) return;
     this.#stopped = true;
     if (this.#socket === null) await this.#connect();
-    this.#socket?.write(Buffer.from(JSON.stringify({ action: 'stop' }) + '\n', 'utf8'));
+    this.#writeLine(Buffer.from(JSON.stringify({ action: 'stop' }) + '\n', 'utf8'));
+  }
+
+  /**
+   * Write one client line. While an agent auth round-trip is pending the line
+   * is queued and flushed right after the ack (mirrors Python `_guest.py`,
+   * which completes the auth exchange before the caller can write).
+   */
+  #writeLine(data: Buffer): void {
+    if (this.#awaitingAuth) {
+      this.#deferred.push(data);
+      return;
+    }
+    this.#socket?.write(data);
+  }
+
+  #flushDeferred(): void {
+    const queued = this.#deferred.splice(0);
+    for (const data of queued) this.#socket?.write(data);
+  }
+
+  #actionLine(): Buffer {
+    return Buffer.from(JSON.stringify(this.#action) + '\n', 'utf8');
   }
 
   async #connect(): Promise<void> {
     const { host, port } = parseAddress(this.#address);
     const socket = net.createConnection({ host, port });
     this.#socket = socket;
+    const token = agentAuthToken();
+    this.#awaitingAuth = token !== null;
     socket.setTimeout(this.#timeoutMs);
     socket.setNoDelay(true);
     socket.on('error', (error) => {
@@ -504,7 +569,12 @@ class NdjsonGuestStream implements GuestStream {
         this.#fail(new DecodeError('guest stream ended with an unterminated line'));
       }
     });
-    socket.write(Buffer.from(JSON.stringify(this.#action) + '\n', 'utf8'));
+    if (token === null) {
+      socket.write(this.#actionLine());
+    } else {
+      // The auth line is always the first line on the connection.
+      socket.write(Buffer.from(JSON.stringify({ action: 'auth', token }) + '\n', 'utf8'));
+    }
   }
 
   #pump(): void {
@@ -526,6 +596,18 @@ class NdjsonGuestStream implements GuestStream {
       }
       if (typeof value.error === 'string') {
         this.#fail(new RemoteError(value.error));
+        return;
+      }
+      if (this.#awaitingAuth) {
+        // Intercept before the event mapping: the ack only unblocks the real
+        // stream action; anything else means the agent refused the connection.
+        if (value.action === 'auth' && value.ok === true) {
+          this.#awaitingAuth = false;
+          this.#socket?.write(this.#actionLine());
+          this.#flushDeferred();
+          continue;
+        }
+        this.#fail(new RemoteError('agent auth failed'));
         return;
       }
       // PROTOCOL.md §2.5 order: started → exit_code → done → output keys.
@@ -585,9 +667,22 @@ class NdjsonGuestStream implements GuestStream {
 /** ZBRT interactive stream: Output frames → stdout/stderr, Exit → exit. */
 class ZbrtGuestStream implements GuestStream {
   #conn: ZbrtConnection;
-  #session: { nextEvent(): Promise<{ stream: number; data: Buffer; code: number | null } | null>; stop(): Promise<void> };
+  #session: {
+    nextEvent(): Promise<{ stream: number; data: Buffer; code: number | null; started?: true } | null>;
+    stop(): Promise<void>;
+    terminal: boolean;
+    stopped: boolean;
+  };
 
-  constructor(conn: ZbrtConnection, session: { nextEvent(): Promise<{ stream: number; data: Buffer; code: number | null } | null>; stop(): Promise<void> }) {
+  constructor(
+    conn: ZbrtConnection,
+    session: {
+      nextEvent(): Promise<{ stream: number; data: Buffer; code: number | null; started?: true } | null>;
+      stop(): Promise<void>;
+      terminal: boolean;
+      stopped: boolean;
+    },
+  ) {
     this.#conn = conn;
     this.#session = session;
   }
@@ -600,6 +695,11 @@ class ZbrtGuestStream implements GuestStream {
       this.#conn.close();
       return null;
     }
+    if (event.started === true) {
+      // ZBRT has no started frame: the session synthesizes one as the first
+      // event of every turn (cross-language contract).
+      return { kind: 'started', data: Buffer.alloc(0), code: null };
+    }
     if (event.code !== null) {
       this.#conn.close();
       return { kind: 'exit', data: Buffer.alloc(0), code: event.code };
@@ -611,9 +711,12 @@ class ZbrtGuestStream implements GuestStream {
     };
   }
 
-  /** ZBRT v1 has no stdin channel — sends raise TransportError. */
+  /** ZBRT v1 carries stdin only inside the Execute payload (UNIFIED_API.md §5). */
   async sendInput(_text: string): Promise<void> {
-    throw new TransportError('zbrt v1 has no input channel');
+    if (this.#session.terminal || this.#session.stopped) {
+      throw new RemoteError('guest stream is no longer running');
+    }
+    throw new RemoteError('stdin is not supported over the zbrt transport');
   }
 
   /** Idempotent stop: Cancel targeting this turn, expecting CancelAck. */

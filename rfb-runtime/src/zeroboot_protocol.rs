@@ -22,17 +22,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
+    // Single-buffer read: the header lands on the stack only to learn the
+    // payload length, then ONE heap buffer holds header + payload and is
+    // decoded in place. (No intermediate payload Vec and no reassembly copy.)
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
     let n = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
     if n > MAX_PAYLOAD {
         return Err(err("payload too large"));
     };
-    let mut bytes = Vec::with_capacity(HEADER_LEN + n);
-    bytes.extend_from_slice(&header);
-    let mut payload = vec![0; n];
-    reader.read_exact(&mut payload).await?;
-    bytes.extend_from_slice(&payload);
+    let mut bytes = vec![0u8; HEADER_LEN + n];
+    bytes[..HEADER_LEN].copy_from_slice(&header);
+    reader.read_exact(&mut bytes[HEADER_LEN..]).await?;
     Frame::decode(&mut bytes.as_slice())
 }
 

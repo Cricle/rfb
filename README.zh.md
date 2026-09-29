@@ -103,7 +103,7 @@ rfb-cli doctor --json   # 宿主能力报告
 
 默认值即实测最佳配置：`RFB_ZBRT_VM_MEM_MIB=128`（Firecracker 实测下限 48）、`RFB_ZBRT_VM_VCPU=1`、`RFB_ZBRT_SESSIONS=8`（单 VM 并发命令数；实测 16 会话有效并发 14.97）、`RFB_ZBRT_SNAPSHOT_SHARDS=2`（热启动下每分片独立父快照与锁，恢复完全并行——实测 100 并发 create **100/100**，2 分片摊薄 ~106ms/个、4 分片 ~54ms；CI 门禁 `tests/zeroboot_concurrency.rs`）。快照文件自动收紧为 0700/0600（`memory.bin` 含 VM 全量内存）。2GB 内存机器：热启动 + 48MiB/VM，100 个活 VM 峰值 **PSS 仅 ~170MiB**（RSS 会把共享页重复计入 8 倍以上，勿按 RSS 判断容量）。
 
-`rfb::cluster::ClusterProvider` 把 N 台 forkd controller 节点组成集群：按最少在途（或轮询）调度沙箱创建，节点故障自动 failover，连续 3 次失败熔断、`probe()` 恢复；exec/stream/文件直连 guest 地址，销毁路由回所属节点。见 `sdk/BACKEND_SETUP.md` §7 与 `rfb/tests/cluster.rs`。
+`rfb::cluster::ClusterProvider` 把 N 台 forkd controller 节点组成集群：按最少在途（或轮询）调度沙箱创建；传输失败、5xx、响应不可解析自动 failover，连续 3 次失败熔断，之后默认每 30s 惰性半开自动试探一次（`recovery_interval`，试探 create 成功即恢复），`probe()` 可手动立即巡检（不计失败）。4xx 直接向调用方报错、不计数不转移（避免双创建）；传输/解析失败后对账节点沙箱列表、仅删除窗口内唯一孤儿（宁漏不误）。create 返回的 handle 用 RAII 释放在途计数（drop 即释放，无需手工 release）；`preflight()` 校验各节点快照 ready/bootable 且 digest 一致，`list_all()` + `delete_on()` 用于属主宕机后的孤儿清理。exec/stream/文件直连 guest 地址，销毁路由回所属节点。见 `sdk/BACKEND_SETUP.md` §7 与 `rfb/tests/cluster.rs`。
 
 **沙箱 fork（zeroboot）**：`ZeroBootSandbox::fork(self)` checkpoint 活动 VM（pause → 全量快照）后恢复出两个全新 VM，返回 `(原沙箱延续, fork)`——workspace tmpfs 属 guest 内存、被 dump 整体捕获，fork 继承 fork 时刻的全部状态（真机验证：fork 前写入的文件在 fork 与 fork 的 fork 中均可读）。单次 fork ~0.5-1s（补丁版无增量 diff，forkd 的 live-fork 才有）；checkpoint 目录由两个子沙箱共享持有、最后一个 drop 自动删除；仅热模式（`RFB_ZBRT_SNAPSHOT_DIR`）可 fork。见 `sdk/BACKEND_SETUP.md` §6b-4 与 `rfb/tests/zeroboot_fork.rs`。
 

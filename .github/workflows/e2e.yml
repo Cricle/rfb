@@ -66,12 +66,21 @@ jobs:
           sudo apt-get install -y musl-tools e2fsprogs binutils iproute2 iptables kmod
           rustup target add x86_64-unknown-linux-musl
 
-      # resx 内置资产完整性：forkd/forkd-controller/firecracker/kernel/rootfs
-      # 全量校验。随后按 runbook §0 的标准安装把 forkd 二进制放进 PATH
-      # （controller 按自身 PATH 找 firecracker；`forkd exec` 验证步骤也依赖它）。
+      # resx 内置资产完整性：校验 resx/SHA256SUMS 清单内的条目（forkd /
+      # forkd-controller / firecracker 两个版本 / arcbox 内核）。如实说明：
+      # 该清单目前没有 rootfs 条目，rootfs 由后续步骤逐次重建（--force）与
+      # 清单策略保证（见下方 build-rootfs 步骤的说明）。随后按 runbook §0
+      # 的标准安装把 forkd 二进制放进 PATH（controller 按自身 PATH 找
+      # firecracker；`forkd exec` 验证步骤也依赖它）。
       - name: Verify resx checksums and install forkd binaries
         run: |
           set -euo pipefail
+          # 预留语义：SHA256SUMS 目前无 rootfs 条目，这条 grep -vF 当前是
+          # 无操作（保留以稳定输出行为）。若未来把 forkd-agent.ext4 加入
+          # 清单，rootfs 仍会在随后步骤被 build-rootfs --force 原地重建覆盖，
+          # 必须先从校验集剔除，避免"清单逐字节比对"与"从源码重建的产物"
+          # 互相矛盾；后续新增 rootfs 类条目沿用同一规则（重建产物不进清单，
+          # 或进清单后同样在此过滤）。
           grep -vF "resx/rootfs/forkd-agent.ext4" resx/SHA256SUMS | sha256sum -c -
           # Windows 检出等场景可能丢失可执行位，统一恢复（controller 启动与
           # rfb-cli 委托 forkd 都要求可直接执行）。
@@ -105,12 +114,15 @@ jobs:
       # 驱动，用它建的快照 guest 永不就绪（实测 ping 全丢、ARP INCOMPLETE）。
       # 下载官方 Firecracker CI 的 5.10.225 内核并覆盖 FORKD_KERNEL；ZBRT
       # （vsock-only）不受影响，仍可用 arcbox。
+      # 供应链 pin：下方 sha256 由本机预先下载同 URL 计算后固化（URL 固定、
+      # 内容不可变发布），下载后先校验再使用，哈希不符立即失败。
       - name: Download virtio-net guest kernel for forkd
         run: |
           set -euo pipefail
           curl -fsSL \
             https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-5.10.225 \
             -o resx/kernel/vmlinux-5.10.225
+          echo "23b3047df7dada3500d06c8012cc030b921da01e213735f7717d2166cfcf5f06  resx/kernel/vmlinux-5.10.225" | sha256sum -c -
           ls -la resx/kernel/vmlinux-5.10.225
           echo "FORKD_KERNEL=$PWD/resx/kernel/vmlinux-5.10.225" >> "$GITHUB_ENV"
 
@@ -132,9 +144,11 @@ jobs:
             --test zeroboot_concurrency \
             --test zeroboot_fork
 
-      # 打包：musl 静态 rfb-runtime → forkd-agent rootfs（该 ext4 的 sha256 与
-      # resx/SHA256SUMS 绑定，必须与清单逐字节一致）。与 sdk/BACKEND_SETUP.md
-      # 的文档流程一致。
+      # 打包：musl 静态 rfb-runtime → forkd-agent rootfs。如实说明：该 ext4
+      # 是逐次重建的产物（--force 原地覆盖检出文件），resx/SHA256SUMS 目前
+      # 没有 rootfs 条目——rootfs 的完整性由"每次 CI 从刚构建的静态 runtime
+      # 重建"保证，而不是与清单逐字节比对（重建产物进清单必然互相矛盾）。
+      # 与 sdk/BACKEND_SETUP.md 的文档流程一致。
       - name: Build forkd-agent rootfs
         run: |
           set -euo pipefail
@@ -585,6 +599,11 @@ jobs:
           emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log="$RUN_DIR/zb-concurrency.log"
           set +e
+          # 性能回归门（宽松下限）：测试端（他人正在实现）若读取
+          # RFB_E2E_MAX_MS_PER_CREATE，则断言并发 create 的
+          # avg ms/create ≤ 该值（500ms），超出即测试失败。
+          # 注意：env 前缀链中间不能插注释行（注释会吞掉行尾续行符），
+          # 故注释整体置于赋值块之前。
           RFB_REAL_E2E=1 \
           RFB_E2E_KERNEL="$PWD/resx/kernel/vmlinux-5.10.225" \
           RFB_E2E_FIRECRACKER="$FC" \
@@ -593,6 +612,7 @@ jobs:
           RFB_ZBRT_SNAPSHOT_DIR=/dev/shm/rfb-zbrt-snap \
           RFB_ZBRT_SNAPSHOT_SHARDS=4 \
           RFB_ZBRT_VM_MEM_MIB=64 \
+          RFB_E2E_MAX_MS_PER_CREATE=500 \
             cargo test -p rfb-sdk --features cli --release \
             --test zeroboot_concurrency -- --ignored --nocapture 2>&1 | tee "$log"
           rc=$?

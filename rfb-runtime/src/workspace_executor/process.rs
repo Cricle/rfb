@@ -10,6 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Per-`read` chunk size for draining a child's stdout/stderr. 32 KiB keeps
+/// the syscall count (and per-chunk live event overhead) low for chatty
+/// children while staying far below the ~64 KiB pipe buffer, so the drain
+/// loop still wakes promptly on partial output.
+const READ_CHUNK: usize = 32 * 1024;
+
 impl WorkspaceGuestExecutor {
     pub(super) fn exec(&self, value: &Value, cancel: &AtomicBool) -> Result<Value, String> {
         let args = value
@@ -204,7 +210,7 @@ impl WorkspaceGuestExecutor {
             let mut data: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
             let mut done = [false; 2];
             let mut failure: [Option<String>; 2] = [None, None];
-            let mut buf = [0u8; 4096];
+            let mut buf = vec![0u8; READ_CHUNK];
             while !(done[0] && done[1]) {
                 if cancel.load(Ordering::SeqCst) {
                     return Err("request cancelled".into());
@@ -460,7 +466,7 @@ fn read_stream(
     sink: Option<Sink>,
 ) -> std::io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    let mut buf = [0u8; 4096];
+    let mut buf = vec![0u8; READ_CHUNK];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {

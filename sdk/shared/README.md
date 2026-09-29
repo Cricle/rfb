@@ -61,3 +61,20 @@ fail-closed 断言：`eval` 在 ZBRT 下抛 ValidationError，且 fake guest 收
 | Java | ✅ fail closed | ✅ 当前键优先 |
 
 各语言 README 的「统一 API / 已知限制」章节已同步为本文契约。
+
+## 5. ZBRT 黄金向量（共享文件）
+
+8 个 ZBRT v1 黄金向量 + 严格解码拒绝用例存放在
+[`conformance/zbrt_vectors.json`](conformance/zbrt_vectors.json)（schema 与五语言加载约定见
+[`conformance/README.md`](conformance/README.md)）：`hello` `helloack` `execute` `output`
+`exit` `cancel` `cancel_legacy` `error`，`request_id` 统一 `000102030405060708090a0b0c0d0e0f`。
+
+各语言 codec 测试**就地加载该文件**（从测试文件位置向上查找含 `sdk/shared/conformance` 的
+仓库根，禁止复制到语言树）：
+
+- Rust：`rfb/tests/client_codec.rs`（`env!("CARGO_MANIFEST_DIR")/../sdk/shared/conformance/zbrt_vectors.json`）
+- Python：`tests/test_zbrt_codec.py`（`Path(__file__).parents` 向上查找）
+- C# / Java / Node.js：补 codec 测试时沿用同一「向上找仓库根」锚点规则
+
+向量变更流程：先改 `sdk/PROTOCOL.md`（§3.2/§4），再改 JSON；任一语言编码或解码对不上即视为
+实现漂移，先修实现。

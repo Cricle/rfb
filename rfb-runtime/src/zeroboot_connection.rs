@@ -6,7 +6,9 @@
 //! 1, 28-byte header) and maps its request types onto the existing
 //! `rfb-runtime` execution/state-machine machinery:
 //!
-//! - `Hello` -> RFB1 `Hello` handshake and a ZBRT `HelloAck` reply.
+//! - `Hello` -> RFB1 `Hello` handshake and a ZBRT `HelloAck` reply. The
+//!   handshake is mandatory: any other frame sent first fails closed with a
+//!   ZBRT `Error` frame ("protocol handshake required").
 //! - `Execute` -> a structured workspace `exec` turn that streams `Output`
 //!   frames live as the child writes, then a single terminal `Exit` frame
 //!   (exactly once, even on cancellation or failure).
@@ -114,14 +116,11 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut writer = writer;
-    // The ZBRT host provider/CLI never send a wire Hello before Execute, so
-    // auto-negotiate protocol readiness with the runtime service itself.
-    {
-        let mut runtime = service.lock().await;
-        let _ = runtime.handle(ControlMessage::Hello {
-            protocol_version: 1,
-        });
-    }
+    // ZBRT handshake is enforced, never auto-negotiated: the peer must send a
+    // wire `Hello` before any other frame. Auto-Hello here would silently
+    // establish protocol readiness for every connection and void the
+    // runtime-service guards that reject pre-handshake work.
+    let mut handshaked = false;
 
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerMessage>(WORKER_CHANNEL_CAPACITY);
     let mut worker_active = false;
@@ -203,8 +202,31 @@ where
                     Some(Err(error)) => break Err(error),
                     None => break Ok(()),
                 };
-                let reply = match frame.kind {
-                    Kind::Hello => handle_hello(frame.request_id, &frame.payload),
+                let reply = if !handshaked && frame.kind != Kind::Hello {
+                    // Fail closed: every non-Hello frame before the handshake
+                    // is rejected instead of reaching the runtime service.
+                    Some(fail_closed_error(
+                        frame.request_id,
+                        "protocol handshake required",
+                    ))
+                } else {
+                    match frame.kind {
+                    Kind::Hello => {
+                        // Establish protocol readiness in the runtime service
+                        // FIRST, then answer the wire Hello. The handshake is
+                        // only open once a HelloAck is actually produced.
+                        let reply = {
+                            let mut runtime = service.lock().await;
+                            let _ = runtime.handle(ControlMessage::Hello {
+                                protocol_version: 1,
+                            });
+                            handle_hello(frame.request_id, &frame.payload)
+                        };
+                        if matches!(&reply, Some(replied) if replied.kind == Kind::HelloAck) {
+                            handshaked = true;
+                        }
+                        reply
+                    }
                     Kind::Execute => {
                         match handle_execute(
                             &service,
@@ -244,6 +266,7 @@ where
                         frame.request_id,
                         "unsupported request kind",
                     )),
+                }
                 };
                 if let Some(frame) = reply {
                     if let Err(error) = write_frame_async(&mut writer, &frame).await {
@@ -627,6 +650,17 @@ fn execute_to_turn(request_id: [u8; 16], exec: Execute) -> SessionRequest {
     }
 }
 
+/// Only the `exit_code` field of a `turn.completed` payload. The payload also
+/// carries the full bounded stdout/stderr; a typed deserialize skips those
+/// string fields without materializing them into a JSON tree, so building the
+/// Exit frame costs no allocation proportional to the command output. The
+/// RFB1 wire shape is unchanged.
+#[derive(serde::Deserialize)]
+struct TurnCompletedExit {
+    #[serde(default)]
+    exit_code: Option<i64>,
+}
+
 /// Convert the terminal runtime responses into exactly one ZBRT terminal frame
 /// per request: `Exit` for a completed or cancelled turn, `Error` for a
 /// terminal runtime error. Ordering is deterministic: the first terminal
@@ -641,11 +675,9 @@ fn terminal_frame(request_id: [u8; 16], responses: &[RuntimeMessage]) -> Option<
                 return Some(exit_frame(request_id, -1));
             }
             RuntimeMessage::Event(event) if event.kind == "turn.completed" => {
-                let value = serde_json::from_slice::<serde_json::Value>(&event.payload)
-                    .unwrap_or(serde_json::Value::Null);
-                let code = value
-                    .get("exit_code")
-                    .and_then(serde_json::Value::as_i64)
+                let code = serde_json::from_slice::<TurnCompletedExit>(&event.payload)
+                    .ok()
+                    .and_then(|exit| exit.exit_code)
                     .and_then(|v| i32::try_from(v).ok())
                     .unwrap_or(-1);
                 return Some(exit_frame(request_id, code));

@@ -44,11 +44,21 @@ impl From<crate::controller::ForkdClientError> for RfbError {
             crate::controller::ForkdClientError::Transport(err) => {
                 RfbError::Transport(io::Error::other(err))
             }
+            // A deadline elapsed on the controller request: every timeout is
+            // transport-class (UNIFIED_API.md §7).
+            crate::controller::ForkdClientError::Timeout => RfbError::Transport(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "forkd request timed out",
+            )),
             crate::controller::ForkdClientError::Http { status, message } => RfbError::Http {
                 status: status.as_u16(),
                 message,
             },
             crate::controller::ForkdClientError::Decode(message) => RfbError::decode(message),
+            // A remote failure reported by the controller itself (e.g. the
+            // request reached forkd but forkd rejected it outside HTTP status
+            // semantics).
+            crate::controller::ForkdClientError::Remote(message) => RfbError::Remote(message),
         }
     }
 }

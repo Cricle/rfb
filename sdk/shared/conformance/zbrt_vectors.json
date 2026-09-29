@@ -1,0 +1,63 @@
+{
+  "comment": "Canonical ZBRT v1 wire vectors (sdk/PROTOCOL.md §4). Every SDK test loads this file from disk and asserts its codec reproduces the exact bytes; do not fork copies into language trees.",
+  "request_id_hex": "000102030405060708090a0b0c0d0e0f",
+  "frames": [
+    {
+      "name": "hello",
+      "kind": 1,
+      "hex": "5a42525401010000000102030405060708090a0b0c0d0e0f000000220000000873646b2d746573740200000007657865637574650000000673747265616d"
+    },
+    {
+      "name": "helloack",
+      "kind": 2,
+      "hex": "5a42525401020000000102030405060708090a0b0c0d0e0f0000005a000000127266622d7a65726f626f6f742d67756573740600000007657865637574650000000673747265616d00000008646561646c696e65000000066865616c74680000000663616e63656c0000000a66696c6573797374656d"
+    },
+    {
+      "name": "execute",
+      "kind": 3,
+      "hex": "5a42525401030000000102030405060708090a0b0c0d0e0f0000002902000000046563686f000000026869010000000a2f776f726b737061636500000003616263000005dc"
+    },
+    {
+      "name": "output",
+      "kind": 4,
+      "hex": "5a42525401040000000102030405060708090a0b0c0d0e0f0000000e0100000009657272206c696e650a"
+    },
+    {
+      "name": "exit",
+      "kind": 5,
+      "hex": "5a42525401050000000102030405060708090a0b0c0d0e0f000000050000000000"
+    },
+    {
+      "name": "cancel",
+      "kind": 6,
+      "hex": "5a42525401060000000102030405060708090a0b0c0d0e0f0000000a01000000047573657200"
+    },
+    {
+      "name": "cancel_legacy",
+      "kind": 6,
+      "hex": "5a42525401060000000102030405060708090a0b0c0d0e0f00000009010000000475736572"
+    },
+    {
+      "name": "error",
+      "kind": 12,
+      "hex": "5a425254010c0000000102030405060708090a0b0c0d0e0f00000015000000010000000d6172677620697320656d707479"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "bad_magic",
+      "byte_offset": 0,
+      "byte_value": 88
+    },
+    {
+      "name": "wrong_version",
+      "byte_offset": 4,
+      "byte_value": 2
+    },
+    {
+      "name": "unknown_kind",
+      "byte_offset": 5,
+      "byte_value": 127
+    }
+  ]
+}

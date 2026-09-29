@@ -1,6 +1,8 @@
 package io.rfb.sdk;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.rfb.sdk.internal.GuestNdjson;
+import io.rfb.sdk.internal.Json;
 import io.rfb.sdk.internal.Validation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +31,7 @@ class GuestNdjsonTest {
 
     @AfterEach
     void tearDown() {
+        GuestNdjson.agentTokenOverride = null;
         if (server != null) {
             server.close();
         }
@@ -40,12 +43,24 @@ class GuestNdjsonTest {
     }
 
     private Sandbox sandboxOn(String address) {
-        RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
+        return sandboxOn(address, 5.0);
+    }
+
+    private Sandbox sandboxOn(String address, double timeoutS) {
+        RfbClient client = new RfbClient("http://127.0.0.1:1", "", timeoutS);
         SandboxInfo info = new SandboxInfo();
         info.setId("sb-1");
         info.setSnapshotTag("base");
         info.setGuestAddr(address);
         return Sandbox.attach(client, info, RfbClient.TRANSPORT_NDJSON);
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Reads one request line and replies with the given lines then flushes. */
@@ -347,6 +362,115 @@ class GuestNdjsonTest {
         try (GuestStream stream = sandbox.stream(List.of("x"))) {
             assertThrows(DecodeError.class, stream::nextEvent);
         }
+    }
+
+    // ---- exec read budget (client + deadline + 5s) ---------------------------
+
+    @Test
+    void execReadBudgetCoversClientTimeoutPlusDeadlinePlusFive() throws Exception {
+        // Cross-language contract §5: a guest answering after the plain client
+        // timeout but inside client+exec+5s must succeed (0.5 + 1 + 5 = 6.5s).
+        server = new FakeNdjsonServer((in, out) -> {
+            in.readLine();
+            sleepQuietly(1200);
+            writeLines(out, "{\"out\":\"late\",\"exit_code\":0}");
+        });
+        Sandbox sandbox = sandboxOn(server.address(), 0.5);
+        ExecResult result = sandbox.exec(List.of("echo"), null, 1.0);
+        assertEquals("late", result.stdoutText());
+        assertEquals(Integer.valueOf(0), result.getExitCode());
+    }
+
+    @Test
+    void nonExecRequestsKeepThePlainClientTimeout() throws Exception {
+        // The widened budget is exec-only: ls still times out at the client
+        // timeout instead of waiting an extra 5s+deadline.
+        server = new FakeNdjsonServer((in, out) -> {
+            in.readLine();
+            sleepQuietly(1500);
+            writeLines(out, "{\"entries\":[]}");
+        });
+        Sandbox sandbox = sandboxOn(server.address(), 0.4);
+        long start = System.nanoTime();
+        assertThrows(TransportError.class, sandbox::ls);
+        assertTrue((System.nanoTime() - start) < 1_500_000_000L, "ls must not use the exec budget");
+    }
+
+    // ---- agent auth (FORKD_AGENT_TOKEN) --------------------------------------
+
+    @Test
+    void agentAuthLinePrecedesExecWhenTokenConfigured() throws Exception {
+        GuestNdjson.agentTokenOverride = "sekret";
+        Sandbox sandbox = sandbox((in, out) -> {
+            JsonNode auth = Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8));
+            assertEquals("auth", auth.path("action").asText());
+            assertEquals("sekret", auth.path("token").asText());
+            writeLines(out, "{\"action\":\"auth\",\"ok\":true}");
+            JsonNode exec = Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8));
+            assertEquals("exec", exec.path("action").asText());
+            writeLines(out, "{\"out\":\"hi\",\"exit_code\":0}");
+        });
+        ExecResult result = sandbox.exec(List.of("echo", "hi"));
+        assertEquals("hi", result.stdoutText());
+    }
+
+    @Test
+    void agentAuthLinePrecedesStreamWhenTokenConfigured() throws Exception {
+        GuestNdjson.agentTokenOverride = "sekret";
+        Sandbox sandbox = sandbox((in, out) -> {
+            assertEquals("auth", Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8))
+                    .path("action").asText());
+            writeLines(out, "{\"action\":\"auth\",\"ok\":true}");
+            assertEquals("stream", Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8))
+                    .path("action").asText());
+            writeLines(out, "{\"started\":true}", "{\"exit_code\":0}");
+        });
+        try (GuestStream stream = sandbox.stream(List.of("cat"))) {
+            assertEquals(StreamEvent.STARTED, stream.nextEvent().getKind());
+            assertEquals(StreamEvent.EXIT, stream.nextEvent().getKind());
+        }
+    }
+
+    @Test
+    void agentAuthRejectionIsRemoteError() throws Exception {
+        GuestNdjson.agentTokenOverride = "wrong-token";
+        Sandbox sandbox = sandbox((in, out) -> {
+            in.readLine(); // the auth line
+            writeLines(out, "{\"error\":\"authentication failed\"}");
+        });
+        RemoteError error = assertThrows(RemoteError.class, sandbox::ping);
+        assertTrue(error.getMessage().contains("authentication failed"));
+    }
+
+    @Test
+    void agentUnexpectedAuthReplyIsRemoteError() throws Exception {
+        GuestNdjson.agentTokenOverride = "sekret";
+        Sandbox sandbox = sandbox((in, out) -> {
+            in.readLine();
+            writeLines(out, "{\"pong\":true}"); // not an auth ack
+        });
+        assertThrows(RemoteError.class, sandbox::ping);
+    }
+
+    @Test
+    void agentAuthDisabledWithoutToken() throws Exception {
+        Sandbox sandbox = sandbox((in, out) -> {
+            assertEquals("ping", Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8))
+                    .path("action").asText());
+            writeLines(out, "{\"pong\":true}");
+        });
+        assertTrue(sandbox.ping());
+    }
+
+    @Test
+    void agentBlankTokenDisablesAuth() throws Exception {
+        GuestNdjson.agentTokenOverride = "   ";
+        Sandbox sandbox = sandbox((in, out) -> {
+            assertEquals("ping", Json.parse(in.readLine().getBytes(StandardCharsets.UTF_8))
+                    .path("action").asText());
+            writeLines(out, "{\"pong\":true}");
+        });
+        assertTrue(sandbox.ping());
     }
 
 }

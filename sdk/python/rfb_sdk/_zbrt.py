@@ -35,6 +35,16 @@ KIND_RESULT = 13
 
 ZBRT_V1_CAPABILITIES = ["execute", "stream", "deadline", "health", "cancel", "filesystem"]
 
+# Client name advertised in the mandatory Hello frame. A guest ZBRT connection
+# must be helloed before anything else: the guest rejects every frame from a
+# connection that has not completed Hello/HelloAck.
+HELLO_CLIENT_NAME = "rfb-sdk-python"
+
+# Aggregate cap on one exec turn's captured output (mirrors the Rust baseline
+# ``rfb/src/client/zbrt.rs`` MAX_EXEC_BYTES so a chatty guest cannot grow host
+# memory without bound). Exceeding it is a Remote-class error.
+MAX_EXEC_BYTES = 16 * 1024 * 1024
+
 STREAM_STDOUT = 0
 STREAM_STDERR = 1
 
@@ -404,9 +414,55 @@ class _ZbrtGuestClient:
         try:
             sock = socket.create_connection(self._address, timeout=timeout_s)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return sock
         except OSError as e:
             raise TransportError(f"zbrt connect failed: {e}") from e
+        self._handshake(sock)
+        return sock
+
+    @staticmethod
+    def _handshake(sock: socket.socket) -> None:
+        """Mandatory Hello/HelloAck handshake on a freshly connected socket.
+
+        The guest refuses every frame until the connection is helloed, so each
+        connection opens with Hello (client name + full V1 capability set) and
+        must be answered by an echoing HelloAck. Every handshake failure —
+        closed peer, mismatched id, wrong kind, malformed payload — surfaces as
+        a TransportError (cross-language contract: handshake failures are
+        transport failures).
+        """
+        request_id = new_request_id()
+        try:
+            write_frame(
+                sock,
+                KIND_HELLO,
+                request_id,
+                encode_hello(HELLO_CLIENT_NAME, ZBRT_V1_CAPABILITIES),
+            )
+            frame = read_frame(sock)
+        except DecodeError as e:
+            raise TransportError(f"zbrt hello handshake failed: {e}") from e
+        if frame is None:
+            raise TransportError("zbrt connection closed during hello handshake")
+        kind, reply_id, payload = frame
+        if reply_id != request_id:
+            raise TransportError("zbrt hello handshake request id mismatch")
+        if kind == KIND_ERROR:
+            try:
+                message = decode_error(payload)[1] if payload else "rejected"
+            except DecodeError as e:
+                # A codec fault inside a Hello rejection is still a handshake
+                # failure: every handshake outcome maps to the Transport class
+                # (a malformed Error payload must not leak as DecodeError).
+                raise TransportError(
+                    f"zbrt hello handshake failed: invalid error payload: {e}"
+                ) from e
+            raise TransportError(f"zbrt hello handshake rejected: {message}")
+        if kind != KIND_HELLO_ACK:
+            raise TransportError(f"unexpected zbrt frame kind {kind} during hello handshake")
+        try:
+            decode_hello_ack(payload)
+        except DecodeError as e:
+            raise TransportError(f"invalid zbrt hello ack payload: {e}") from e
 
     def _effective_timeout(self, timeout_s) -> float:
         if not timeout_s:
@@ -441,10 +497,16 @@ class _ZbrtGuestClient:
             write_frame(sock, KIND_EXECUTE, request_id, encode_execute(argv, cwd, stdin, timeout_ms))
             stdout = bytearray()
             stderr = bytearray()
+            total = 0
             while True:
                 kind, _rid, payload = self._read_reply(sock, request_id)
                 if kind == KIND_OUTPUT:
                     stream, data = decode_output(payload)
+                    # Aggregate cap across the whole turn (Rust baseline
+                    # client/zbrt.rs): exceed -> Remote-class error.
+                    total += len(data)
+                    if total > MAX_EXEC_BYTES:
+                        raise RemoteError("guest output exceeded the 16 MiB limit")
                     if stream == STREAM_STDOUT:
                         stdout += data
                     elif stream == STREAM_STDERR:
@@ -521,8 +583,14 @@ class _ZbrtStream:
         self._terminal = False
         self._closed = False
         self._pending = []
+        # ZBRT has no started frame: the first next_event synthesizes one
+        # (Rust baseline client/zbrt.rs ZbrtStream::next_event).
+        self._started_sent = False
 
     def next_event(self):
+        if not self._started_sent:
+            self._started_sent = True
+            return StreamEvent(StreamEventKind.STARTED)
         if self._pending:
             return self._pending.pop(0)
         if self._terminal or self._closed:

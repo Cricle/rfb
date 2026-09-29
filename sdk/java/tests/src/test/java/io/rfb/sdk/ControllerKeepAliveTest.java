@@ -20,9 +20,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * TCP regression: one {@link ControllerHttp} (one {@code java.net.http.HttpClient})
- * must reuse a single keep-alive connection for sequential controller requests —
- * N requests, exactly 1 accept. Mirrors the Rust reqwest connection pool.
+ * TCP regression: one {@link ControllerHttp} must reuse a single keep-alive
+ * connection for sequential controller requests — N requests, exactly 1 accept
+ * (mirrors the Rust reqwest connection pool). A stale pooled connection is
+ * rebuilt and retried exactly once for idempotent requests; a POST is never
+ * replayed.
  */
 class ControllerKeepAliveTest {
     /** Raw HTTP/1.1 keep-alive server: one accept loop, per-socket request loop. */
@@ -30,6 +32,11 @@ class ControllerKeepAliveTest {
         final ServerSocket serverSocket;
         final ExecutorService pool = Executors.newCachedThreadPool();
         final AtomicInteger accepts = new AtomicInteger(0);
+        /** Requests observed per connection; connections die after this many. */
+        volatile int closeAfterRequests = -1;
+        /** Close a POST connection right after its request head is read. */
+        volatile boolean closeOnPost = false;
+        final AtomicInteger posts = new AtomicInteger(0);
 
         /** Accepted sockets, closed by {@link #close()} so serve threads
             blocked in read() cannot outlive the test. */
@@ -70,7 +77,7 @@ class ControllerKeepAliveTest {
             }
         }
 
-        /** Answer GETs on one connection until the peer closes. */
+        /** Answer requests on one connection until the peer closes. */
         private void serve(Socket socket) {
             try (socket) {
                 InputStream in = socket.getInputStream();
@@ -80,18 +87,28 @@ class ControllerKeepAliveTest {
                 byte[] head = ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                         + "Content-Length: " + body.length + "\r\n\r\n")
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                while (readRequestHead(in)) {
+                int served = 0;
+                String requestLine;
+                while ((requestLine = readRequestHead(in)) != null) {
+                    if (closeOnPost && requestLine.startsWith("POST")) {
+                        posts.incrementAndGet();
+                        return; // close without answering: a replayed POST would show up
+                    }
                     out.write(head);
                     out.write(body);
                     out.flush();
+                    served++;
+                    if (closeAfterRequests > 0 && served >= closeAfterRequests) {
+                        return; // leave a stale connection behind for the next request
+                    }
                 }
             } catch (IOException ignored) {
                 // peer went away — fine for a fake
             }
         }
 
-        /** Consume one request head (request line + headers). False on clean EOF. */
-        private static boolean readRequestHead(InputStream in) throws IOException {
+        /** Consume one request head (request line + headers). Null on clean EOF. */
+        private static String readRequestHead(InputStream in) throws IOException {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             int b;
             while ((b = in.read()) >= 0) {
@@ -101,11 +118,13 @@ class ControllerKeepAliveTest {
                     byte[] raw = buf.toByteArray();
                     if (raw[size - 4] == '\r' && raw[size - 3] == '\n'
                             && raw[size - 2] == '\r' && raw[size - 1] == '\n') {
-                        return true;
+                        String headText = buf.toString("ISO-8859-1");
+                        int end = headText.indexOf('\r');
+                        return end < 0 ? headText : headText.substring(0, end);
                     }
                 }
             }
-            return false;
+            return null;
         }
 
         @Override

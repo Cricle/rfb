@@ -276,10 +276,17 @@ forkd exec --target "$ADDR" -- /usr/local/bin/hello rfb
 
 每台节点机就是一台标准 forkd controller（§6c），集群层不引入新服务端组件：
 `rfb::cluster::ClusterProvider` 在 N 个 controller 端点之间调度 sandbox 创建——
-默认最少在途数（LeastInflight）、可选轮询（RoundRobin）；节点传输失败或 5xx
-自动 failover 到其余节点，连续 3 次失败的节点被熔断跳过（`probe()` 恢复）。
+默认最少在途数（LeastInflight）、可选轮询（RoundRobin）。传输失败、5xx、
+响应不可解析（Decode）按「节点故障」计一次失败并自动 failover 到其余节点，
+连续 3 次失败熔断；4xx 是节点明确拒绝，立即向调用方报错、不计失败也不转移
+（避免双创建）。熔断节点默认每 30 秒最多放行一次惰性半开试探
+（`recovery_interval`，默认 30s；试探 create 成功即恢复），`probe()` 可立即手动
+巡检（不计失败，失败只推迟下次试探）。传输/解析失败后还会对账该节点的沙箱
+列表：标签匹配且 `created_at_unix` 落在本次尝试窗口内**恰好一条**时删除该孤儿，
+其余（0 条 / 多条 / 无时间戳 / 列表失败）只告警不动（宁漏不误）。
 exec/stream/文件操作直连沙箱 guest 地址（不过 controller），销毁路由回创建
-节点。所有节点必须预置同一个 snapshot tag。
+节点。create 返回的 handle 用 RAII 释放在途计数，`drop` 即释放（无需手工
+release）。所有节点必须预置同一个 snapshot tag。
 
 ```rust
 use rfb::cluster::{ClusterConfig, ClusterProvider};
@@ -289,16 +296,28 @@ use std::time::Duration;
 let provider = ClusterProvider::new(ClusterConfig::from_urls(
     ["http://10.0.0.1:8889", "http://10.0.0.2:8889", "http://10.0.0.3:8889"],
     "fresh", // 各节点已就绪的快照 tag
-))?;
-let sandbox = provider.create(Default::default()).await?;   // 调度到负载最低节点
+).with_recovery_interval(Duration::from_secs(30)))?; // 默认即 30s
+let sandbox = provider.create(Default::default()).await?; // 调度到负载最低节点
 let result = sandbox.exec(ExecSpec::new("uname")).await?;
-provider.probe().await;              // 节点健康巡检（恢复熔断节点）
-provider.node_status();              // (url, healthy, inflight) 快照，接监控
+drop(sandbox);                         // RAII：在途计数随 handle 释放，无需手工 release
+provider.probe().await;                // 手动巡检（成功即恢复熔断节点）
+let status = provider.node_statuses(); // healthy/tripped/failures/inflight/next_trial，接监控
+
+// 上线前跨节点一致性：所有节点 ready/bootable，且快照 digest 一致
+let report = provider.preflight().await;
+assert!(report.digests_agree, "snapshot digest mismatch: {:?}", report.notes);
+
+// 属主宕机后的孤儿清理：list_all 聚合各节点 → delete_on 精确清理
+for node in provider.list_all().await {
+    for sandbox in &node.sandboxes { /* 判断 handle 已丢失的孤儿 */ }
+}
+provider.delete_on("http://10.0.0.1:8889", "sbx-123").await?;
 ```
 
 - 节点扩容：加 URL 即可；沙箱 handle 自带所属节点，无需集群级会话粘性。
 - 100 并发集群 = 每节点 §6b-2 的分片并发再叠加节点间调度。
-- 单测：`rfb/tests/cluster.rs`（mock controller 覆盖调度/熔断/failover/probe）。
+- 单测：`rfb/tests/cluster.rs`（mock controller 覆盖调度/错误分级/熔断/半开/
+  对账/预检/聚合清理）。
 
 ## 1. 前提条件
 

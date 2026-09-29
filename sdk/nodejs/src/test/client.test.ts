@@ -112,4 +112,59 @@ describe('RfbClient controller calls (fake HTTP controller)', () => {
       (e: Error) => e.constructor.name === 'DecodeError',
     );
   });
+
+  it('percent-encodes snapshot tags verbatim (dots and colons stay legal)', async () => {
+    const { base, requests } = await startController((_url, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end('{"tag":"base.v2","status":"ready","bootable":true}');
+    });
+    const client = new RfbClient({ baseUrl: base, timeoutS: 5 });
+
+    const dotted = await client.snapshot('base.v2');
+    assert.equal(dotted?.status, 'ready');
+    assert.equal(requests[0], 'GET /v1/snapshots/base.v2/info');
+
+    await client.snapshot('snap:1');
+    assert.equal(requests[1], 'GET /v1/snapshots/snap%3A1/info');
+  });
+
+  it('rejects an empty snapshot tag before any HTTP request', async () => {
+    const { base, requests } = await startController((_url, res) => res.end('[]'));
+    const client = new RfbClient({ baseUrl: base, timeoutS: 5 });
+    const isValidation = (e: Error) => e.constructor.name === 'ValidationError';
+    await assert.rejects(() => client.snapshot(''), isValidation);
+    await assert.rejects(() => client.waitSnapshot(''), isValidation);
+    await assert.rejects(() => client.createSandbox(''), isValidation);
+    assert.equal(requests.length, 0, 'tag validation must precede any HTTP call');
+  });
+
+  it('waitSnapshot matches tags verbatim and createSandbox passes them in the body', async () => {
+    const { base, requests } = await startController((url, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      if (url === '/v1/snapshots') {
+        res.end('[{"tag":"snap:1","status":"ready","bootable":true}]');
+        return;
+      }
+      res.end('[{"id":"sb-2","snapshot_tag":"snap:1","guest_addr":"127.0.0.1:1"}]');
+    });
+    const client = new RfbClient({ baseUrl: base, timeoutS: 5 });
+
+    const ready = await client.waitSnapshot('snap:1');
+    assert.equal(ready.tag, 'snap:1');
+
+    const sandboxes = await client.createSandbox('snap:1');
+    assert.equal(sandboxes[0]?.id, 'sb-2');
+    assert.deepEqual(requests, ['GET /v1/snapshots', 'POST /v1/sandboxes']);
+  });
+
+  it('passes controller ping payloads through verbatim (protocol_version)', async () => {
+    const { base, requests } = await startController((_url, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end('{"pong":true,"protocol_version":1}');
+    });
+    const client = new RfbClient({ baseUrl: base, timeoutS: 5 });
+    const value = await client.pingSandbox('sb-1');
+    assert.deepEqual(value, { pong: true, protocol_version: 1 });
+    assert.deepEqual(requests, ['POST /v1/sandboxes/sb-1/ping']);
+  });
 });

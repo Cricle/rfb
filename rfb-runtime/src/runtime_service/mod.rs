@@ -244,17 +244,21 @@ impl RuntimeService {
         }
     }
 
-    /// Claim a turn for in-flight execution. Validates identity/activity, marks
-    /// the session active, stores the executor's cancellation handle, and takes
-    /// the executor out so the caller can run `start_turn` on a worker thread.
-    /// Returns the executor on success, or the rejection response.
     /// Dispatch a typed filesystem operation to the active workspace executor.
-    /// Fails closed while a turn has taken the executor out to a worker.
+    /// Fails closed before the protocol handshake has established readiness and
+    /// while a turn has taken the executor out to a worker.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn filesystem_rpc(&mut self, op: u8, path: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+        // Defense in depth on top of the transport guards (ZBRT rejects any
+        // non-Hello frame before the handshake): a filesystem RPC can read or
+        // mutate the workspace, so it must never run before protocol readiness
+        // is established.
+        if !self.protocol_ready {
+            return Err("protocol handshake required before filesystem RPC".into());
+        }
         if self.executor.is_none() {
             return Err("turn in progress; filesystem RPC unavailable".into());
         }

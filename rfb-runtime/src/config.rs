@@ -31,6 +31,9 @@ pub const DEFAULT_WORKSPACE: &str = "/workspace";
 /// The image-declared environment file (`RFB_RUNTIME_ENVIRONMENT`,
 /// default `/etc/rfb-runtime/environment`).
 pub const DEFAULT_ENVIRONMENT_PATH: &str = "/etc/rfb-runtime/environment";
+/// The Firecracker executable the VM lifecycle driver spawns
+/// (`RFB_FIRECRACKER_BIN`, default `firecracker` on `PATH`).
+pub const DEFAULT_FIRECRACKER_BIN: &str = "firecracker";
 
 /// Comprehensive runtime tuning knobs. Every field has a default that equals
 /// the historical hard-coded value; none are mandatory.
@@ -80,6 +83,19 @@ fn env_secs(name: &str, default: Duration) -> Duration {
         .and_then(|value| value.trim().parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(default)
+}
+
+/// Resolve the Firecracker executable spawned by the VM lifecycle driver.
+///
+/// Unlike the guest vsock port this override is honored in release builds too:
+/// host images may install the binary under a versioned name or an absolute
+/// path. An unset or blank value falls back to [`DEFAULT_FIRECRACKER_BIN`], so
+/// the historical `PATH` lookup is unchanged.
+pub fn firecracker_bin() -> String {
+    std::env::var("RFB_FIRECRACKER_BIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_FIRECRACKER_BIN.to_owned())
 }
 
 impl RuntimeConfig {

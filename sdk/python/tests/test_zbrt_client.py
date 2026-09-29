@@ -3,6 +3,7 @@
 import socket
 import struct
 import unittest
+from unittest import mock
 
 from rfb_sdk import _zbrt as z
 from rfb_sdk.errors import DecodeError, RemoteError, TransportError
@@ -37,6 +38,10 @@ class ZbrtClientTests(unittest.TestCase):
     def test_stream_frame_with_mismatched_request_id_is_decode_error(self):
         self.server.mismatch_reply_id = True
         stream = self.client.open_stream(["cat"], "/")
+        # First poll is the synthesized started event; the corrupted reply id
+        # then hits the Output frame read.
+        started = stream.next_event()
+        self.assertEqual(started.kind.value, "started")
         with self.assertRaises(DecodeError):
             stream.next_event()
 
@@ -114,12 +119,19 @@ class ZbrtStreamTests(unittest.TestCase):
 
     def test_stream_output_then_exit_then_none(self):
         stream = self.client.open_stream(["echo"], None)
+        # ZBRT has no started frame: the first poll synthesizes Started
+        # (Rust baseline client/zbrt.rs ZbrtStream::next_event).
+        started = stream.next_event()
+        self.assertEqual(started.kind.value, "started")
+        self.assertEqual(started.data, b"")
+        self.assertIsNone(started.code)
         stdout = stream.next_event()
         self.assertEqual(stdout.kind.value, "stdout")
         self.assertEqual(stdout.data, b"hello\n")
         exit_event = stream.next_event()
         self.assertEqual(exit_event.kind.value, "exit")
         self.assertEqual(exit_event.code, 0)
+        self.assertIsNone(stream.next_event())
         self.assertIsNone(stream.next_event())
 
     def test_stream_stop_receives_cancel_ack(self):
@@ -129,6 +141,9 @@ class ZbrtStreamTests(unittest.TestCase):
         # The fake server answered Cancel with an empty-payload CancelAck and
         # then an Exit(-1) terminal for the held request.
         self.assertEqual(len(self.server.received_cancels), 1)
+        # The cached Exit is delivered after the synthesized started event.
+        started = stream.next_event()
+        self.assertEqual(started.kind.value, "started")
         exit_event = stream.next_event()
         self.assertEqual(exit_event.kind.value, "exit")
         self.assertEqual(exit_event.code, -1)
@@ -136,6 +151,22 @@ class ZbrtStreamTests(unittest.TestCase):
         # stop is idempotent: no second Cancel goes on the wire.
         stream.stop()
         self.assertEqual(len(self.server.received_cancels), 1)
+
+    def test_stream_stop_with_exit_before_cancel_ack_caches_exit(self):
+        # Exit arrives during the stop drain BEFORE the CancelAck: stop must
+        # return immediately (not block until timeout), mark the stream
+        # terminal and cache the Exit for the next next_event.
+        self.server.hold_execute_open = True
+        self.server.exit_before_cancel_ack = True
+        stream = self.client.open_stream(["tail"], None)
+        stream.stop()
+        self.assertEqual(len(self.server.received_cancels), 1)
+        started = stream.next_event()
+        self.assertEqual(started.kind.value, "started")
+        exit_event = stream.next_event()
+        self.assertEqual(exit_event.kind.value, "exit")
+        self.assertEqual(exit_event.code, -1)
+        self.assertIsNone(stream.next_event())
 
     def test_stream_stop_after_terminal_is_noop(self):
         stream = self.client.open_stream(["echo"], None)
@@ -152,12 +183,140 @@ class ZbrtStreamTests(unittest.TestCase):
     def test_stream_error_frame_raises_remote_error(self):
         self.server.fail_execute_message = "a turn is already active"
         stream = self.client.open_stream(["tail"], None)
+        self.assertEqual(stream.next_event().kind.value, "started")
         with self.assertRaises(RemoteError):
             stream.next_event()
         # After the error the stream is terminal: next_event returns None and
         # stop() is a no-op.
         self.assertIsNone(stream.next_event())
         stream.stop()
+
+
+class ZbrtHelloHandshakeTests(unittest.TestCase):
+    """Every guest ZBRT connection is Hello-first (cross-language contract):
+    the guest rejects all frames from an un-helloed connection, so the SDK
+    must send Hello before Execute/Health/Fs on each fresh connection and
+    validate the echoing HelloAck."""
+
+    def setUp(self):
+        self.server = FakeZbrtServer()
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.client = z._ZbrtGuestClient(self.server.address, 5.0)
+
+    def test_hello_is_first_frame_on_every_connection(self):
+        self.assertTrue(self.client.ping())
+        self.client.exec(["echo", "hi"], "/", 5, b"")
+        self.client.fs_op(z.FS_OP_LS, ".", {"max_results": 10})
+        stream = self.client.open_stream(["echo"], None)
+        self.assertEqual(stream.next_event().kind.value, "started")
+        self.assertEqual(stream.next_event().kind.value, "stdout")
+        self.assertEqual(stream.next_event().kind.value, "exit")
+        # One connection per request, and each one opened with Hello.
+        self.assertEqual(self.server.received_first_frame_kinds, [1, 1, 1, 1])
+        self.assertEqual(len(self.server.received_hellos), 4)
+        for client_name, caps in self.server.received_hellos:
+            self.assertEqual(client_name, "rfb-sdk-python")
+            self.assertEqual(caps, z.ZBRT_V1_CAPABILITIES)
+
+    def test_hello_rejection_close_is_transport_error(self):
+        self.server.reject_hello = "close"
+        with self.assertRaises(TransportError):
+            self.client.ping()
+
+    def test_hello_error_frame_is_transport_error(self):
+        self.server.reject_hello = "error"
+        with self.assertRaises(TransportError) as ctx:
+            self.client.ping()
+        self.assertIn("hello", str(ctx.exception))
+
+    def test_hello_wrong_reply_kind_is_transport_error(self):
+        self.server.reject_hello = "wrong_kind"
+        with self.assertRaises(TransportError):
+            self.client.ping()
+
+    def test_hello_malformed_error_payload_is_transport_error(self):
+        # A truncated Error payload during the handshake is still a handshake
+        # failure: every failed handshake maps to the Transport class, never
+        # a raw DecodeError.
+        self.server.reject_hello = "malformed_error"
+        with self.assertRaises(TransportError):
+            self.client.ping()
+        self.assertEqual(self.server.received_executes, [])
+
+    def test_hello_is_the_first_frame_written_before_any_read(self):
+        # Mock-level ordering contract (independent of the fake server): the
+        # FIRST frame written on a fresh socket is Hello with the client name
+        # and the full V1 capability set, and the HelloAck round-trip happens
+        # before the business request (Health here) goes out.
+        sock = mock.Mock()
+        written = []
+        state = {"rid": None, "phase": "hello"}
+
+        def fake_write(_sock, kind, request_id, payload=b""):
+            written.append((kind, request_id, payload))
+            state["rid"] = request_id
+
+        def fake_read(_sock):
+            if state["phase"] == "hello":
+                assert written and written[0][0] == z.KIND_HELLO, (
+                    "Hello must be written before any reply is read"
+                )
+                state["phase"] = "health"
+                return (
+                    z.KIND_HELLO_ACK,
+                    state["rid"],
+                    z.encode_hello_ack("rfb-zeroboot-guest", z.ZBRT_V1_CAPABILITIES),
+                )
+            return (z.KIND_HEALTH_ACK, state["rid"], z.encode_health(True, None))
+
+        with mock.patch.object(z.socket, "create_connection", return_value=sock), \
+             mock.patch.object(z, "write_frame", side_effect=fake_write), \
+             mock.patch.object(z, "read_frame", side_effect=fake_read):
+            self.assertTrue(self.client.ping())
+
+        self.assertEqual(
+            [kind for kind, _rid, _payload in written],
+            [z.KIND_HELLO, z.KIND_HEALTH],
+        )
+        client_name, caps = z.decode_hello(written[0][2])
+        self.assertEqual(client_name, "rfb-sdk-python")
+        self.assertEqual(caps, z.ZBRT_V1_CAPABILITIES)
+
+    def test_handshake_failure_means_no_request_frames(self):
+        # A rejected handshake must abort before the real request goes out.
+        self.server.reject_hello = "close"
+        with self.assertRaises(TransportError):
+            self.client.exec(["echo"], "/", 5, b"")
+        self.assertEqual(self.server.received_executes, [])
+
+
+class ZbrtExecOutputCapTests(unittest.TestCase):
+    """One exec turn aggregates at most 16 MiB of Output (Rust baseline
+    client/zbrt.rs MAX_EXEC_BYTES); exceeding it is a Remote-class error."""
+
+    def setUp(self):
+        self.server = FakeZbrtServer()
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.client = z._ZbrtGuestClient(self.server.address, 5.0)
+
+    def test_output_over_limit_is_remote_error(self):
+        self.server.exec_oversize_chunks = [5, 5]
+        with mock.patch.object(z, "MAX_EXEC_BYTES", 8):
+            with self.assertRaises(RemoteError) as ctx:
+                self.client.exec(["echo"], "/", 5, b"")
+        self.assertIn("output exceeded", str(ctx.exception))
+
+    def test_output_exactly_at_limit_is_allowed(self):
+        self.server.exec_oversize_chunks = [5, 3]
+        with mock.patch.object(z, "MAX_EXEC_BYTES", 8):
+            code, stdout, _stderr = self.client.exec(["echo"], "/", 5, b"")
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, b"\x00" * 8)
+
+    def test_default_cap_is_16mib(self):
+        self.assertEqual(z.MAX_EXEC_BYTES, 16 * 1024 * 1024)
 
 
 class ZbrtServerFrameChecks(unittest.TestCase):

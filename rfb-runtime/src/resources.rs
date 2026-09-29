@@ -8,14 +8,68 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Size of the guest `/workspace` tmpfs, mounted by the PID-1 guest init
-/// (`guest.rs::mount_workspace_tmpfs`).
-///
-/// This is the single source of truth: `RuntimeLimits::default()`
-/// derives `max_workspace_bytes` from it so the executor-side limit can never
-/// exceed the kernel-enforced tmpfs cap (which would turn policy errors into
-/// raw ENOSPC from the mount).
+#[cfg(target_os = "linux")]
+use std::fs;
+
+const MIB: u64 = 1024 * 1024;
+
+/// Fallback `/workspace` tmpfs size (bytes) for environments where the guest's
+/// total memory cannot be read (non-Linux builds, unusual `/proc` layouts).
+/// The runtime size is derived from guest memory — see
+/// [`derive_workspace_bytes`] and [`workspace_tmpfs_bytes`].
 pub const WORKSPACE_TMPFS_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Floor for the derived `/workspace` tmpfs size: a sandbox below this much
+/// workspace is useless, so tiny memory budgets still get a usable tmpfs.
+pub const WORKSPACE_TMPFS_MIN_BYTES: u64 = 64 * MIB;
+/// Ceiling for the derived `/workspace` tmpfs size: no guest needs more than
+/// 1 GiB of investigation artifacts in RAM.
+pub const WORKSPACE_TMPFS_MAX_BYTES: u64 = 1024 * MIB;
+
+/// Derive the `/workspace` tmpfs size from the guest's total memory: 40% of
+/// `mem_total_bytes`, floored to whole MiB and clamped to
+/// 64 MiB..=1 GiB. The MiB flooring is deliberate: the tmpfs mount option
+/// (`guest.rs::mount_workspace_tmpfs`) is also expressed in whole MiB, so the
+/// executor-side limit can never exceed the kernel-enforced tmpfs cap (which
+/// would turn policy errors into raw ENOSPC from the mount).
+pub fn derive_workspace_bytes(mem_total_bytes: u64) -> u64 {
+    // 40% = 2/5, computed in whole MiB so the result stays MiB-aligned.
+    let share_mib = mem_total_bytes / MIB * 2 / 5;
+    (share_mib * MIB).clamp(WORKSPACE_TMPFS_MIN_BYTES, WORKSPACE_TMPFS_MAX_BYTES)
+}
+
+/// Total guest memory in bytes parsed from `/proc/meminfo` (`MemTotal`, which
+/// the kernel reports in KiB).
+#[cfg(target_os = "linux")]
+fn mem_total_bytes() -> Option<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib: u64 = rest.trim().strip_suffix(" kB")?.trim().parse().ok()?;
+            return Some(kib.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// Non-Linux builds have no `/proc/meminfo`: fall back to the constant.
+#[cfg(not(target_os = "linux"))]
+fn mem_total_bytes() -> Option<u64> {
+    None
+}
+
+/// The `/workspace` tmpfs size actually used by this process: derived from the
+/// guest's total memory when available, else the [`WORKSPACE_TMPFS_BYTES`]
+/// fallback. Cached after the first read (the value cannot change mid-run).
+pub fn workspace_tmpfs_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        mem_total_bytes()
+            .map(derive_workspace_bytes)
+            .unwrap_or(WORKSPACE_TMPFS_BYTES)
+    })
+}
 
 /// Hard limits the runtime enforces on frames, events, workspace, and turn time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +92,11 @@ impl Default for RuntimeLimits {
             max_frame_bytes: 4 * 1024 * 1024,
             max_event_bytes: 512 * 1024,
             channel_capacity: 64,
-            max_workspace_bytes: WORKSPACE_TMPFS_BYTES,
+            // Same source as the tmpfs actually mounted by the guest init:
+            // 40% of MemTotal (clamped to 64 MiB..1 GiB), so the executor-side
+            // limit can never exceed the kernel-enforced tmpfs cap (which
+            // would turn policy errors into raw ENOSPC from the mount).
+            max_workspace_bytes: workspace_tmpfs_bytes(),
             max_runtime_seconds: 1800,
         }
     }

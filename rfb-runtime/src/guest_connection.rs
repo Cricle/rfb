@@ -9,6 +9,13 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// How long the post-disconnect wait for an in-flight turn's result may run.
+/// The worker normally delivers as soon as the command finishes or the cancel
+/// flag fires; if nothing arrives within this bound the worker is suspected
+/// stuck (wedged child, lost delivery), so the turn is abandoned explicitly
+/// instead of wedging the runtime on a phantom active turn forever.
+const DETACHED_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Completion of a turn that ran on a worker thread: (sequence, session,
 /// request, result, executor handed back to the service).
 type TurnResult = (
@@ -156,17 +163,29 @@ where
     // If the connection ends while a turn is in flight (the client vanished),
     // a detached task keeps the result channel alive so the worker's delivery
     // succeeds and the executor is returned to the shared service exactly
-    // once. A worker that died without delivering is abandoned explicitly so
-    // the runtime keeps answering instead of wedging on a phantom turn.
+    // once. The wait is bounded: a worker that neither delivers nor dies (or
+    // died without delivering) within DETACHED_TURN_WAIT is treated as stuck
+    // and the turn is abandoned explicitly so the runtime keeps answering
+    // instead of wedging on a phantom turn.
     if worker_active {
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            match result_rx.recv().await {
-                Some((_, session_id, request_id, result, executor)) => {
+            match tokio::time::timeout(DETACHED_TURN_WAIT, result_rx.recv()).await {
+                Ok(Some((_, session_id, request_id, result, executor))) => {
                     let mut runtime = shared.lock().await;
                     runtime.complete_turn(session_id, request_id, result, executor);
                 }
-                None => {
+                Ok(None) => {
+                    let mut runtime = shared.lock().await;
+                    runtime.abandon_active_turn();
+                }
+                Err(_elapsed) => {
+                    eprintln!(
+                        "rfb-runtime: detached turn wait timed out after {:?}; \
+                         the worker appears stuck (no result delivered) — \
+                         abandoning the active turn",
+                        DETACHED_TURN_WAIT
+                    );
                     let mut runtime = shared.lock().await;
                     runtime.abandon_active_turn();
                 }

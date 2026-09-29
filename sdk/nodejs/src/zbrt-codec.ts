@@ -131,6 +131,23 @@ export interface HelloAck {
   capabilities: string[];
 }
 
+export interface HelloLike {
+  client: string;
+  capabilities: string[];
+}
+
+export function decodeHello(payload: Uint8Array): HelloLike {
+  const r = new Reader(Buffer.from(payload));
+  const client = r.text();
+  const n = r.u8();
+  const capabilities: string[] = [];
+  for (let i = 0; i < n; i++) {
+    capabilities.push(r.text());
+  }
+  checkTrailing(r);
+  return { client, capabilities };
+}
+
 export function decodeHelloAck(payload: Uint8Array): HelloAck {
   const r = new Reader(Buffer.from(payload));
   const server = r.text();
@@ -161,16 +178,17 @@ export function encodeExecute(
   if (argv.length > MAX_ARGV) {
     throw new DecodeError('too many arguments');
   }
-  if (timeoutMs < 0 || timeoutMs > MAX_U32) {
-    throw new DecodeError('timeout_ms out of u32 range');
-  }
+  // The facade computes whole-second deadlines (ceil×1000); out-of-range
+  // values clamp to u32::MAX like the Rust/C#/Python baselines instead of
+  // failing the encode.
+  const clamped = Math.min(Math.max(0, Math.floor(timeoutMs)), MAX_U32);
   const chunks: Buffer[] = [Buffer.from([argv.length])];
   for (const arg of argv) {
     putText(chunks, arg);
   }
   putFlagText(chunks, cwd ?? null);
   putPrefixed(chunks, stdin);
-  putU32(chunks, timeoutMs);
+  putU32(chunks, clamped);
   return concat(chunks);
 }
 
@@ -243,9 +261,21 @@ export interface Cancel {
   target: Buffer | null;
 }
 
-export function encodeCancel(reason: string | null | undefined, target16: Uint8Array | null): Buffer {
+export function encodeCancel(
+  reason: string | null | undefined,
+  target16: Uint8Array | null,
+  includeTargetField = true,
+): Buffer {
   const chunks: Buffer[] = [];
   putFlagText(chunks, reason);
+  if (!includeTargetField) {
+    // Legacy V1 form: the payload ends right after the reason (no target
+    // byte) — used to reproduce the cancel_legacy golden vector verbatim.
+    if (target16 !== null && target16 !== undefined) {
+      throw new DecodeError('legacy cancel cannot carry a target');
+    }
+    return concat(chunks);
+  }
   if (target16 !== null && target16 !== undefined) {
     if (target16.length !== 16) {
       throw new DecodeError('cancel target must be 16 bytes');

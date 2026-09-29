@@ -27,25 +27,36 @@ public final class GuestNdjsonStream {
     private volatile boolean terminal = false;
     private volatile boolean closed = false;
 
-    GuestNdjsonStream(Socket socket) throws IOException {
+    GuestNdjsonStream(Socket socket, InputStream in, OutputStream out) {
         this.socket = socket;
-        this.in = new BufferedInputStream(socket.getInputStream());
-        this.out = socket.getOutputStream();
+        this.in = in;
+        this.out = out;
     }
 
     public static GuestNdjsonStream open(InetSocketAddress address, Duration timeout,
                                          JsonNode action) {
         Socket socket = GuestNdjson.connect(address, timeout);
+        boolean handedOff = false;
         try {
-            GuestNdjson.writeLine(socket.getOutputStream(), action);
-            return new GuestNdjsonStream(socket);
+            // One reader for the whole session: the auth reply and any bytes
+            // read ahead must not be lost between two input streams.
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            GuestNdjson.authenticate(in, out);
+            GuestNdjson.writeLine(out, action);
+            GuestNdjsonStream stream = new GuestNdjsonStream(socket, in, out);
+            handedOff = true;
+            return stream;
         } catch (IOException e) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-                // best effort
-            }
             throw new io.rfb.sdk.TransportError("guest stream handshake failed: " + e.getMessage(), e);
+        } finally {
+            if (!handedOff) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
         }
     }
 

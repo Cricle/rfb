@@ -11,6 +11,11 @@ case "${1:-}" in
   *) printf 'usage: %s [--check|--dry-run]\n' "$0" >&2; exit 2 ;;
 esac
 
+# 开头先跑边界门：token 扫描 + 依赖方向断言（rfb-sdk 不依赖 rfb-rig/rfb-ben、
+# rfb-runtime 不依赖 rfb-sdk/rfb-rig、rfb-rig 依赖 rfb-sdk）。发布出去的
+# 依赖图一旦倒置，crates.io 上无法撤回，必须在打包前拦下。
+bash scripts/check-boundary.sh
+
 version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == "rfb-sdk"))')
 # Every published crate must share the tag's version: publish_crate() skips
 # versions already on crates.io, so a partial bump would silently publish a
@@ -32,10 +37,12 @@ if [[ -n "$tag" && "$tag" != "v$version" ]]; then
   exit 1
 fi
 
+# fmt 不涉及依赖解析（无 --locked 可言）；clippy/test/doc 全部 --locked：
+# 发布机与 Cargo.lock 必须逐字节一致，防止本地/远端依赖漂移污染发布产物。
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features --no-fail-fast
-RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --lib --no-deps
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked --no-fail-fast
+RUSTDOCFLAGS='-D missing_docs -D warnings' cargo doc --workspace --all-features --locked --lib --no-deps
 
 # Dry-run verification only: package each crate and simulate publishing. The
 # rfb-sdk/rfb-rig dry-runs fail while rfb-runtime@0.0.1 is unpublished (known

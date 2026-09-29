@@ -11,6 +11,7 @@ import json
 import socketserver
 import struct
 import threading
+import time
 import urllib.parse
 
 ZBRT_MAGIC = b"ZBRT"
@@ -253,6 +254,91 @@ class FakeControllerServer:
         return Handler
 
 
+class FlakyKeepAliveController:
+    """Minimal HTTP/1.1 controller fake that closes every TCP connection right
+    after answering exactly one request — so the SDK's pooled keep-alive
+    socket is always stale by the time the next request reuses it.
+
+    Counts accepted connections and seen requests so tests can pin the
+    stale-connection retry contract (retry once for idempotent methods,
+    never for POST).
+    """
+
+    def __init__(self):
+        self.requests = []
+        self.connections = 0
+        self._server = _ThreadedTcpServer(("127.0.0.1", 0), self._make_handler())
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+
+    @property
+    def port(self):
+        return self._server.server_address[1]
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+    @staticmethod
+    def _payload(method, path):
+        if method == "POST" and path == "/v1/sandboxes":
+            return json.dumps(
+                [{"id": "sb-1", "snapshot_tag": "base", "guest_addr": "127.0.0.1:9000"}]
+            ).encode("utf-8")
+        if method == "DELETE":
+            return json.dumps({"ok": True}).encode("utf-8")
+        return json.dumps([]).encode("utf-8")
+
+    def _make_handler(self):
+        outer = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                outer.connections += 1
+                rfile = self.request.makefile("rb")
+                wfile = self.request.makefile("wb")
+                request_line = rfile.readline(65536)
+                if not request_line:
+                    return
+                try:
+                    method, path, _version = request_line.decode("latin-1").split(" ", 2)
+                except ValueError:
+                    return
+                length = 0
+                while True:
+                    header_line = rfile.readline(65536)
+                    if not header_line or header_line in (b"\r\n", b"\n"):
+                        break
+                    name, _, header_value = header_line.decode("latin-1").partition(":")
+                    if name.strip().lower() == "content-length":
+                        length = int(header_value.strip())
+                body = rfile.read(length) if length else b""
+                outer.requests.append((method, path, body))
+                # Respond WITHOUT Connection: close, then close the socket
+                # anyway: the client pools the connection, the next request on
+                # it hits a peer-closed (stale) socket.
+                payload = outer._payload(method, path)
+                head = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    "\r\n"
+                ).encode("latin-1")
+                wfile.write(head + payload)
+                wfile.flush()
+
+        return Handler
+
+
 # ---------------------------------------------------------------------------
 # forkd guest NDJSON fake
 # ---------------------------------------------------------------------------
@@ -299,6 +385,9 @@ class FakeNdjsonGuestServer:
         self.ping_response = {"pong": True}  # scriptable ping terminal line
         self.exec_null_exit_code = False  # send "exit_code": null on the exec terminal line
         self.legacy_event_keys = False  # emit legacy out/err keys (older agent)
+        self.agent_token = None  # expected agent token; None accepts any auth line
+        self.auth_reply = None  # override raw auth reply object
+        self.exec_delay_s = 0.0  # delay before answering exec (read-budget tests)
         self.received = []
         self.stream_inputs = []
         self.stop_requested = False
@@ -335,90 +424,107 @@ class FakeNdjsonGuestServer:
                     wfile.write(json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n")
                     wfile.flush()
 
-                line = rfile.readline(1024 * 1024 + 1)
-                if not line:
-                    return
-                value = json.loads(line.decode("utf-8"))
-                outer.received.append(value)
-                action = value.get("action")
-                if outer.fail_next is not None:
-                    message = outer.fail_next
-                    outer.fail_next = None
-                    send({"error": message})
-                    return
-                if outer.error_response is not None:
-                    send({"error": outer.error_response})
-                    return
-                if outer.oversize_response:
-                    wfile.write(b"x" * (1024 * 1024 + 16) + b"\n")
-                    wfile.flush()
-                    return
-                if action == "ping":
-                    send(outer.ping_response)
-                elif action == "exec":
-                    # First a non-terminal progress line, then the terminal
-                    # line carrying exit_code/stdout/stderr (the guest puts
-                    # the exec result fields on the terminal line).
-                    send({"progress": "starting"})
-                    stdout_key = "out" if outer.legacy_event_keys else "stdout"
-                    stderr_key = "err" if outer.legacy_event_keys else "stderr"
-                    if outer.exec_null_exit_code:
+                while True:
+                    line = rfile.readline(1024 * 1024 + 1)
+                    if not line:
+                        return
+                    value = json.loads(line.decode("utf-8"))
+                    outer.received.append(value)
+                    action = value.get("action")
+                    if action == "auth":
+                        # Agent-auth handshake: accept the configured token
+                        # (or any token when none is configured) and keep the
+                        # connection open for the real request line.
+                        if outer.auth_reply is not None:
+                            send(outer.auth_reply)
+                            return
+                        if outer.agent_token is None or value.get("token") == outer.agent_token:
+                            send({"action": "auth", "ok": True})
+                            continue
+                        send({"action": "auth", "ok": False, "error": "invalid token"})
+                        return
+                    if outer.fail_next is not None:
+                        message = outer.fail_next
+                        outer.fail_next = None
+                        send({"error": message})
+                        return
+                    if outer.error_response is not None:
+                        send({"error": outer.error_response})
+                        return
+                    if outer.oversize_response:
+                        wfile.write(b"x" * (1024 * 1024 + 16) + b"\n")
+                        wfile.flush()
+                        return
+                    if action == "ping":
+                        send(outer.ping_response)
+                    elif action == "exec":
+                        if outer.exec_delay_s:
+                            time.sleep(outer.exec_delay_s)
+                        # First a non-terminal progress line, then the terminal
+                        # line carrying exit_code/stdout/stderr (the guest puts
+                        # the exec result fields on the terminal line).
+                        send({"progress": "starting"})
+                        stdout_key = "out" if outer.legacy_event_keys else "stdout"
+                        stderr_key = "err" if outer.legacy_event_keys else "stderr"
+                        if outer.exec_null_exit_code:
+                            send(
+                                {
+                                    "exit_code": None,
+                                    "timed_out": outer.exec_timed_out,
+                                    stdout_key: list(outer.exec_stdout),
+                                    stderr_key: list(outer.exec_stderr),
+                                }
+                            )
+                        else:
+                            send(
+                                {
+                                    "exit_code": outer.exec_exit,
+                                    "timed_out": outer.exec_timed_out,
+                                    stdout_key: list(outer.exec_stdout),
+                                    stderr_key: list(outer.exec_stderr),
+                                }
+                            )
+                    elif action == "eval":
                         send(
                             {
-                                "exit_code": None,
-                                "timed_out": outer.exec_timed_out,
-                                stdout_key: list(outer.exec_stdout),
-                                stderr_key: list(outer.exec_stderr),
+                                "out" if outer.legacy_event_keys else "output": list(outer.eval_output),
+                                "status": outer.eval_status,
+                                "timed_out": False,
                             }
                         )
-                    else:
-                        send(
-                            {
-                                "exit_code": outer.exec_exit,
-                                "timed_out": outer.exec_timed_out,
-                                stdout_key: list(outer.exec_stdout),
-                                stderr_key: list(outer.exec_stderr),
-                            }
-                        )
-                elif action == "eval":
-                    send(
-                        {
-                            "out" if outer.legacy_event_keys else "output": list(outer.eval_output),
-                            "status": outer.eval_status,
-                            "timed_out": False,
+                    elif action == "ls":
+                        send({"entries": outer.ls_entries, "truncated": False})
+                    elif action == "find":
+                        send({"matches": outer.find_matches, "truncated": False})
+                    elif action == "grep":
+                        send({"matches": outer.grep_matches, "truncated": False})
+                    elif action == "read":
+                        result = {
+                            "data": list(outer.read_data),
+                            "truncated": outer.read_truncated,
                         }
-                    )
-                elif action == "ls":
-                    send({"entries": outer.ls_entries, "truncated": False})
-                elif action == "find":
-                    send({"matches": outer.find_matches, "truncated": False})
-                elif action == "grep":
-                    send({"matches": outer.grep_matches, "truncated": False})
-                elif action == "read":
-                    result = {
-                        "data": list(outer.read_data),
-                        "truncated": outer.read_truncated,
-                    }
-                    if outer.read_total is not None:
-                        result["total_bytes"] = outer.read_total
-                    send(result)
-                elif action == "write":
-                    send({"bytes_written": len(value.get("data", []))})
-                elif action == "stream":
-                    send({"event": "started"})
-                    while True:
-                        session_line = rfile.readline(1024 * 1024 + 1)
-                        if not session_line:
-                            break
-                        session_value = json.loads(session_line.decode("utf-8"))
-                        outer.stream_inputs.append(session_value)
-                        if "in" in session_value:
-                            key = "out" if outer.legacy_event_keys else "stdout"
-                            send({key: list(session_value["in"].encode("utf-8"))})
-                        elif session_value.get("action") == "stop":
-                            outer.stop_requested = True
-                            send({"exit_code": 130})
-                            break
+                        if outer.read_total is not None:
+                            result["total_bytes"] = outer.read_total
+                        send(result)
+                    elif action == "write":
+                        send({"bytes_written": len(value.get("data", []))})
+                    elif action == "stream":
+                        send({"event": "started"})
+                        while True:
+                            session_line = rfile.readline(1024 * 1024 + 1)
+                            if not session_line:
+                                return
+                            session_value = json.loads(session_line.decode("utf-8"))
+                            outer.stream_inputs.append(session_value)
+                            if "in" in session_value:
+                                key = "out" if outer.legacy_event_keys else "stdout"
+                                send({key: list(session_value["in"].encode("utf-8"))})
+                            elif session_value.get("action") == "stop":
+                                outer.stop_requested = True
+                                send({"exit_code": 130})
+                                return
+                    else:
+                        return
 
         return Handler
 
@@ -428,6 +534,24 @@ class FakeNdjsonGuestServer:
 # ---------------------------------------------------------------------------
 
 
+def parse_hello(payload):
+    """client name and capability list from a Hello/HelloAck payload."""
+    pos = 0
+    (n,) = struct.unpack_from(">I", payload, pos)
+    pos += 4
+    client = payload[pos : pos + n].decode("utf-8")
+    pos += n
+    cap_count = payload[pos]
+    pos += 1
+    caps = []
+    for _ in range(cap_count):
+        (n,) = struct.unpack_from(">I", payload, pos)
+        pos += 4
+        caps.append(payload[pos : pos + n].decode("utf-8"))
+        pos += n
+    return client, caps
+
+
 class FakeZbrtServer:
     """Minimal ZBRT v1 frame server.
 
@@ -435,6 +559,10 @@ class FakeZbrtServer:
     stdout then exits 0; any other argv (the eval mapping) streams
     b"eval out\\n" then exits 0. A stderr line is emitted when
     ``exec_stderr`` is set for echo-style commands.
+
+    Every connection is answered Hello-first: ``received_first_frame_kinds``
+    records the first frame kind of each connection (tests pin it to Hello),
+    and ``received_hellos`` records parsed Hello payloads.
     """
 
     def __init__(self, *, exec_stderr=b""):
@@ -444,10 +572,15 @@ class FakeZbrtServer:
         self.fail_next = None  # str -> Error frame for the next request, then clear
         self.hold_execute_open = False  # hold non-echo Execute until Cancel
         self.mismatch_reply_id = False  # reply with a corrupted request_id
+        self.reject_hello = None  # None | "close" | "error" | "wrong_kind" | "malformed_error"
+        self.exec_oversize_chunks = None  # list[int]: Output sizes for Execute
+        self.exit_before_cancel_ack = False  # Exit precedes CancelAck on cancel
         self.connections = 0
         self.received_fs_ops = []
         self.received_cancels = []
         self.received_executes = []
+        self.received_hellos = []
+        self.received_first_frame_kinds = []
         self._held_request_id = None
         self._server = _ThreadedTcpServer(("127.0.0.1", 0), self._make_handler())
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -500,11 +633,41 @@ class FakeZbrtServer:
             def _serve(self):
                 rfile = self.request.makefile("rb")
                 wfile = self.request.makefile("wb")
+                first_frame = True
                 while True:
                     frame = read_frame(rfile)
                     if frame is None:
                         return
                     kind, request_id, payload = frame
+                    if first_frame:
+                        first_frame = False
+                        outer.received_first_frame_kinds.append(kind)
+                    if kind == 1:  # Hello: handshake is always answered with an
+                        # echoing HelloAck (even under mismatch_reply_id) so
+                        # later requests exercise the reply-id check.
+                        if outer.reject_hello == "close":
+                            return
+                        if outer.reject_hello == "error":
+                            message = b"hello rejected"
+                            error_payload = (
+                                struct.pack(">I", 1)
+                                + struct.pack(">I", len(message))
+                                + message
+                            )
+                            write_frame(wfile, KIND_ERROR, request_id, error_payload)
+                            return
+                        if outer.reject_hello == "wrong_kind":
+                            write_frame(wfile, KIND_HEALTH_ACK, request_id, b"")
+                            return
+                        if outer.reject_hello == "malformed_error":
+                            # Truncated Error payload: a codec fault inside a
+                            # rejected handshake must still surface as a
+                            # Transport-class failure, never a raw DecodeError.
+                            write_frame(wfile, KIND_ERROR, request_id, b"\x00\x00")
+                            return
+                        outer.received_hellos.append(parse_hello(payload))
+                        write_frame(wfile, KIND_HELLO_ACK, request_id, payload)
+                        continue
                     if outer.mismatch_reply_id:
                         request_id = bytes(byte ^ 0xFF for byte in request_id)
                     if outer.fail_next is not None:
@@ -515,9 +678,7 @@ class FakeZbrtServer:
                         )
                         write_frame(wfile, KIND_ERROR, request_id, error_payload)
                         continue
-                    if kind == 1:  # Hello
-                        write_frame(wfile, KIND_HELLO_ACK, request_id, payload)
-                    elif kind == KIND_EXECUTE:
+                    if kind == KIND_EXECUTE:
                         argv, cwd, stdin, timeout_ms = parse_execute(payload)
                         outer.received_executes.append((argv, cwd, stdin, timeout_ms))
                         if outer.fail_execute_message is not None:
@@ -525,6 +686,16 @@ class FakeZbrtServer:
                                 ">I", len(outer.fail_execute_message)
                             ) + outer.fail_execute_message.encode("utf-8")
                             write_frame(wfile, KIND_ERROR, request_id, error_payload)
+                            continue
+                        if outer.exec_oversize_chunks is not None:
+                            for size in outer.exec_oversize_chunks:
+                                write_frame(
+                                    wfile,
+                                    KIND_OUTPUT,
+                                    request_id,
+                                    bytes([0]) + struct.pack(">I", size) + b"\x00" * size,
+                                )
+                            write_frame(wfile, KIND_EXIT, request_id, struct.pack(">i", 0) + b"\x00")
                             continue
                         if outer.hold_execute_open and not (argv and argv[0] == "echo"):
                             # Simulate a long-running stream: hold the turn
@@ -540,11 +711,20 @@ class FakeZbrtServer:
                         write_frame(wfile, KIND_EXIT, request_id, exit_payload)
                     elif kind == 6:  # Cancel
                         outer.received_cancels.append(payload)
-                        write_frame(wfile, KIND_CANCEL_ACK, request_id, b"")
+                        held_exit = struct.pack(">i", -1) + b"\x00"
                         if outer._held_request_id is not None:
-                            exit_payload = struct.pack(">i", -1) + b"\x00"
-                            write_frame(wfile, KIND_EXIT, outer._held_request_id, exit_payload)
+                            if outer.exit_before_cancel_ack:
+                                # Exit arrives before the CancelAck: the drain
+                                # must stop immediately and cache the Exit.
+                                write_frame(wfile, KIND_EXIT, outer._held_request_id, held_exit)
+                                outer._held_request_id = None
+                                write_frame(wfile, KIND_CANCEL_ACK, request_id, b"")
+                                continue
+                            write_frame(wfile, KIND_CANCEL_ACK, request_id, b"")
+                            write_frame(wfile, KIND_EXIT, outer._held_request_id, held_exit)
                             outer._held_request_id = None
+                        else:
+                            write_frame(wfile, KIND_CANCEL_ACK, request_id, b"")
                     elif kind == 8:  # Fs
                         op = payload[0]
                         (path_len,) = struct.unpack_from(">I", payload, 1)

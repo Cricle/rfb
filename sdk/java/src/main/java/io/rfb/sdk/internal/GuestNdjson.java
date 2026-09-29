@@ -22,7 +22,51 @@ import java.util.List;
  * line. INTERNAL — the public surface is {@code io.rfb.sdk.Sandbox}.
  */
 public final class GuestNdjson {
+    /**
+     * Agent-token environment variable (cross-language contract §8): when set
+     * to a non-blank value, every guest NDJSON connection must authenticate
+     * before any request line is sent. Unset/blank = unchanged wire behavior.
+     */
+    public static final String AGENT_TOKEN_ENV = "FORKD_AGENT_TOKEN";
+
+    /**
+     * Test seam only: the JVM cannot mutate its own environment, so tests
+     * inject the token here. Non-null wins over the environment; production
+     * behavior reads {@link #AGENT_TOKEN_ENV} exclusively.
+     */
+    public static volatile String agentTokenOverride;
+
     private GuestNdjson() {
+    }
+
+    /** Configured agent token, or null when auth is disabled (blank = unset). */
+    static String agentToken() {
+        String token = agentTokenOverride != null
+                ? agentTokenOverride : System.getenv(AGENT_TOKEN_ENV);
+        return token == null || token.trim().isEmpty() ? null : token;
+    }
+
+    /**
+     * Agent-token handshake on a fresh guest connection: with a token
+     * configured the FIRST line is {@code {"action":"auth","token":…}} and the
+     * agent must answer {@code {"action":"auth","ok":true}}; any other reply
+     * (including an {@code error} line) is a Remote-class failure. Without a
+     * token nothing is written (mirrors Python {@code _guest.py}).
+     */
+    public static void authenticate(InputStream in, OutputStream out) {
+        String token = agentToken();
+        if (token == null) {
+            return;
+        }
+        writeLine(out, Json.object().put("action", "auth").put("token", token));
+        JsonNode value = readLine(in);
+        if (value == null) {
+            throw new RemoteError("guest closed before response");
+        }
+        checkRemoteError(value);
+        if (!("auth".equals(value.path("action").asText()) && value.path("ok").asBoolean(false))) {
+            throw new RemoteError("guest agent auth failed");
+        }
     }
 
     public static InetSocketAddress parseAddress(String address) {
@@ -84,6 +128,7 @@ public final class GuestNdjson {
         try (Socket socket = connect(address, timeout)) {
             OutputStream out = socket.getOutputStream();
             InputStream in = new BufferedInputStream(socket.getInputStream());
+            authenticate(in, out);
             writeLine(out, action);
             List<JsonNode> responses = new ArrayList<>();
             while (true) {

@@ -450,10 +450,17 @@ fn workspace_executor_protocol_covers_start_terminal_and_filesystem() {
     let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
     ready(&mut service);
 
+    // printf is a POSIX tool; Windows has no printf.exe on PATH, so use the
+    // shell there. Both produce stdout output the terminal event must carry.
+    #[cfg(windows)]
+    let (exec_args, expected_data) = (r#"["cmd","/c","echo","hello"]"#, "hello\r\n");
+    #[cfg(not(windows))]
+    let (exec_args, expected_data) = (r#"["printf","hello"]"#, "hello");
+
     let responses = service.handle(ControlMessage::StartTurn(SessionRequest {
         session_id: "session".into(),
         request_id: "turn".into(),
-        prompt: r#"{"op":"exec","args":["printf","hello"],"cwd":"."}"#.into(),
+        prompt: format!(r#"{{"op":"exec","args":{exec_args},"cwd":"."}}"#),
     }));
     assert!(
         matches!(responses.first(), Some(RuntimeMessage::Event(event)) if event.kind == "turn.started")
@@ -471,7 +478,7 @@ fn workspace_executor_protocol_covers_start_terminal_and_filesystem() {
         terminal.stream,
         rfb_runtime::session::TerminalStream::Stdout
     );
-    assert_eq!(terminal.data, "hello");
+    assert_eq!(terminal.data, expected_data);
     assert!(
         matches!(responses.last(), Some(RuntimeMessage::Event(event)) if event.kind == "turn.completed")
     );
@@ -745,27 +752,27 @@ fn workspace_executor_filesystem_rpc_writes_reads_and_projects() {
 #[test]
 fn workspace_executor_filesystem_rpc_enforces_size_limits() {
     let root = temp_workspace();
-    let limits = RuntimeLimits {
-        max_event_bytes: 8,
-        ..Default::default()
-    };
+    let limits = RuntimeLimits::default();
     let mut executor = WorkspaceGuestExecutor::new(&root, limits).unwrap();
 
+    // The wire contract caps one file write at 51200 bytes (PROTOCOL.md);
+    // exceeding it is refused regardless of max_event_bytes (large payloads
+    // are the caller's job to shard).
     let error = executor
         .write_workspace_file(&FileWriteRequest {
             request_id: "w".into(),
             path: "big.txt".into(),
-            content: b"123456789".to_vec(),
+            content: vec![b'a'; 50 * 1024 + 1],
         })
         .unwrap_err();
-    assert!(error.contains("max_event_bytes"));
+    assert!(error.contains("file rpc limit"));
 
-    // max_bytes outside [1, max_event_bytes] is rejected by policy.
+    // max_bytes outside [1, 51200] is rejected by policy.
     assert!(executor
         .read_workspace_file(&FileReadRequest {
             request_id: "r".into(),
             path: "x.txt".into(),
-            max_bytes: 9,
+            max_bytes: 50 * 1024 + 1,
         })
         .is_err());
     assert!(executor
@@ -775,6 +782,45 @@ fn workspace_executor_filesystem_rpc_enforces_size_limits() {
             max_bytes: 0,
         })
         .is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn filesystem_rpc_requires_handshake_before_any_workspace_work() {
+    let root = temp_workspace();
+    fs::create_dir_all(root.join("probe")).unwrap();
+    let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
+
+    // Defense in depth: even if a transport skipped its own pre-handshake
+    // guard, the runtime refuses filesystem work before protocol readiness.
+    let error = service
+        .filesystem_rpc(1, ".", br#"{"max_results": 10}"#)
+        .unwrap_err();
+    assert!(
+        error.contains("protocol handshake required"),
+        "pre-handshake filesystem rpc must fail closed, got: {error}"
+    );
+
+    assert!(matches!(
+        service
+            .handle(ControlMessage::Hello {
+                protocol_version: 1
+            })
+            .as_slice(),
+        [RuntimeMessage::HelloAck { .. }]
+    ));
+    let payload = service
+        .filesystem_rpc(1, ".", br#"{"max_results": 10}"#)
+        .expect("filesystem rpc after handshake");
+    let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert!(
+        value["entries"]
+            .as_array()
+            .map(|entries| entries.iter().any(|entry| entry["name"] == "probe"))
+            .unwrap_or(false),
+        "post-handshake ls must list the seeded directory: {value}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

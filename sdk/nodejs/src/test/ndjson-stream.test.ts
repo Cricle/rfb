@@ -19,6 +19,8 @@ describe('NdjsonGuestStream (fake NDJSON guest)', () => {
     server?.close();
     server = null;
     connectionCount = 0;
+    connectionCount = 0;
+    delete process.env.FORKD_AGENT_TOKEN;
   });
 
   function sandboxOn(port: number): Sandbox {
@@ -31,6 +33,7 @@ describe('NdjsonGuestStream (fake NDJSON guest)', () => {
     server = net.createServer((socket) => {
       connectionCount += 1;
       sockets.push(socket);
+      socket.on('error', () => {});
       socket.setNoDelay(true);
       let buffer = '';
       let index = 0;
@@ -189,5 +192,63 @@ describe('NdjsonGuestStream (fake NDJSON guest)', () => {
       pty: true,
       env: { K: 'V' },
     });
+  });
+
+  it('authenticates the stream connection when FORKD_AGENT_TOKEN is set', async () => {
+    process.env.FORKD_AGENT_TOKEN = 'stream-token';
+    const requests: string[] = [];
+    const port = await startGuest((line, socket, index) => {
+      requests.push(line);
+      if (index === 0) {
+        assert.deepEqual(JSON.parse(line), { action: 'auth', token: 'stream-token' });
+        socket.write('{"action":"auth","ok":true}\n');
+      } else if (index === 1) {
+        // The stream action goes out only after the auth ack.
+        assert.equal(JSON.parse(line).action, 'stream');
+        socket.write('{"started":true}\n');
+        socket.write('{"stdout":"hi"}\n');
+        socket.write('{"exit_code":0}\n');
+      }
+    });
+    const stream = await sandboxOn(port).stream(['cat']);
+    assert.equal((await stream.nextEvent())?.kind, 'started');
+    const stdout = await stream.nextEvent();
+    assert.equal(stdout?.data.toString('utf8'), 'hi');
+    assert.equal((await stream.nextEvent())?.kind, 'exit');
+    assert.equal(requests.length, 2);
+    assert.deepEqual(JSON.parse(requests[1] as string), { action: 'stream', args: ['cat'] });
+  });
+
+  it('queues early input behind the auth handshake', async () => {
+    process.env.FORKD_AGENT_TOKEN = 'stream-token';
+    const requests: string[] = [];
+    const port = await startGuest((line, socket, index) => {
+      requests.push(line);
+      if (index === 0) socket.write('{"action":"auth","ok":true}\n');
+      if (line.includes('"in"')) socket.write('{"stdout":"echo:x"}\n');
+    });
+    const stream = await sandboxOn(port).stream(['cat']);
+    await stream.sendInput('x'); // before any nextEvent: must not precede auth
+    const echoed = await stream.nextEvent();
+    assert.equal(echoed?.kind, 'stdout');
+    assert.equal(echoed?.data.toString('utf8'), 'echo:x');
+    assert.deepEqual(requests.map((line) => JSON.parse(line)), [
+      { action: 'auth', token: 'stream-token' },
+      { action: 'stream', args: ['cat'] },
+      { in: 'x' },
+    ]);
+  });
+
+  it('surfaces a refused agent auth as RemoteError', async () => {
+    process.env.FORKD_AGENT_TOKEN = 'bad-token';
+    const port = await startGuest((_line, socket, index) => {
+      if (index === 0) socket.write('{"action":"auth","ok":false}\n');
+    });
+    const stream = await sandboxOn(port).stream(['cat']);
+    await assert.rejects(
+      () => stream.nextEvent(),
+      (error: Error) =>
+        error.constructor.name === 'RemoteError' && error.message.includes('auth failed'),
+    );
   });
 });

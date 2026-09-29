@@ -273,6 +273,21 @@ class FacadeNdjsonTests(FacadeMixin, unittest.TestCase):
         self.guest.ping_response = {"healthy": True}
         self.assertFalse(sandbox.ping())
 
+    def test_ping_additive_keys_pass_through(self):
+        # Additive agent ping keys (e.g. protocol_version) are never validated:
+        # the SDK reads only `pong` and ignores the rest (no version gate).
+        sandbox = self._sandbox()
+        self.guest.ping_response = {
+            "pong": True,
+            "protocol_version": 1,
+            "numpy_version": "not-installed",
+            "pid": 4242,
+            "agent_lang": "rust",
+            "warmup_ready": False,
+            "path": "/usr/bin",
+        }
+        self.assertTrue(sandbox.ping())
+
     def test_exec_null_exit_code_defaults_to_minus_one(self):
         # Rust baseline (ndjson::exec_result): a null / non-integer exit_code
         # on the terminal line falls back to -1 instead of raising.
@@ -346,6 +361,9 @@ class FacadeZbrtTests(FacadeMixin, unittest.TestCase):
     def test_stream_output_then_exit(self):
         sandbox = self._sandbox()
         stream = sandbox.stream(["echo"])
+        # The first event is the synthesized started marker (ZBRT has no
+        # started frame; mirrors the Rust client).
+        self.assertEqual(stream.next_event().kind, StreamEventKind.STARTED)
         stdout = stream.next_event()
         self.assertEqual(stdout.kind, StreamEventKind.STDOUT)
         self.assertEqual(stdout.data, b"hello\n")
@@ -359,6 +377,7 @@ class FacadeZbrtTests(FacadeMixin, unittest.TestCase):
         self.guest.hold_execute_open = True
         sandbox = self._sandbox()
         stream = sandbox.stream(["tail", "-f"])
+        self.assertEqual(stream.next_event().kind, StreamEventKind.STARTED)
         stream.stop()  # Cancel -> CancelAck
         exit_event = stream.next_event()
         self.assertEqual(exit_event.kind, StreamEventKind.EXIT)

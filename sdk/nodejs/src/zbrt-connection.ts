@@ -1,9 +1,9 @@
 /**
  * One ZBRT v1 session over a TCP socket (PROTOCOL.md §3.4, mirroring
  * `zeroboot_connection.rs` / the Java ZbrtConnection): fresh 128-bit request
- * id per request, Output frames strictly before exactly one terminal frame,
- * idempotent Cancel with empty-payload CancelAck, Error frames raise
- * RemoteError. INTERNAL.
+ * id per request, mandatory Hello handshake on connect, Output frames strictly
+ * before exactly one terminal frame, idempotent Cancel with empty-payload
+ * CancelAck, Error frames raise RemoteError. INTERNAL.
  */
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
@@ -35,27 +35,49 @@ export const V1_CAPABILITIES: readonly string[] = Object.freeze([
   'filesystem',
 ]);
 
+/** Client name announced in the mandatory Hello handshake. */
+export const ZBRT_CLIENT_NAME = 'rfb-sdk-node';
+
+/** Per-turn aggregate Output cap: one Execute turn may stream at most 16 MiB
+ * of combined stdout+stderr before the SDK fails it with a Remote error. */
+export const MAX_TURN_OUTPUT_BYTES = 16 * 1024 * 1024;
+
 function connectSocket(host: string, port: number, timeoutMs: number): Promise<net.Socket> {
   return new Promise<net.Socket>((resolve, reject) => {
     const socket = net.createConnection({ host, port });
+    let settled = false;
+    const fail = (error: TransportError): void => {
+      // destroy(error) surfaces through the frame reader as a TransportError;
+      // reject() only matters while the connect handshake is still pending.
+      socket.destroy(error);
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    };
     const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new TransportError('guest connection timed out'));
+      fail(new TransportError('guest connection timed out'));
     }, timeoutMs);
     socket.once('connect', () => {
       clearTimeout(timer);
       socket.setNoDelay(true);
-      socket.setTimeout(0);
+      // Read-stall budget (PROTOCOL.md §3.4: 读停顿 → Transport): an idle gap
+      // longer than the client timeout must fail the session, never hang it.
+      socket.setTimeout(timeoutMs);
+      settled = true;
       resolve(socket);
     });
     socket.once('error', (error: Error) => {
       clearTimeout(timer);
-      reject(new TransportError(`guest connect failed: ${error.message}`));
+      if (!settled) {
+        settled = true;
+        socket.destroy();
+        reject(new TransportError(`guest connect failed: ${error.message}`));
+      }
     });
     socket.once('timeout', () => {
       clearTimeout(timer);
-      socket.destroy();
-      reject(new TransportError('guest connection timed out'));
+      fail(new TransportError('guest read timed out'));
     });
   });
 }
@@ -66,7 +88,20 @@ interface ZbrtSessionHost {
   requireId(frame: ZbrtFrame, requestId: Buffer): Promise<void>;
   errorFromFrame(frame: ZbrtFrame): RemoteError;
   unexpectedFrame(frame: ZbrtFrame, expected: string): DecodeError;
-  cancelRoundTrip(reason: string | null, target16: Buffer | null): Promise<ZbrtFrame>;
+  cancelRoundTrip(
+    reason: string | null,
+    target16: Buffer | null,
+    onStraggler?: (frame: ZbrtFrame) => void,
+  ): Promise<ZbrtFrame>;
+}
+
+/** One streamed event: Output (stream 0/1) or the terminal Exit (code set).
+ * The synthesized first event of a turn carries `started: true`. */
+export interface ZbrtStreamEvent {
+  stream: number;
+  data: Buffer;
+  code: number | null;
+  started?: true;
 }
 
 /** One active Execute turn: yields Output events, then the terminal Exit. */
@@ -75,6 +110,9 @@ export class ZbrtStreamSession {
   public stopped = false;
   public terminal = false;
   readonly #host: ZbrtSessionHost;
+  #pending: ZbrtStreamEvent[] = [];
+  #announced = false;
+  #outputBytes = 0;
 
   constructor(host: ZbrtSessionHost, requestId: Buffer) {
     this.#host = host;
@@ -82,14 +120,22 @@ export class ZbrtStreamSession {
   }
 
   /** Next event: {stream, data, code} — code != null marks the Exit. */
-  async nextEvent(): Promise<{ stream: number; data: Buffer; code: number | null } | null> {
+  async nextEvent(): Promise<ZbrtStreamEvent | null> {
+    if (!this.#announced) {
+      // Cross-language contract: the first event of every ZBRT turn is a
+      // synthesized started marker (the ZBRT wire has no started frame,
+      // unlike the NDJSON stream in PROTOCOL.md §2.5).
+      this.#announced = true;
+      return { stream: -1, data: Buffer.alloc(0), code: null, started: true };
+    }
+    if (this.#pending.length > 0) return this.#pending.shift() as ZbrtStreamEvent;
     if (this.terminal) return null;
     const frame = await this.#host.nextFrame();
     if (frame === null) return null;
     await this.#host.requireId(frame, this.requestId);
     if (frame.kind === KIND_OUTPUT) {
       const output = codec.decodeOutput(frame.payload);
-      return { stream: output.stream, data: output.data, code: null };
+      return this.#takeOutput(output.stream, output.data);
     }
     if (frame.kind === KIND_EXIT) {
       const exit = codec.decodeExit(frame.payload);
@@ -102,11 +148,33 @@ export class ZbrtStreamSession {
     throw this.#host.unexpectedFrame(frame, 'Output/Exit');
   }
 
+  /** Buffer one Output event and enforce the per-turn aggregate output cap. */
+  #takeOutput(stream: number, data: Buffer): ZbrtStreamEvent {
+    this.#outputBytes += data.length;
+    if (this.#outputBytes > MAX_TURN_OUTPUT_BYTES) {
+      throw new RemoteError(`zbrt turn output exceeded ${MAX_TURN_OUTPUT_BYTES} bytes`);
+    }
+    return { stream, data, code: null };
+  }
+
   /** Idempotent stop: Cancel targeting this request, expecting CancelAck. */
   async stop(): Promise<void> {
     if (this.terminal || this.stopped) return;
     this.stopped = true;
-    const ack = await this.#host.cancelRoundTrip(null, this.requestId);
+    // Frames may still straggle in between Cancel and CancelAck: Output is
+    // buffered for the caller (PROTOCOL.md §3.4) and a first-arriving Exit
+    // marks the turn terminal and is cached — dropping it would leave the
+    // next nextEvent() waiting on a frame that already arrived.
+    const ack = await this.#host.cancelRoundTrip(null, this.requestId, (frame) => {
+      if (frame.kind === KIND_OUTPUT) {
+        const output = codec.decodeOutput(frame.payload);
+        this.#pending.push(this.#takeOutput(output.stream, output.data));
+      } else if (frame.kind === KIND_EXIT) {
+        const exit = codec.decodeExit(frame.payload);
+        this.terminal = true;
+        this.#pending.push({ stream: -1, data: Buffer.alloc(0), code: exit.code });
+      }
+    });
     if (ack.payload.length !== 0) {
       throw new DecodeError('CancelAck payload must be empty');
     }
@@ -122,10 +190,14 @@ export class ZbrtConnection {
     this.#ready = (async () => {
       this.#socket = await connectSocket(host, port, timeoutMs);
       this.#reader = frameReader(this.#socket);
+      // Cross-language contract: every ZBRT connection opens with a mandatory
+      // Hello handshake — the session is unusable until HelloAck validates,
+      // and any handshake failure is a Transport-class error.
+      await this.#handshake();
     })();
   }
 
-  /** Resolves once the TCP connection is up. */
+  /** Resolves once the TCP connection is up and Hello has been acknowledged. */
   async ready(): Promise<this> {
     await this.#ready;
     return this;
@@ -133,6 +205,29 @@ export class ZbrtConnection {
 
   newRequestId(): Buffer {
     return randomBytes(16);
+  }
+
+  /** Mandatory Hello handshake; any failure is Transport-class. */
+  async #handshake(): Promise<void> {
+    try {
+      const id = this.newRequestId();
+      await this.#writeFrame(
+        new ZbrtFrame(KIND_HELLO, 0, id, codec.encodeHello(ZBRT_CLIENT_NAME, V1_CAPABILITIES)),
+      );
+      const frame = await this.#reader?.next();
+      if (frame === null || frame === undefined) {
+        throw new TransportError('connection closed by guest');
+      }
+      if (frame.kind !== KIND_HELLO_ACK) {
+        throw new TransportError(
+          `zbrt hello handshake failed: unexpected frame kind ${frame.kind} while awaiting HelloAck`,
+        );
+      }
+      codec.decodeHelloAck(frame.payload);
+    } catch (error) {
+      if (error instanceof TransportError) throw error;
+      throw new TransportError(`zbrt hello handshake failed: ${(error as Error).message}`);
+    }
   }
 
   async #writeFrame(frame: ZbrtFrame): Promise<void> {
@@ -174,23 +269,33 @@ export class ZbrtConnection {
     throw this.unexpectedFrame(frame, expected);
   }
 
-  async #cancelRoundTrip(reason: string | null, target16: Buffer | null): Promise<ZbrtFrame> {
+  async #cancelRoundTrip(
+    reason: string | null,
+    target16: Buffer | null,
+    onStraggler?: (frame: ZbrtFrame) => void,
+  ): Promise<ZbrtFrame> {
     const id = this.newRequestId();
     await this.#writeFrame(new ZbrtFrame(KIND_CANCEL, 0, id, codec.encodeCancel(reason, target16)));
     // The guest may emit straggler Output/Exit frames for the cancelled turn
-    // before the CancelAck; skip them and keep reading until the ack instead
-    // of failing the decode (mirrors the Python reference's wait-for-ack).
+    // before the CancelAck; hand them to the session (the stream stop path
+    // buffers Output and caches a first-arriving Exit) and keep reading until
+    // the ack instead of failing the decode (mirrors the Python reference's
+    // wait-for-ack).
     while (true) {
       const frame = await this.#reader?.next();
       if (!frame) throw new TransportError('connection closed by guest');
       if (frame.kind === KIND_CANCEL_ACK) return frame;
       if (frame.kind === KIND_ERROR) throw this.errorFromFrame(frame);
-      if (frame.kind === KIND_OUTPUT || frame.kind === KIND_EXIT) continue;
+      if (frame.kind === KIND_OUTPUT || frame.kind === KIND_EXIT) {
+        onStraggler?.(frame);
+        continue;
+      }
       throw this.unexpectedFrame(frame, 'CancelAck');
     }
   }
 
-  /** Optional Hello handshake; the guest is auto-ready without it. */
+  /** Explicit Hello round-trip; the constructor already performs the mandatory
+   * handshake — this re-issues Hello for on-demand verification. */
   async hello(clientName: string): Promise<codec.HelloAck> {
     await this.#ready;
     const id = this.newRequestId();
@@ -199,8 +304,12 @@ export class ZbrtConnection {
     );
     const frame = await this.#reader?.next();
     if (frame === null || frame === undefined) throw new TransportError('connection closed by guest');
-    if (frame.kind === KIND_HELLO_ACK) return codec.decodeHelloAck(frame.payload);
-    throw this.unexpectedFrame(frame, 'HelloAck');
+    if (frame.kind !== KIND_HELLO_ACK) {
+      throw new TransportError(
+        `zbrt hello handshake failed: unexpected frame kind ${frame.kind} while awaiting HelloAck`,
+      );
+    }
+    return codec.decodeHelloAck(frame.payload);
   }
 
   /**
@@ -226,12 +335,19 @@ export class ZbrtConnection {
     );
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
+    let outputBytes = 0;
     while (true) {
       const frame = await this.#reader?.next();
       if (frame === null || frame === undefined) throw new TransportError('connection closed by guest');
       await this.requireId(frame, id);
       if (frame.kind === KIND_OUTPUT) {
         const output = codec.decodeOutput(frame.payload);
+        // Per-turn aggregate cap: an unbounded turn would let one runaway
+        // guest exhaust host memory; 16 MiB mirrors the frame payload cap.
+        outputBytes += output.data.length;
+        if (outputBytes > MAX_TURN_OUTPUT_BYTES) {
+          throw new RemoteError(`zbrt turn output exceeded ${MAX_TURN_OUTPUT_BYTES} bytes`);
+        }
         (output.stream === 0 ? stdout : stderr).push(output.data);
       } else if (frame.kind === KIND_EXIT) {
         const exit = codec.decodeExit(frame.payload);
@@ -300,7 +416,8 @@ export class ZbrtConnection {
       requireId: (frame, requestId) => this.requireId(frame, requestId),
       errorFromFrame: (frame) => this.errorFromFrame(frame),
       unexpectedFrame: (frame, expected) => this.unexpectedFrame(frame, expected),
-      cancelRoundTrip: (reason, target) => this.#cancelRoundTrip(reason, target),
+      cancelRoundTrip: (reason, target, onStraggler) =>
+        this.#cancelRoundTrip(reason, target, onStraggler),
     };
     return new ZbrtStreamSession(host, id);
   }

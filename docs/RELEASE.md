@@ -7,12 +7,42 @@
 
 | 工作流 | 触发 | 内容 |
 |---|---|---|
-| `ci.yml` | 全部 PR + 非 main 分支推送（+手动） | Rust 门禁（fmt/clippy/test/doc，`--all-features`，含边界检查）+ SDK 全量验证（debian:12 容器内 Python / C# / Java / Node.js 四套件 build+tests） |
+| `ci.yml` | 全部 PR + **所有分支推送（含 main）**（+手动） | Rust 门禁（fmt/clippy/test/doc，`--all-features`，clippy/test/doc 均带 `--locked`；含边界检查、feature 矩阵）+ SDK 全量验证（debian:12 容器内 Python / C# / Java / Node.js 四套件 build+tests） |
 | `e2e.yml` | push main（+手动） | KVM 真机 E2E：构建 rfb-cli 与 forkd-agent rootfs → 起真实 forkd-controller → 建快照 → 跑全部 `#[ignore]` 真机测试（串行） |
 | `release.yml` | push `v*.*.*` tag | 五渠道发布 + GitHub Release（见下） |
 
 所有 workflow 的失败现场都通过 `::error::`/`::warning::` 注解带出
 （check-runs annotations 公开 API 可读），因为日志下载需要 token。
+
+### 1.1 门禁变化（2026-09 本轮）
+
+- **main 推送同时跑 `ci.yml` 与 `e2e.yml`**（原约定 main 推送只跑 e2e.yml）：
+  Rust 门禁不再只在 PR/非 main 分支上执行。
+- **`--locked` 全覆盖**：ci.yml 的 clippy/test/doc 与 msrv check、release.sh 的
+  clippy/test/doc 门禁都带 `--locked`（fmt 除外），锁定 Cargo.lock 逐字节一致。
+- **feature 矩阵**（ci.yml rust job 新增 step）：`cargo check --locked` 逐条跑
+  rfb-sdk（no-default / +forkd / +zeroboot）与 rfb-runtime（no-default /
+  +guest / +host-vsock / +firecracker / +forkd / +zeroboot）共 9 个 lean
+  组合，防 `--all-features` 覆盖不到的单 feature 漏编译；任一条失败即停。
+- **发布前置版本一致性门**（release.yml crates job 第一步）：tag 必须与
+  六处清单一致——workspace `Cargo.toml`、`sdk/python/pyproject.toml`、
+  `sdk/nodejs/package.json`、`sdk/java/pom.xml`、`Rfb.Sdk.csproj`、
+  `Rfb.Cli.csproj`——外加三个 crate（cargo metadata）；任一不等即 `::error`
+  列出全部不一致文件并 exit 1。契约测试 `rfb/tests/release_contract.rs`
+  （零依赖、手写解析）在普通 `cargo test` 里对同一约束再兜一道底。
+- **artifact 保留期**：`rfb-cli-linux-x64` 的 `retention-days` 1 → 7（便于
+  失败渠道修复重跑与事后取证）。
+- **NuGet push 不再把 API key 放进 argv**：改为生成临时 NuGet.Config（0600，
+  凭据写 `%NUGET_KEY%` 占位由 NuGet 从环境变量展开，密钥不落盘），经
+  `--configfile` 传入，run 结束（含失败路径）删除。
+- **内核 pin**：e2e.yml 下载的 `vmlinux-5.10.225` 下载后即用固化的 sha256
+  校验（`23b3047df7dada3500d06c8012cc030b921da01e213735f7717d2166cfcf5f06`）。
+- **边界脚本增强**：`scripts/check-boundary.sh` 新增依赖方向断言
+  （rfb-sdk ↛ rfb-rig/rfb-ben、rfb-runtime ↛ rfb-sdk/rfb-rig、rfb-rig →
+  rfb-sdk，经 `cargo metadata` 解析、工具不可用时降级为警告）；
+  `scripts/release.sh` 开头先调用它。`scripts/check-tests-folder.sh` 的
+  内联测试正则覆盖 `cfg(all(test,…))`/`cfg(any(test,…))` 等变体，扫描范围
+  纳入 ben/ 的 src。
 
 ## 2. 发布五渠道
 

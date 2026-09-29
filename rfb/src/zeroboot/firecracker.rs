@@ -583,11 +583,38 @@ impl FirecrackerVm {
         };
         let log = open_log()?;
         let log_out = open_log()?;
-        let process = Command::new(firecracker_path)
+        let mut command = Command::new(firecracker_path);
+        command
             .args(["--api-sock", &socket_path])
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
-            .stderr(Stdio::from(log))
+            .stderr(Stdio::from(log));
+        // The VM must not outlive this process: without PDEATHSIG a SIGKILLed
+        // host leaves an orphan Firecracker holding the snapshot dir and its
+        // 100s of MiB of guest memory. prctl is set in the child before exec
+        // (pre_exec runs between fork and exec); the parent-pid check closes
+        // the fork/exec race where the parent already died before prctl ran.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent_pid = std::process::id() as libc::pid_t;
+            // SAFETY: pre_exec runs in the forked child before exec; only
+            // async-signal-safe calls (prctl, getppid, _exit) are made.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent_pid {
+                        // The intended parent is already gone: PDEATHSIG would
+                        // never fire, so exit instead of orphaning the VM.
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let process = command
             .spawn()
             .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;
         let mut process = ChildGuard::new(process);
@@ -612,7 +639,26 @@ impl FirecrackerVm {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // The socket path appearing does not mean the API is accepting
+        // connections yet. Poll a real connect in 1 ms steps for up to 50 ms
+        // instead of sleeping a fixed 50 ms: a ready API starts configuration
+        // immediately, and a stalled one still falls through to the original
+        // behavior (the following api_put reports the failure).
+        let ready_deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            let connected = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle
+                    .block_on(tokio::net::UnixStream::connect(&socket_path))
+                    .is_ok(),
+                // No runtime in this thread (pure synchronous caller): a
+                // plain blocking connect still proves the listener is up.
+                Err(_) => std::os::unix::net::UnixStream::connect(&socket_path).is_ok(),
+            };
+            if connected || Instant::now() >= ready_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         Ok(Self {
             process: process.take()?,

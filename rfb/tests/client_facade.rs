@@ -8,9 +8,11 @@
 //! avoid overlapped server-side I/O entirely and keep the tests deterministic.
 //!
 //! Covers: fake forkd controller (hand-written HTTP), fake NDJSON guest, fake
-//! ZBRT frame server; controller surface, NDJSON multi-line + stream
-//! sessions, ZBRT exec/fs/stream/cancel/health, identical facade shapes on
-//! both transports, and local validation fail-closed rules.
+//! ZBRT frame server; controller surface (incl. invalid base_url → Validation
+//! and blank `FORKD_URL` → default), NDJSON multi-line + stream sessions, ZBRT
+//! Hello-first handshake / control-connection reuse / stale reconnect / exec /
+//! fs / stream / cancel / health, identical facade shapes on both transports,
+//! and local validation fail-closed rules (incl. ZBRT argc > 255).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +23,8 @@ use rfb::client::{
     CreateOptions, DirEntry, GuestSandbox, GuestTransport, RfbClient, RfbError, StreamEventKind,
 };
 use rfb::protocol::{
-    Error as ZbrtErrorFrame, Exit as ZbrtExit, Frame, Fs, Health, Kind, Output as ZbrtOutput,
+    Error as ZbrtErrorFrame, Exit as ZbrtExit, Frame, Fs, Health, Hello, HelloAck, Kind,
+    Output as ZbrtOutput, ZBRT_V1_CAPABILITIES,
 };
 use serde_json::{json, Value};
 
@@ -271,64 +274,105 @@ fn zcancelack(request_id: [u8; 16]) -> Frame {
     zframe(Kind::CancelAck, request_id, Vec::new())
 }
 
+fn hello_capabilities() -> Vec<String> {
+    ZBRT_V1_CAPABILITIES
+        .iter()
+        .map(|cap| (*cap).to_owned())
+        .collect()
+}
+
 fn spawn_zbrt<F>(handler: F) -> String
 where
     F: Fn(Frame) -> Vec<Frame> + Send + Sync + 'static,
 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind zbrt");
     let addr = listener.local_addr().unwrap().to_string();
+    let handler = std::sync::Arc::new(handler);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            loop {
-                // Blocking ZBRT frame read: 28-byte header + payload.
-                let mut header = [0u8; 28];
-                if read_exact_blocking(&mut stream, &mut header).is_err() {
-                    break;
-                }
-                if &header[..4] != b"ZBRT" || header[4] != 1 {
-                    break;
-                }
-                let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-                let mut payload = vec![0u8; len];
-                if read_exact_blocking(&mut stream, &mut payload).is_err() {
-                    break;
-                }
-                let kind = match header[5] {
-                    1 => Kind::Hello,
-                    2 => Kind::HelloAck,
-                    3 => Kind::Execute,
-                    4 => Kind::Output,
-                    5 => Kind::Exit,
-                    6 => Kind::Cancel,
-                    7 => Kind::CancelAck,
-                    8 => Kind::Fs,
-                    9 => Kind::FsResult,
-                    10 => Kind::Health,
-                    11 => Kind::HealthAck,
-                    12 => Kind::Error,
-                    13 => Kind::Result,
-                    _ => break,
-                };
-                let frame = Frame {
-                    kind,
-                    flags: 0,
-                    request_id: header[8..24].try_into().unwrap(),
-                    payload,
-                };
-                for reply in handler(frame) {
-                    let mut bytes = Vec::new();
-                    if reply.encode(&mut bytes).is_err() {
+            let Ok(stream) = stream else { break };
+            // One thread per connection: the SDK client keeps the control
+            // connection open (connection reuse) while opening additional
+            // per-turn connections, so a serial accept loop would deadlock
+            // the second connection.
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                loop {
+                    // Blocking ZBRT frame read: 28-byte header + payload.
+                    let mut header = [0u8; 28];
+                    if read_exact_blocking(&mut stream, &mut header).is_err() {
                         break;
+                    }
+                    if &header[..4] != b"ZBRT" || header[4] != 1 {
+                        break;
+                    }
+                    let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
+                    let mut payload = vec![0u8; len];
+                    if read_exact_blocking(&mut stream, &mut payload).is_err() {
+                        break;
+                    }
+                    let kind = match header[5] {
+                        1 => Kind::Hello,
+                        2 => Kind::HelloAck,
+                        3 => Kind::Execute,
+                        4 => Kind::Output,
+                        5 => Kind::Exit,
+                        6 => Kind::Cancel,
+                        7 => Kind::CancelAck,
+                        8 => Kind::Fs,
+                        9 => Kind::FsResult,
+                        10 => Kind::Health,
+                        11 => Kind::HealthAck,
+                        12 => Kind::Error,
+                        13 => Kind::Result,
+                        _ => break,
                     };
-                    if stream.write_all(&bytes).is_err() {
-                        break;
-                    }
-                    if stream.flush().is_err() {
-                        break;
+                    let frame = Frame {
+                        kind,
+                        flags: 0,
+                        request_id: header[8..24].try_into().unwrap(),
+                        payload,
+                    };
+                    // Mandatory ZBRT handshake (PROTOCOL.md §3.4): the SDK client
+                    // sends Hello first on every connection; the fake guest
+                    // auto-acknowledges it here so per-test handlers only see
+                    // business frames.
+                    let replies = if frame.kind == Kind::Hello {
+                        let hello = Hello::decode(&frame.payload).expect("Hello payload");
+                        assert_eq!(hello.client, "rfb-sdk", "hello client id");
+                        assert_eq!(
+                            hello.capabilities,
+                            hello_capabilities(),
+                            "hello capabilities"
+                        );
+                        vec![zframe(
+                            Kind::HelloAck,
+                            frame.request_id,
+                            HelloAck {
+                                server: "rfb-zeroboot-guest".to_owned(),
+                                capabilities: hello_capabilities(),
+                            }
+                            .encode()
+                            .unwrap(),
+                        )]
+                    } else {
+                        handler(frame)
+                    };
+                    for reply in replies {
+                        let mut bytes = Vec::new();
+                        if reply.encode(&mut bytes).is_err() {
+                            break;
+                        };
+                        if stream.write_all(&bytes).is_err() {
+                            break;
+                        }
+                        if stream.flush().is_err() {
+                            break;
+                        }
                     }
                 }
-            }
+            });
         }
     });
     addr
@@ -552,6 +596,36 @@ async fn wait_snapshot_ready_failed_and_timeout() {
         client.wait_snapshot("t", 1).await,
         Err(RfbError::Transport(_))
     ));
+}
+
+#[test]
+fn client_new_rejects_invalid_base_url_as_validation() {
+    // Fail-closed before any request is built: non-URL, non-http(s) scheme,
+    // missing host, and blank values are all Validation (UNIFIED_API.md §2).
+    for bad in ["", "not a url", "ftp://controller", "http://"] {
+        let err = match RfbClient::new(bad, None, Duration::from_secs(5)) {
+            Err(err) => err,
+            Ok(_) => panic!("expected Validation for base_url `{bad}`"),
+        };
+        assert!(
+            matches!(err, RfbError::Validation(_)),
+            "expected Validation for base_url `{bad}`, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn client_from_env_blank_forkd_url_falls_back_to_default() {
+    // No other test in this binary reads FORKD_URL/FORKD_TOKEN, so mutating
+    // the process environment here stays race-free.
+    std::env::set_var("FORKD_URL", "   ");
+    std::env::set_var("FORKD_TOKEN", "tok");
+    let result = RfbClient::from_env();
+    std::env::remove_var("FORKD_URL");
+    std::env::remove_var("FORKD_TOKEN");
+    // A blank FORKD_URL falls back to the default (matching the other
+    // language SDKs) instead of failing URL validation.
+    result.expect("blank FORKD_URL must fall back to the default URL");
 }
 
 // ---------------------------------------------------------------------------
@@ -934,4 +1008,236 @@ async fn eval_zbrt_fails_closed_without_sending_frames() {
         Err(RfbError::Validation(_))
     ));
     assert_eq!(received.load(Ordering::SeqCst), 0, "no frames sent");
+}
+
+/// ZBRT server that logs one line per received frame so tests can assert the
+/// exact connection topology. Replies: Hello → HelloAck (logged), Execute →
+/// Output+Exit, Fs → canned `ls` FsResult, Health → HealthAck. With
+/// `stale_after_first_exchange`, the first connection is closed right after
+/// its first business reply (stale-connection semantics).
+fn spawn_zbrt_recording(log: Arc<Mutex<Vec<String>>>, stale_after_first_exchange: bool) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind zbrt");
+    let addr = listener.local_addr().unwrap().to_string();
+    let connections = Arc::new(AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            // One thread per connection: the client holds the control
+            // connection open while exec opens its own, so a serial accept
+            // loop would deadlock the second connection.
+            let conn = connections.fetch_add(1, Ordering::SeqCst);
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut exchanges = 0usize;
+                loop {
+                    let mut header = [0u8; 28];
+                    if read_exact_blocking(&mut stream, &mut header).is_err() {
+                        break;
+                    }
+                    if &header[..4] != b"ZBRT" || header[4] != 1 {
+                        break;
+                    }
+                    let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
+                    let mut payload = vec![0u8; len];
+                    if read_exact_blocking(&mut stream, &mut payload).is_err() {
+                        break;
+                    }
+                    let Ok(kind) = Kind::parse(header[5]) else {
+                        break;
+                    };
+                    let rid: [u8; 16] = header[8..24].try_into().unwrap();
+                    let replies = match kind {
+                        Kind::Hello => {
+                            let hello = Hello::decode(&payload).expect("Hello payload");
+                            log.lock().unwrap().push(format!(
+                                "conn{conn} hello client={} caps={}",
+                                hello.client,
+                                hello.capabilities.join(",")
+                            ));
+                            vec![zframe(
+                                Kind::HelloAck,
+                                rid,
+                                HelloAck {
+                                    server: "rfb-zeroboot-guest".to_owned(),
+                                    capabilities: hello_capabilities(),
+                                }
+                                .encode()
+                                .unwrap(),
+                            )]
+                        }
+                        Kind::Execute => {
+                            log.lock().unwrap().push(format!("conn{conn} execute"));
+                            vec![zout(rid, 0, b"hi"), zexit(rid, 0)]
+                        }
+                        Kind::Fs => {
+                            exchanges += 1;
+                            log.lock().unwrap().push(format!("conn{conn} fs"));
+                            vec![zfsresult(
+                                rid,
+                                json!({
+                                    "entries": [{"name": "a.txt", "is_dir": false, "size": 3}],
+                                    "truncated": false
+                                }),
+                            )]
+                        }
+                        Kind::Health => {
+                            log.lock().unwrap().push(format!("conn{conn} health"));
+                            vec![zhealthack(rid)]
+                        }
+                        _ => break,
+                    };
+                    let mut delivered = true;
+                    for reply in replies {
+                        let mut bytes = Vec::new();
+                        if reply.encode(&mut bytes).is_err()
+                            || stream.write_all(&bytes).is_err()
+                            || stream.flush().is_err()
+                        {
+                            delivered = false;
+                            break;
+                        }
+                    }
+                    if !delivered || (stale_after_first_exchange && exchanges >= 1) {
+                        // Drop the connection: the client must transparently
+                        // reconnect once and retry the request.
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn zbrt_hello_first_and_control_connection_reuse() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let server = spawn_zbrt_recording(log.clone(), false);
+    let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
+
+    let exec = sandbox.exec(&["echo", "hi"], "/", 60.0, b"").await.unwrap();
+    assert_eq!(exec.stdout, b"hi");
+    assert!(sandbox.ping().await.unwrap());
+    assert!(!sandbox.ls(".").await.unwrap().is_empty());
+    assert!(!sandbox.ls(".").await.unwrap().is_empty());
+
+    let log = log.lock().unwrap().clone();
+    let caps = ZBRT_V1_CAPABILITIES.join(",");
+    // exec keeps its own connection; ping + both ls calls share one control
+    // connection (no extra Hello for the reuse).
+    assert_eq!(
+        log,
+        vec![
+            format!("conn0 hello client=rfb-sdk caps={caps}"),
+            "conn0 execute".to_owned(),
+            format!("conn1 hello client=rfb-sdk caps={caps}"),
+            "conn1 health".to_owned(),
+            "conn1 fs".to_owned(),
+            "conn1 fs".to_owned(),
+        ],
+        "every connection must start with Hello; health/fs must reuse one control connection"
+    );
+}
+
+#[tokio::test]
+async fn zbrt_control_connection_reconnects_once_after_stale() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let server = spawn_zbrt_recording(log.clone(), true);
+    let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
+
+    let entries = sandbox.ls(".").await.unwrap();
+    assert_eq!(entries.len(), 1);
+    // The server dropped the control connection after the first exchange; the
+    // client must reconnect (fresh Hello) and retry this request once.
+    let entries = sandbox.ls(".").await.unwrap();
+    assert_eq!(entries.len(), 1);
+
+    let log = log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec![
+            "conn0 hello client=rfb-sdk caps=execute,stream,deadline,health,cancel,filesystem"
+                .to_owned(),
+            "conn0 fs".to_owned(),
+            "conn1 hello client=rfb-sdk caps=execute,stream,deadline,health,cancel,filesystem"
+                .to_owned(),
+            "conn1 fs".to_owned(),
+        ],
+        "stale control connection must be re-established with a fresh Hello"
+    );
+}
+
+#[tokio::test]
+async fn zbrt_handshake_failure_is_transport() {
+    // A guest that answers the mandatory Hello with an Error frame makes the
+    // connection unusable; the SDK classifies the failed handshake as
+    // Transport.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind zbrt");
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut header = [0u8; 28];
+            if read_exact_blocking(&mut stream, &mut header).is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            if read_exact_blocking(&mut stream, &mut payload).is_err() {
+                break;
+            }
+            let rid: [u8; 16] = header[8..24].try_into().unwrap();
+            let reply = zerror(rid, 1, "protocol handshake required");
+            let mut bytes = Vec::new();
+            if reply.encode(&mut bytes).is_ok() {
+                let _ = stream.write_all(&bytes);
+                let _ = stream.flush();
+            }
+        }
+    });
+    let (_client, sandbox) = connect_fake(&addr, GuestTransport::Zbrt).await;
+    let err = sandbox.exec(&["false"], "/", 60.0, b"").await.unwrap_err();
+    assert!(
+        matches!(err, RfbError::Transport(_)),
+        "handshake failure must be Transport, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn zbrt_argv_over_255_fails_closed_without_connecting() {
+    // ZBRT v1 Execute carries argc in one byte: over-limit argv must be
+    // rejected locally (Validation) with zero TCP connections.
+    let connections = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind zbrt");
+    let addr = listener.local_addr().unwrap().to_string();
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream.is_err() {
+                break;
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let (_client, sandbox) = connect_fake(&addr, GuestTransport::Zbrt).await;
+
+    let argv: Vec<String> = (0..256).map(|i| format!("a{i}")).collect();
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let err = sandbox.exec(&args, "/", 60.0, b"").await.unwrap_err();
+    assert!(
+        matches!(err, RfbError::Validation(_)),
+        "argc>255 must be a local Validation error, got {err:?}"
+    );
+    // stream() runs the same local check.
+    match sandbox.stream(&args, None, None, None).await {
+        Err(RfbError::Validation(_)) => {}
+        Err(err) => panic!("argc>255 stream must be a local Validation error, got {err:?}"),
+        Ok(_) => panic!("argc>255 stream must be rejected"),
+    }
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "zero TCP connections for an over-limit argv"
+    );
 }

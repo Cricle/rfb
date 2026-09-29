@@ -83,6 +83,28 @@ async fn spawn_guest(root: std::path::PathBuf) -> tokio::io::DuplexStream {
     host
 }
 
+/// Perform the mandatory ZBRT handshake: every non-Hello frame is refused
+/// until the guest answered a wire Hello with a HelloAck.
+async fn handshake(host: &mut tokio::io::DuplexStream) {
+    write_frame_async(
+        host,
+        &new_frame(
+            Kind::Hello,
+            Hello {
+                client: "rfb-cli".into(),
+                capabilities: vec!["execute".into()],
+            }
+            .encode()
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let frame = read_frame_async(host).await.unwrap();
+    assert_eq!(frame.kind, Kind::HelloAck);
+    assert_eq!(frame.request_id, [7; 16]);
+}
+
 /// Collect every `Output` frame for the given request id, then the single
 /// terminal frame. Returns (stdout bytes, stderr bytes, terminal frame).
 #[cfg(unix)]
@@ -157,8 +179,8 @@ async fn hello_negotiates_zbrt_capabilities() {
 async fn execute_streams_output_frames_then_single_exit() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
-    // The host provider/CLI send Execute without a wire Hello.
     write_frame_async(
         &mut host,
         &exec_frame(
@@ -182,6 +204,7 @@ async fn execute_streams_output_frames_then_single_exit() {
 async fn execute_echo_smoke_and_health() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     write_frame_async(&mut host, &exec_frame(&["echo", "ok"], 0))
         .await
@@ -216,6 +239,7 @@ async fn execute_echo_smoke_and_health() {
 async fn malformed_execute_fails_closed_with_error_frame() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     write_frame_async(
         &mut host,
@@ -227,6 +251,45 @@ async fn malformed_execute_fails_closed_with_error_frame() {
     assert_eq!(frame.kind, Kind::Error);
     let error = ZbrtError::decode(&frame.payload).unwrap();
     assert_eq!(error.code, 1);
+    assert!(
+        error.message.contains("invalid Execute payload"),
+        "malformed Execute must fail on its payload, got: {}",
+        error.message
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn frames_before_handshake_fail_closed() {
+    let root = workspace();
+    let mut host = spawn_guest(root.clone()).await;
+
+    // Every non-Hello frame sent before the wire handshake is rejected by the
+    // connection itself; none of them may reach the runtime service (whose
+    // capabilities guards assume protocol readiness).
+    for kind in [Kind::Execute, Kind::Cancel, Kind::Health, Kind::Fs] {
+        write_frame_async(&mut host, &new_frame(kind, Vec::new()))
+            .await
+            .unwrap();
+        let frame = read_frame_async(&mut host).await.unwrap();
+        assert_eq!(
+            frame.kind,
+            Kind::Error,
+            "{kind:?} before Hello was not refused"
+        );
+        assert_eq!(frame.request_id, [7; 16]);
+        let error = ZbrtError::decode(&frame.payload).unwrap();
+        assert!(
+            error.message.contains("protocol handshake required"),
+            "{kind:?} -> {}",
+            error.message
+        );
+    }
+
+    // The refusal does not poison the connection: a Hello afterwards still
+    // negotiates and opens the session.
+    handshake(&mut host).await;
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -235,6 +298,7 @@ async fn malformed_execute_fails_closed_with_error_frame() {
 async fn cancel_without_active_request_is_idempotent() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     write_frame_async(
         &mut host,
@@ -263,6 +327,7 @@ async fn cancel_without_active_request_is_idempotent() {
 async fn duplicate_execute_request_id_fails_closed() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     write_frame_async(&mut host, &exec_frame(&["echo", "one"], 5000))
         .await
@@ -287,6 +352,7 @@ async fn duplicate_execute_request_id_fails_closed() {
 async fn cancel_terminates_process_group_with_single_terminal() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     // A long-running command that would take ~5s if allowed to finish.
     write_frame_async(&mut host, &exec_frame(&["sleep", "5"], 30000))
@@ -342,6 +408,7 @@ async fn cancel_terminates_process_group_with_single_terminal() {
 async fn cancelled_turn_output_does_not_leak_into_next_request() {
     let root = workspace();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     // Turn A is cancelled mid-flight while its stdout pipe is still draining;
     // any straggler Output chunks must not be forwarded under the next
@@ -422,6 +489,7 @@ async fn fs_rpc_runs_structured_workspace_operation() {
     let root = workspace();
     fs::create_dir_all(root.join("sub")).unwrap();
     let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
 
     write_frame_async(
         &mut host,

@@ -7,7 +7,7 @@ import unittest
 from rfb_sdk import _forkd
 from rfb_sdk.errors import DecodeError, HttpStatusError, TransportError, ValidationError
 
-from tests.fake_servers import FakeControllerServer
+from tests.fake_servers import FakeControllerServer, FlakyKeepAliveController
 
 
 def _closed_port():
@@ -125,6 +125,18 @@ class ForkdControllerTests(unittest.TestCase):
         self.assertEqual(value, {"pong": True})
         self.assertEqual(self.server.requests[-1]["path"], "/v1/sandboxes/sb-1/ping")
 
+    def test_ping_sandbox_passes_extra_fields_through(self):
+        # The controller ping reply is passed through verbatim: newer
+        # controllers may add fields (e.g. "protocol_version": 1) and the SDK
+        # must neither reject nor drop them (backward compatible).
+        self.server.behavior = lambda m, p, b: (
+            (200, json.dumps({"pong": True, "protocol_version": 1}).encode())
+            if m == "POST" and p == "/v1/sandboxes/sb-1/ping"
+            else None
+        )
+        value = self.controller.ping_sandbox("sb-1")
+        self.assertEqual(value, {"pong": True, "protocol_version": 1})
+
     def test_ping_sandbox_rejects_bad_id(self):
         for bad in ("", "bad id", "x" * 129, "../etc"):
             with self.assertRaises(ValidationError):
@@ -174,6 +186,56 @@ class ForkdControllerTests(unittest.TestCase):
             self.controller.ping_sandbox("sb-1")
         self.assertEqual(self.server.connections, 1)
         self.assertEqual(len(self.server.requests), 10)
+
+
+class ForkdControllerStaleKeepAliveTests(unittest.TestCase):
+    """Pooled keep-alive socket closed by the peer while idle (stale-connection
+    semantics): exactly one reconnect + replay for idempotent methods; POST is
+    never replayed because the peer may already have processed it (e.g. it
+    could have created an extra sandbox)."""
+
+    def setUp(self):
+        self.server = FlakyKeepAliveController()
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.controller = _forkd._ForkdController(self.server.url, None, 5.0)
+
+    @staticmethod
+    def _create_request():
+        return {
+            "snapshot_tag": "base",
+            "n": 1,
+            "per_child_netns": False,
+            "memory_limit_mib": None,
+            "prewarm": False,
+            "live_fork": False,
+            "hugepages": False,
+        }
+
+    def test_stale_pooled_get_is_retried_once_on_a_fresh_connection(self):
+        self.assertEqual(self.controller.list_snapshots(), [])
+        # The second GET lands on the pooled socket the peer already closed:
+        # one reconnect + replay happens transparently.
+        self.assertEqual(self.controller.list_snapshots(), [])
+        self.assertEqual([r[0] for r in self.server.requests], ["GET", "GET"])
+        self.assertEqual(self.server.connections, 2)
+
+    def test_stale_pooled_delete_is_retried_once_on_a_fresh_connection(self):
+        self.assertIsNone(self.controller.delete_sandbox("sb-1"))
+        # DELETE is idempotent: the stale pooled socket is replayed once.
+        self.assertIsNone(self.controller.delete_sandbox("sb-1"))
+        self.assertEqual([r[0] for r in self.server.requests], ["DELETE", "DELETE"])
+        self.assertEqual(self.server.connections, 2)
+
+    def test_stale_pooled_post_is_not_retried(self):
+        created = self.controller.create_sandboxes(self._create_request())
+        self.assertEqual(len(created), 1)
+        with self.assertRaises(TransportError):
+            self.controller.create_sandboxes(self._create_request())
+        # The POST never reached the peer twice and no second connection was
+        # opened for the replay.
+        self.assertEqual([r[0] for r in self.server.requests], ["POST"])
+        self.assertEqual(self.server.connections, 1)
 
 
 if __name__ == "__main__":
