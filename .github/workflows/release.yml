@@ -243,9 +243,12 @@ jobs:
       # Trusted publishing（OIDC）：不传 `password` 且 job 具有 id-token: write
       # 时，action 自动走 OIDC 交换（无需长期 PYPI_KEY）；attestations 默认开启
       # （PEP 740）。该 action 没有 trusted-publishing 输入。
+      # pin 必须是 **commit SHA**：ghcr 的 Docker 镜像只按 commit SHA 打 tag。
+      # 之前 pin 了 v1.14.2 的 annotated tag 对象 SHA（a892a5a…），runner 按
+      # 它找镜像 → `manifest unknown`。
       - name: Publish rfb-sdk to PyPI
         if: steps.pypi_guard.outputs.exists != 'true'
-        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: sdk/python/dist
 
@@ -427,11 +430,11 @@ jobs:
             echo "::error::secret NUGET_KEY 未配置（nuget.org API key）"
             exit 1
           fi
-          # 为什么不用 --api-key：密钥会进 /proc/<pid>/cmdline（对本机所有
-          # 进程可见）并可能被命令回显带进日志。改为生成临时 NuGet.Config
-          # （0600）：凭据值写 %NUGET_KEY% 占位，由 NuGet 运行时从环境变量
-          # 展开——密钥既不落盘（文件里只有占位符）也不进 argv；经
-          # --configfile 传入，run 结束（含失败路径）由 trap 删除。
+          # --api-key 进 argv（/proc 可见）：理论上不如配置文件干净，但实测
+          # NuGet 不会展开 packageSourceCredentials 里的 %VAR% 占位符（临时
+          # NuGet.Config 方案 push 时 401 "No API Key provided"），而 push 的
+          # key 走 X-NuGet-ApiKey 头、只认 --api-key。runner 是一次性的，argv
+          # 暴露面可接受；绝不把 key tee 进日志。
           nuget_cfg="$RUNNER_TEMP/nuget-push.config.xml"
           trap 'rm -f "$nuget_cfg"' EXIT
           umask 077   # 0600：凭据配置仅限当前用户可读写
@@ -442,18 +445,12 @@ jobs:
               <clear />
               <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
             </packageSources>
-            <packageSourceCredentials>
-              <nuget.org>
-                <add key="Username" value="rfb-release" />
-                <add key="ClearTextPassword" value="%NUGET_KEY%" />
-              </nuget.org>
-            </packageSourceCredentials>
           </configuration>
           XMLEOF
           log=/tmp/release-nuget.log
           set +e
           dotnet nuget push "dist/nuget/*.nupkg" --configfile "$nuget_cfg" \
-            --source nuget.org --skip-duplicate 2>&1 | tee "$log"
+            --api-key "$NUGET_KEY" --source nuget.org --skip-duplicate 2>&1 | tee "$log"
           rc=$?
           set -e
           rm -f "$nuget_cfg"
