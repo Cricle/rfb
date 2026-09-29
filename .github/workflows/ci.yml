@@ -257,14 +257,14 @@ jobs:
           retention-days: 7
 
   msrv:
-    name: MSRV check (Rust 1.90)
+    name: MSRV check (Rust 1.93)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
-          toolchain: 1.90.0
+          toolchain: 1.93.0
       # A fast compile-only check (no clippy/tests) to catch dependency MSRV regressions.
       # Dependabot may try to bump past the declared MSRV; this job fails before the
       # version reaches CI's all-features build.

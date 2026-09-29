@@ -11,7 +11,7 @@ rfb-runtime = { version = "0.0.1", default-features = false, features = ["core"]
 
 `core`（也是默认 feature）提供异步核心；`guest` 加入 guest 进程、JSON 配置和 vsock；`host-vsock` 提供宿主侧 vsock 客户端；`forkd` 基于 `guest` 提供 forkd agent；`firecracker` 提供 Linux/KVM 控制器；`cli` 启用 guest、forkd、firecracker 及运行时二进制。按需关闭默认 feature，避免把平台后端带入普通库消费者。
 
-MSRV 为 Rust 1.90，edition 2021。`core` 可在常见 Rust 平台编译；vsock 与 Firecracker/KVM 后端仅支持 Linux（Windows/macOS 不提供这些后端）。真实 RFB1 验收还需要 Linux/WSL、KVM、匹配版本的 Firecracker、kernel 和可写 rootfs；缺少它们时普通编译/单元测试仍可运行，但严格验收必须失败而不是伪报 PASS。
+MSRV 为 Rust 1.93，edition 2021。`core` 可在常见 Rust 平台编译；vsock 与 Firecracker/KVM 后端仅支持 Linux（Windows/macOS 不提供这些后端）。真实 RFB1 验收还需要 Linux/WSL、KVM、匹配版本的 Firecracker、kernel 和可写 rootfs；缺少它们时普通编译/单元测试仍可运行，但严格验收必须失败而不是伪报 PASS。
 
 ## 三个独立协议
 

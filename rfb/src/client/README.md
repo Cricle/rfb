@@ -22,7 +22,7 @@
 cargo build -p rfb-sdk --features forkd,zeroboot
 ```
 
-依赖 crate 内已有实现，未新增依赖：controller 复用 `rfb::controller::ForkdClient`，NDJSON 复用 `rfb::forkd_guest::ForkdGuestClient/ForkdGuestStream`，ZBRT 帧编解码复用 `rfb::protocol`（`rfb-runtime::zeroboot_protocol` 的 re-export）。MSRV 1.82，edition 2021，tokio 异步。
+依赖 crate 内已有实现，未新增依赖：controller 复用 `rfb::controller::ForkdClient`，NDJSON 复用 `rfb::forkd_guest::ForkdGuestClient/ForkdGuestStream`，ZBRT 帧编解码复用 `rfb::protocol`（`rfb-runtime::zeroboot_protocol` 的 re-export）。MSRV 1.93，edition 2021，tokio 异步。
 
 ## 统一 API 快速上手（与其他语言 SDK 同一场景）
 
