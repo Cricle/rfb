@@ -202,9 +202,11 @@ async fn session_negotiates_hello_and_reuses_one_connection() {
         .await;
     });
 
-    let session = ZeroBootSession::open(&path, 5000, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::open(&path, 5000, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     assert!(session.supports("execute"));
     assert!(session.supports("health"));
     assert!(!session.supports("filesystem"));
@@ -287,9 +289,11 @@ async fn exec_consumes_multiple_output_frames_until_exit() {
         .await;
     });
 
-    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     let result = session
         .exec(exec_request(
             &["sh", "-c", "echo a; echo b >&2; echo c"],
@@ -328,9 +332,11 @@ async fn exec_accepts_legacy_result_frame() {
         write_frame(&mut server, &reply(exec.request_id, Kind::Result, payload)).await;
     });
 
-    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     let result = session.exec(exec_request(&["legacy"], 2000)).await.unwrap();
     assert_eq!(result.status, Some(7));
     assert_eq!(result.stdout, b"data");
@@ -370,9 +376,11 @@ async fn exec_maps_guest_error_frame() {
         .await;
     });
 
-    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     let error = session
         .exec(exec_request(&["missing"], 2000))
         .await
@@ -423,9 +431,11 @@ async fn exec_detects_protocol_violation_in_response_frames() {
         .await;
     });
 
-    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     let error = session
         .exec(exec_request(&["echo"], 2000))
         .await
@@ -960,9 +970,11 @@ async fn concurrent_execs_queue_instead_of_failing_the_turn() {
         }
     });
 
-    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
-        .await
-        .unwrap();
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(2))
+            .await
+            .unwrap(),
+    );
     let (a, b, c) = tokio::join!(
         session.exec(exec_request(&["echo", "one"], 2000)),
         session.exec(exec_request(&["echo", "two"], 2000)),

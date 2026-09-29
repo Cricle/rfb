@@ -529,10 +529,10 @@ async fn filesystem_search_edges_and_append() {
     task.abort();
 }
 
-/// Official forkd ping field contract (rfb-cli-usage.md 搂4): the response must
-/// carry `pong`, `numpy_version`, `pid`, `agent_lang`, `warmup_ready`, and
-/// `path`. The Rust replacement reports honest values for fields only the
-/// Python/Node interpreter can produce.
+/// Official forkd ping field contract (rfb-cli-usage.md §4): the response must
+/// carry `pong`, `numpy_version`, `pid`, `agent_lang`, `warmup_ready`, `path`,
+/// and the additive `protocol_version` marker. The Rust replacement reports
+/// honest values for fields only the Python/Node interpreter can produce.
 #[tokio::test]
 async fn ping_golden_contract_matches_official_field_set() {
     let task = spawn_agent("127.0.0.1:18903");
@@ -543,6 +543,7 @@ async fn ping_golden_contract_matches_official_field_set() {
     assert_eq!(ping["numpy_version"], "not-installed");
     assert_eq!(ping["agent_lang"], "rust");
     assert_eq!(ping["warmup_ready"], false);
+    assert_eq!(ping["protocol_version"], 1);
     assert!(
         ping["pid"].as_u64().unwrap_or(0) > 0,
         "pid must be a positive int"
@@ -554,7 +555,8 @@ async fn ping_golden_contract_matches_official_field_set() {
             .unwrap_or(false),
         "path must be a non-empty string"
     );
-    // The field set is exactly the official six (no silent additions).
+    // The field set is exactly the official six plus the additive
+    // `protocol_version` marker (no silent additions).
     let golden = json!({
         "pong": true,
         "numpy_version": "not-installed",
@@ -562,6 +564,7 @@ async fn ping_golden_contract_matches_official_field_set() {
         "agent_lang": "rust",
         "warmup_ready": false,
         "path": ping["path"].clone(),
+        "protocol_version": 1,
     });
     assert_eq!(ping, golden);
     task.abort();
