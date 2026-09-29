@@ -49,6 +49,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      # release.sh 会跑全特性 test+doc（rustpython/mlua/ring/zstd 的构建峰值
+      # 顶满 runner 剩余盘：链接阶段 SIGBUS=Bus error 就是写产物时空间耗尽），
+      # 先清预装大件换回 ~20GB——与 ci.yml rust job 的同名步骤一致。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
           toolchain: stable
