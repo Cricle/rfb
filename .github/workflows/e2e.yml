@@ -114,12 +114,30 @@ jobs:
           ls -la resx/kernel/vmlinux-5.10.225
           echo "FORKD_KERNEL=$PWD/resx/kernel/vmlinux-5.10.225" >> "$GITHUB_ENV"
 
-      # 构建：CLI（含 rfb-cli bin）→ musl 静态 rfb-runtime → forkd-agent rootfs。
-      # 与 sdk/BACKEND_SETUP.md 的文档流程一致。
-      - name: Build rfb-cli and forkd-agent rootfs
+      # 一次编译（release profile）：CLI、rfb-ben 与全部真机测试二进制在同一
+      # 次构建里产出。后续每个测试步骤只做 cargo 新鲜度检查后执行已编译产物，
+      # 不再出现 debug/release 两套依赖图各编一遍的情况。
+      - name: Compile once (release profile, CLI + rfb-ben + real-VM test binaries)
         run: |
           set -euo pipefail
-          cargo build -p rfb-sdk --features cli --release
+          # 单次 cargo 调用完成全部 host 侧编译（bins + 6 个真机测试目标）：
+          # 同一次 feature 解析把 dev-dependencies 也纳入，避免 bin 图与
+          # test 图各编一遍 rfb-sdk；后续步骤只做新鲜度检查。
+          cargo build --release -p rfb-sdk -p rfb-ben --features cli \
+            --bins \
+            --test forkd_real_e2e \
+            --test zeroboot_interpreters \
+            --test zeroboot_provider_real \
+            --test zeroboot_real_e2e \
+            --test zeroboot_concurrency \
+            --test zeroboot_fork
+
+      # 打包：musl 静态 rfb-runtime → forkd-agent rootfs（该 ext4 的 sha256 与
+      # resx/SHA256SUMS 绑定，必须与清单逐字节一致）。与 sdk/BACKEND_SETUP.md
+      # 的文档流程一致。
+      - name: Build forkd-agent rootfs
+        run: |
+          set -euo pipefail
           ./target/release/rfb-cli image build-static \
             --root . --target x86_64-unknown-linux-musl --package rfb-runtime
           ./target/release/rfb-cli image build-rootfs \
@@ -288,7 +306,7 @@ jobs:
           emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log=/tmp/real-e2e.log
           set +e
-          cargo test -p rfb-sdk --features cli --test forkd_real_e2e \
+          cargo test --release -p rfb-sdk --features cli --test forkd_real_e2e \
             -- --ignored --test-threads=1 2>&1 | tee "$log"
           rc=$?
           set -e
@@ -324,7 +342,7 @@ jobs:
           RFB_REAL_E2E=1 \
           RFB_E2E_ROOTFS_DIR="$RUN_DIR/interp-image" \
           RFB_E2E_FIRECRACKER=/usr/local/bin/firecracker \
-            cargo test -p rfb-sdk --features cli --test zeroboot_interpreters \
+            cargo test --release -p rfb-sdk --features cli --test zeroboot_interpreters \
             -- --ignored --test-threads=1 2>&1 | tee "$log"
           rc=$?
           set -e
@@ -532,7 +550,7 @@ jobs:
 
           # 阶梯同时扫 vCPU：会话池让并发命令真正并行，vCPU 才是吞吐的
           # 上限轴；两档（1/2 vCPU）足以看出是否随核数扩展。
-          cargo build -p rfb-ben --release
+          # rfb-ben 已在 "Compile once" 步骤构建，这里只执行基准。
           ./target/release/rfb-ben zbrt \
             --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" \
             --samples 100 --warmup 5 --levels 1,2,4,8,16 --rounds 4 \
@@ -547,12 +565,12 @@ jobs:
           RFB_REAL_E2E=1 \
           RFB_E2E_ZBRT_ROOTFS="$ZB_ROOTFS" \
           RFB_E2E_FIRECRACKER="$FC" \
-            cargo test -p rfb-sdk --features cli --test zeroboot_provider_real \
+            cargo test --release -p rfb-sdk --features cli --test zeroboot_provider_real \
             -- --ignored --test-threads=1 2>&1 | tee "$RUN_DIR/zb-provider-real.log"
           RFB_REAL_E2E=1 \
           RFB_E2E_ROOTFS_DIR="$RUN_DIR/zb-rootfs" \
           RFB_E2E_FIRECRACKER="$FC" \
-            cargo test -p rfb-sdk --features cli --test zeroboot_real_e2e \
+            cargo test --release -p rfb-sdk --features cli --test zeroboot_real_e2e \
             -- --ignored --test-threads=1 2>&1 | tee "$RUN_DIR/zb-real-e2e.log"
 
       # 100 并发热启动并发门（快照分片）：4 分片 + 64MiB/VM + 100 并发
@@ -564,6 +582,7 @@ jobs:
           set -euo pipefail
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
           RUN="$PWD/examples/full/out/full-sandbox.ext4"
+          FC=/usr/local/bin/firecracker
           emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log="$RUN_DIR/zb-concurrency.log"
           set +e
@@ -592,6 +611,7 @@ jobs:
         run: |
           set -euo pipefail
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          FC=/usr/local/bin/firecracker
           emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log="$RUN_DIR/zb-fork.log"
           set +e
