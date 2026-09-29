@@ -21,7 +21,7 @@ version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,
 # versions already on crates.io, so a partial bump would silently publish a
 # new tag with stale rfb-runtime/rfb-rig dependencies.
 for crate in rfb-runtime rfb-rig; do
-  crate_version=$(CRATE_NAME="$crate" cargo metadata --no-deps --format-version 1 | python3 -c 'import json,os,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == os.environ["CRATE_NAME"]))')
+  crate_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; name=sys.argv[1]; print(next(x["version"] for x in p if x["name"] == name))' "$crate")
   if [[ "$crate_version" != "$version" ]]; then
     printf '%s version %s does not match rfb-sdk version %s\n' "$crate" "$crate_version" "$version" >&2
     exit 1
