@@ -581,7 +581,6 @@ jobs:
         run: |
           set -euo pipefail
           RUN_DIR="$RUNNER_TEMP/forkd-e2e"
-          RUN="$PWD/examples/full/out/full-sandbox.ext4"
           FC=/usr/local/bin/firecracker
           emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
           log="$RUN_DIR/zb-concurrency.log"
@@ -589,6 +588,7 @@ jobs:
           RFB_REAL_E2E=1 \
           RFB_E2E_KERNEL="$PWD/resx/kernel/vmlinux-5.10.225" \
           RFB_E2E_FIRECRACKER="$FC" \
+          RFB_E2E_ZBRT_ROOTFS="$PWD/resx/rootfs/zeroboot-zbrt.ext4" \
           RFB_E2E_CONCURRENCY=100 \
           RFB_ZBRT_SNAPSHOT_DIR=/dev/shm/rfb-zbrt-snap \
           RFB_ZBRT_SNAPSHOT_SHARDS=4 \
