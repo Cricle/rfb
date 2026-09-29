@@ -52,15 +52,13 @@ fn config_requires_all_native_runtime_paths() {
 fn non_execute_capabilities_are_rejected() {
     let provider = ZeroBootProvider::default();
     let spec = SandboxSpec {
-        capabilities: vec![Capability::ReadFramebuffer],
+        capabilities: vec![Capability::Eval],
         ..Default::default()
     };
     let result = futures_lite::future::block_on(provider.create(spec));
     assert!(matches!(
         result,
-        Err(ProviderError::UnsupportedCapability(
-            Capability::ReadFramebuffer
-        ))
+        Err(ProviderError::UnsupportedCapability(Capability::Eval))
     ));
 }
 

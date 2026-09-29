@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use super::types::{ExecResult, StreamEvent, StreamEventKind};
+use super::types::{GuestExecResult, StreamEvent, StreamEventKind};
 use super::RfbError;
 
 /// Decode `out`/`stdout`-shaped values: UTF-8 string, byte array, or null.
@@ -27,16 +27,17 @@ pub(super) fn value_bytes(value: Option<&Value>) -> Result<Vec<u8>, RfbError> {
 }
 
 /// Map an `exec` terminal line to the unified result.
-pub(super) fn exec_result(value: &Value) -> Result<ExecResult, RfbError> {
-    Ok(ExecResult {
+pub(super) fn exec_result(value: &Value) -> Result<GuestExecResult, RfbError> {
+    Ok(GuestExecResult {
         exit_code: value
             .get("exit_code")
             .and_then(Value::as_i64)
             // Clamp, never wrap: an out-of-range wire code maps to -1.
             .map(|code| i32::try_from(code).unwrap_or(-1))
             .unwrap_or(-1),
-        stdout: value_bytes(value.get("out").or_else(|| value.get("stdout")))?,
-        stderr: value_bytes(value.get("err").or_else(|| value.get("stderr")))?,
+        // UNIFIED_API.md §4: the current keys win when both are present.
+        stdout: value_bytes(value.get("stdout").or_else(|| value.get("out")))?,
+        stderr: value_bytes(value.get("stderr").or_else(|| value.get("err")))?,
         timed_out: value
             .get("timed_out")
             .and_then(Value::as_bool)
@@ -45,15 +46,18 @@ pub(super) fn exec_result(value: &Value) -> Result<ExecResult, RfbError> {
 }
 
 /// Map an `eval` terminal line to the unified result; `output` becomes stdout.
-pub(super) fn eval_result(value: &Value) -> Result<ExecResult, RfbError> {
-    Ok(ExecResult {
+/// `status` is the forkd agent's current eval key (PROTOCOL.md §2.4),
+/// `exit_code` the legacy alias — same precedence as the trait impl in
+/// forkd/provider.rs so both surfaces agree on a guest that sends both.
+pub(super) fn eval_result(value: &Value) -> Result<GuestExecResult, RfbError> {
+    Ok(GuestExecResult {
         exit_code: value
-            .get("exit_code")
-            .or_else(|| value.get("status"))
+            .get("status")
+            .or_else(|| value.get("exit_code"))
             .and_then(Value::as_i64)
             .map(|code| i32::try_from(code).unwrap_or(0))
             .unwrap_or(0),
-        stdout: value_bytes(value.get("out").or_else(|| value.get("output")))?,
+        stdout: value_bytes(value.get("output").or_else(|| value.get("out")))?,
         stderr: Vec::new(),
         timed_out: value
             .get("timed_out")

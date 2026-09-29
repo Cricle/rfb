@@ -51,7 +51,7 @@ async fn operations_facade_applies_timeout_and_validates_paths() {
     let ops = rfb::guest::GuestOperations::with_config(
         &Fake,
         rfb::guest::OperationsConfig {
-            default_timeout: Duration::from_secs(3),
+            default_timeout: Some(Duration::from_secs(3)),
         },
     );
     assert_eq!(
@@ -551,7 +551,7 @@ async fn operations_facade_applies_default_timeout_to_exec_eval_stream() {
     let ops = GuestOperations::with_config(
         &sandbox,
         OperationsConfig {
-            default_timeout: Duration::from_secs(42),
+            default_timeout: Some(Duration::from_secs(42)),
         },
     );
     ops.exec(ExecSpec::new("true")).await.unwrap();
@@ -576,7 +576,7 @@ async fn operations_facade_preserves_explicit_timeouts() {
     let ops = GuestOperations::with_config(
         &sandbox,
         OperationsConfig {
-            default_timeout: Duration::from_secs(60),
+            default_timeout: Some(Duration::from_secs(60)),
         },
     );
     let mut exec = ExecSpec::new("true");

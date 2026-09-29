@@ -325,4 +325,28 @@ fn zeroboot_guest_interpreters() {
         Outcome::Rejected { .. } => {}
         Outcome::Exited { code, .. } => assert_ne!(code, 0, "timeout kill exited 0"),
     }
+
+    // A prebuilt Rust app baked by a build.rfb `[rust] apps` entry (see
+    // examples/full/full.rfb): a plain exec of a static binary. Opt out with
+    // RFB_E2E_RUST_APP=0 for images built without the app.
+    let rust_app =
+        std::env::var("RFB_E2E_RUST_APP").unwrap_or_else(|_| "/usr/local/bin/hello".into());
+    if rust_app != "0" {
+        let (code, stdout, stderr) = exited(
+            "rust-app",
+            execute(&vm, "rust-app", &[&rust_app, "rfb"], "", 15000),
+        );
+        if code == 127 || String::from_utf8_lossy(&stderr).contains("No such file") {
+            panic!(
+                "rust app {rust_app} is not in the image; build it via \
+                 rfb-cli image build-script examples/full/full.rfb (or set RFB_E2E_RUST_APP=0)"
+            );
+        }
+        assert_eq!(code, 0, "rust app exit code");
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("rust-in-image"),
+            "rust app stdout: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
 }

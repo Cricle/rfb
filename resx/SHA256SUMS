@@ -4,3 +4,4 @@ b99ea49b8d8b7bfa307d3845585d6a97f7642aa17a985749900370070d8ca930 *resx/firecrack
 382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6 *resx/firecracker/firecracker-v1.16.1-x86_64.tgz
 6d29e2efa24111e76e3a3ecaf155ccd7c97cd94f9494ffa5df2b405cfd94e7f8 *resx/firecracker/firecracker-v1.16.1-x86_64.tgz.sha256
 819ce6ffcfdd1ceaf683bae260f28f6983102bd85deb0775b2aadb4b853ad7fa *resx/kernel/vmlinux-arcbox-0.0.24
+2eac5b4a1e7c99754b413697743501a4d35ebaf6bc8309a642341afb6bfb4c02  resx/rootfs/forkd-agent.ext4

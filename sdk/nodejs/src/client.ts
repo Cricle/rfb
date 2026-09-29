@@ -3,7 +3,7 @@
  * `rfb::client::RfbClient`: forkd controller lifecycle over HTTP/JSON plus a
  * `Sandbox` facade over the forkd guest NDJSON and ZBRT transports.
  */
-import { HttpStatusError, RemoteError, TransportError, ValidationError } from './errors.js';
+import { DecodeError, HttpStatusError, RemoteError, TransportError, ValidationError } from './errors.js';
 import * as validation from './validation.js';
 import { Sandbox, TRANSPORT_NDJSON, TRANSPORT_ZBRT } from './sandbox.js';
 import type { SandboxInfo } from './sandbox.js';
@@ -85,27 +85,35 @@ export class RfbClient {
   }
 
   async #send(method: string, pathAndQuery: string, body?: unknown): Promise<HttpResponse> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutS * 1000);
-    let response: Response;
-    try {
-      response = await fetch(this.baseUrl + pathAndQuery, {
-        method,
-        headers: {
-          ...(this.token !== null ? { Authorization: `Bearer ${this.token}` } : {}),
-          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: body === undefined ? null : JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (error) {
-      clearTimeout(timer);
-      const e = error as Error & { cause?: { message?: string } };
-      throw new TransportError(`forkd request failed: ${e.cause?.message ?? e.message}`);
+    // PROTOCOL.md §1.2: a keep-alive connection may be closed by the peer;
+    // retry once for idempotent methods (GET/DELETE/PUT).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutS * 1000);
+      try {
+        const response = await fetch(this.baseUrl + pathAndQuery, {
+          method,
+          headers: {
+            ...(this.token !== null ? { Authorization: `Bearer ${this.token}` } : {}),
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          },
+          body: body === undefined ? null : JSON.stringify(body),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const text = await response.text().catch(() => '');
+        return { status: response.status, body: text };
+      } catch (error) {
+        clearTimeout(timer);
+        if (attempt === 0 && (method === 'GET' || method === 'DELETE' || method === 'PUT')) {
+          continue; // stale keep-alive: retry once
+        }
+        const e = error as Error & { cause?: { message?: string } };
+        throw new TransportError(`forkd request failed: ${e.cause?.message ?? e.message}`);
+      }
     }
-    clearTimeout(timer);
-    const text = await response.text().catch(() => '');
-    return { status: response.status, body: text };
+    // Unreachable: the loop returns on success or throws on error.
+    throw new Error('unreachable');
   }
 
   #expectOk(result: HttpResponse): string {
@@ -122,14 +130,24 @@ export class RfbClient {
     return result.body;
   }
 
-  /** GET /v1/snapshots. */
-  async listSnapshots(): Promise<SnapshotSummary[]> {
-    return JSON.parse(this.#expectOk(await this.#send('GET', '/v1/snapshots')));
+  /** Strict response parse: a malformed 2xx body is a DecodeError (§7), not SyntaxError. */
+  #parseJson<T>(text: string): T {
+    try {
+      return JSON.parse(text) as T;
+    } catch (error) {
+      throw new DecodeError(`invalid forkd response json: ${(error as Error).message}`);
+    }
   }
 
-  /** GET /v1/sandboxes — the live sandbox registry. */
-  async listSandboxes(): Promise<SandboxInfo[]> {
-    return JSON.parse(this.#expectOk(await this.#send('GET', '/v1/sandboxes')));
+  /** GET /v1/snapshots. */
+  async listSnapshots(): Promise<SnapshotSummary[]> {
+    return this.#parseJson<SnapshotSummary[]>(this.#expectOk(await this.#send('GET', '/v1/snapshots')));
+  }
+
+  /** GET /v1/sandboxes — the live sandbox registry, as attachable handles. */
+  async listSandboxes(): Promise<Sandbox[]> {
+    const infos = this.#parseJson<SandboxInfo[]>(this.#expectOk(await this.#send('GET', '/v1/sandboxes')));
+    return infos.map((info) => new Sandbox(info, this, TRANSPORT_NDJSON, this.timeoutS * 1000));
   }
 
   /** Snapshot detail: /info → legacy endpoint; both 404 → null. */
@@ -137,11 +155,11 @@ export class RfbClient {
     validation.sandboxId(tag);
     const preferred = await this.#send('GET', `/v1/snapshots/${tag}/info`);
     if (preferred.status !== 404) {
-      return JSON.parse(this.#expectOk(preferred));
+      return this.#parseJson<SnapshotSummary>(this.#expectOk(preferred));
     }
     const legacy = await this.#send('GET', `/v1/snapshots/${tag}`);
     if (legacy.status === 404) return null;
-    return JSON.parse(this.#expectOk(legacy));
+    return this.#parseJson<SnapshotSummary>(this.#expectOk(legacy));
   }
 
   /** Poll every 100 ms until status=ready and bootable=true; failed → RemoteError. */
@@ -194,7 +212,7 @@ export class RfbClient {
       live_fork: liveFork,
       hugepages,
     });
-    const infos = JSON.parse(this.#expectOk(result)) as SandboxInfo[];
+    const infos = this.#parseJson<SandboxInfo[]>(this.#expectOk(result));
     return infos.map((info) => new Sandbox(info, this, transport, this.timeoutS * 1000));
   }
 
@@ -210,7 +228,7 @@ export class RfbClient {
     const sandboxId = target;
     validation.sandboxId(sandboxId);
     const result = await this.#send('GET', '/v1/sandboxes');
-    const list = JSON.parse(this.#expectOk(result)) as SandboxInfo[];
+    const list = this.#parseJson<SandboxInfo[]>(this.#expectOk(result));
     const info = Array.isArray(list) ? list.find((s) => s.id === sandboxId) : undefined;
     if (!info) {
       throw new RemoteError('sandbox not found');
@@ -220,20 +238,22 @@ export class RfbClient {
 
   /** Attach to a sandbox with an explicit transport ("ndjson" | "zbrt"). */
   async connectWithTransport(sandboxId: string, transport?: string | null): Promise<Sandbox> {
-    const sandbox = await this.connect(sandboxId);
+    // Fail closed before any network traffic (§7): validate the transport
+    // name first, then resolve the sandbox.
     if (transport !== undefined && transport !== null) {
       if (transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT) {
         throw new ValidationError(`invalid transport: ${transport}`);
       }
+      const sandbox = await this.connect(sandboxId);
       return new Sandbox(sandbox.info, this, transport, this.timeoutS * 1000);
     }
-    return sandbox;
+    return this.connect(sandboxId);
   }
 
   async pingSandbox(sandboxId: string): Promise<Record<string, unknown>> {
     validation.sandboxId(sandboxId);
     const result = await this.#send('POST', `/v1/sandboxes/${sandboxId}/ping`);
-    return JSON.parse(this.#expectOk(result));
+    return this.#parseJson<Record<string, unknown>>(this.#expectOk(result));
   }
 
   /** Delete a sandbox; both 2xx and 404 are success. */

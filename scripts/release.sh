@@ -12,6 +12,16 @@ case "${1:-}" in
 esac
 
 version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == "rfb-sdk"))')
+# Every published crate must share the tag's version: publish_crate() skips
+# versions already on crates.io, so a partial bump would silently publish a
+# new tag with stale rfb-runtime/rfb-rig dependencies.
+for crate in rfb-runtime rfb-rig; do
+  crate_version=$(CRATE_NAME="$crate" cargo metadata --no-deps --format-version 1 | python3 -c 'import json,os,sys; p=json.load(sys.stdin)["packages"]; print(next(x["version"] for x in p if x["name"] == os.environ["CRATE_NAME"]))')
+  if [[ "$crate_version" != "$version" ]]; then
+    printf '%s version %s does not match rfb-sdk version %s\n' "$crate" "$crate_version" "$version" >&2
+    exit 1
+  fi
+done
 tag=$(git describe --tags --exact-match 2>/dev/null || true)
 if [[ "$mode" == publish && -z "$tag" ]]; then
   printf 'formal release requires an exact version tag\n' >&2
@@ -35,7 +45,7 @@ if [[ "$mode" == dry-run ]]; then
   # an unrelated 2022 crate; the lib target keeps the name `rfb`). Publish order
   # follows the dependency chain: rfb-runtime <- rfb-sdk <- rfb-rig.
   for crate in rfb-runtime rfb-sdk rfb-rig; do
-    cargo package -p "$crate" --locked --allow-dirty
+    cargo package -p "$crate" --locked
     cargo publish -p "$crate" --locked --dry-run
   done
   printf 'Release checks passed for workspace version %s\n' "$version"
@@ -59,7 +69,7 @@ publish_crate() {
     printf '%s %s already on crates.io; skipping\n' "$1" "$version"
     return 0
   fi
-  cargo package -p "$1" --locked --allow-dirty
+  cargo package -p "$1" --locked
   # --token on the command line: the CARGO_REGISTRIES_CRATES_IO_TOKEN env var
   # was not honored by the runner's cargo during one release run ("no token
   # found"); a CLI flag cannot be lost to environment plumbing.

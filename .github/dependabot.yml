@@ -8,6 +8,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # libc >= 0.2.187 changed the POSIX_SPAWN_* constant types (i32 -> i16),
+      # which breaks rustpython-vm 0.5.0 (the newest release) in the
+      # --all-features build. Remove this rule once rustpython ships a fix.
+      - dependency-name: libc
+        versions: [">= 0.2.187"]
   - package-ecosystem: npm
     directory: /sdk/nodejs
     schedule:

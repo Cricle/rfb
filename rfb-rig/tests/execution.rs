@@ -4,8 +4,8 @@
 
 use futures::executor::block_on;
 use rfb::{
-    guest, BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, ImageManifest, Sandbox,
-    SandboxError, TransportKind,
+    guest, BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, Sandbox, SandboxError,
+    TransportKind,
 };
 use rfb_rig::{ExecutionError, ExecutionTarget, GuestExecution};
 use serde_json::json;
@@ -62,9 +62,6 @@ impl Sandbox for FakeSandbox {
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
         let result = self.result.clone();
         Box::pin(async move { result })
-    }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
     }
     fn ls<'a>(
         &'a self,

@@ -148,7 +148,8 @@ pub enum Kind {
     Result = 13,
 }
 impl Kind {
-    fn parse(v: u8) -> io::Result<Self> {
+    /// Decode one wire kind byte; unknown bytes fail closed.
+    pub fn parse(v: u8) -> io::Result<Self> {
         match v {
             1 => Ok(Self::Hello),
             2 => Ok(Self::HelloAck),

@@ -110,10 +110,9 @@ pub async fn serve<R, W>(
     service: Arc<Mutex<RuntimeService>>,
 ) -> io::Result<()>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = reader;
     let mut writer = writer;
     // The ZBRT host provider/CLI never send a wire Hello before Execute, so
     // auto-negotiate protocol readiness with the runtime service itself.
@@ -132,6 +131,29 @@ where
     // TERMINATED_RETENTION so the bookkeeping stays bounded per connection.
     let mut terminated_order: std::collections::VecDeque<[u8; 16]> =
         std::collections::VecDeque::new();
+
+    // Frame reading lives in a dedicated task: `read_frame_async` is not
+    // cancellation-safe (header and payload are separate reads), so the
+    // select! below must never drop it mid-frame — a dropped read loses
+    // partially consumed bytes and desyncs the stream for the rest of the
+    // connection. Receiving from the channel IS cancellation-safe.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<io::Result<Frame>>(8);
+    tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match read_frame_async(&mut reader).await {
+                Ok(frame) => {
+                    if frame_tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = frame_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
 
     let io_result = loop {
         tokio::select! {
@@ -174,11 +196,12 @@ where
                     None => break Ok(()),
                 }
             }
-            frame = read_frame_async(&mut reader) => {
+            frame = frame_rx.recv() => {
                 let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
-                    Err(error) => break Err(error),
+                    Some(Ok(frame)) => frame,
+                    Some(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                    Some(Err(error)) => break Err(error),
+                    None => break Ok(()),
                 };
                 let reply = match frame.kind {
                     Kind::Hello => handle_hello(frame.request_id, &frame.payload),
@@ -306,7 +329,12 @@ async fn forward_event<W: AsyncWrite + Unpin>(
 }
 
 fn handle_hello(request_id: [u8; 16], payload: &[u8]) -> Option<Frame> {
-    let hello = Hello::decode(payload).ok()?;
+    let hello = match Hello::decode(payload) {
+        Ok(hello) => hello,
+        // Fail closed like Execute/Fs/Cancel: a peer that sent garbage gets a
+        // ZBRT Error frame instead of hanging until its I/O timeout.
+        Err(_) => return Some(fail_closed_error(request_id, "invalid Hello payload")),
+    };
     if hello.client.trim().is_empty() {
         return Some(fail_closed_error(request_id, "client is required"));
     }
@@ -368,20 +396,29 @@ async fn handle_execute(
     // Attach a live output sink that queues into the same ordered worker
     // channel as the terminal result, so Output frames always precede the
     // single terminal frame for this request.
+    //
+    // try_send, never blocking_send: a full channel means the serve loop is
+    // backpressured writing to a slow vsock peer. Blocking here would park
+    // the exec thread past every cancel/deadline check (the cancel flag is
+    // only observed between chunks), turning a slow consumer into an
+    // uncancellable turn. Overflow drops the chunk instead — live streaming
+    // is lossy under extreme backpressure, the terminal result is not: it is
+    // sent with blocking_send below, after start_turn has returned.
     let tx = worker_tx.clone();
     let rid = request_id;
     executor.attach_event_sink(Some(Arc::new(move |event| {
-        // A send error means the serve loop (and its channel) is gone; the
-        // output event is dropped. Loud enough to be diagnosable, quiet
-        // enough to stay out of the frame path.
-        if tx
-            .blocking_send(WorkerMessage::Output {
-                request_id: rid,
-                event,
-            })
-            .is_err()
-        {
-            eprintln!("rfb zeroboot: worker channel closed; dropping output event");
+        if let Err(send_error) = tx.try_send(WorkerMessage::Output {
+            request_id: rid,
+            event,
+        }) {
+            if matches!(
+                send_error,
+                tokio::sync::mpsc::error::TrySendError::Closed(_)
+            ) {
+                eprintln!("rfb zeroboot: worker channel closed; dropping output event");
+            }
+            // Full(...) = serve loop backpressured; drop the chunk silently
+            // (a stderr line per dropped chunk would itself feed the firehose).
         }
     })));
     requests.insert(
@@ -528,7 +565,9 @@ fn cancel_ack(request_id: [u8; 16]) -> Frame {
 }
 
 fn handle_health(request_id: [u8; 16], payload: &[u8]) -> Option<Frame> {
-    let _ = Health::decode(payload).ok()?;
+    if Health::decode(payload).is_err() {
+        return Some(fail_closed_error(request_id, "invalid Health payload"));
+    };
     let health = Health {
         healthy: true,
         message: Some("ready".into()),
@@ -563,15 +602,21 @@ fn normalize_workspace_path(path: &str) -> String {
 /// Build a [`SessionRequest`] the workspace executor can run from a ZBRT
 /// `Execute` mapped to the shell-free workspace executor, including stdin and
 /// the exact millisecond deadline.
+///
+/// stdin travels base64-encoded (`stdin_b64`): the wire payload is arbitrary
+/// bytes, and both the historical JSON byte array (up to ~30x allocation
+/// amplification inside the guest) and a lossy UTF-8 conversion are wrong.
 fn execute_to_turn(request_id: [u8; 16], exec: Execute) -> SessionRequest {
-    // stdin travels as a JSON byte array: the wire payload is arbitrary
-    // bytes, and a lossy UTF-8 conversion would corrupt binary input.
     let mut prompt = serde_json::json!({
         "op": "exec",
         "args": exec.argv,
         "cwd": normalize_workspace_path(&exec.cwd.unwrap_or_else(|| ".".to_string())),
-        "stdin": exec.stdin.iter().map(|b| serde_json::Value::from(*b)).collect::<Vec<_>>(),
     });
+    if !exec.stdin.is_empty() {
+        use base64::Engine as _;
+        prompt["stdin_b64"] =
+            serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(&exec.stdin));
+    }
     if exec.timeout_ms > 0 {
         prompt["timeout_ms"] = serde_json::json!(exec.timeout_ms);
     }

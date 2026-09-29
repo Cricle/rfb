@@ -89,11 +89,18 @@ fi
 # python3 + curl + ca-certificates：Python 套件与后续 dotnet 安装脚本所需；
 # openjdk-17-jdk-headless + maven：Java 套件。dotnet 不在 apt 里，下一步单独装。
 if [ "${E2E_SKIP_APT:-0}" != "1" ]; then
-  log "安装 apt 依赖（python3 / curl / ca-certificates / openjdk-17-jdk-headless / maven / nodejs / npm）..."
+  log "安装 apt 依赖（python3 / curl / ca-certificates / JDK / maven / nodejs / npm）..."
   export DEBIAN_FRONTEND=noninteractive
   $SUDO apt-get update -qq
+  # JDK 大版本随 Debian 变化（bookworm=17, trixie=21），按序回退。
   $SUDO apt-get install -y -qq --no-install-recommends \
-    python3 curl ca-certificates openjdk-17-jdk-headless maven nodejs npm
+    python3 curl ca-certificates nodejs npm || {
+    echo "[e2e] 基础依赖安装失败"; exit 12;
+  }
+  $SUDO apt-get install -y -qq --no-install-recommends openjdk-17-jdk-headless \
+    || $SUDO apt-get install -y -qq --no-install-recommends openjdk-21-jdk-headless \
+    || { echo "[e2e] JDK 安装失败（17/21 均不可用）"; exit 12; }
+  $SUDO apt-get install -y -qq --no-install-recommends maven
   # .NET 运行时强依赖 ICU，缺失即在 dotnet 首次启动时 FailFast/SIGABRT（rc 134）。
   # ICU 包名随 Debian 版本变化（bookworm=libicu72, trixie=libicu76），按序回退。
   $SUDO apt-get install -y -qq --no-install-recommends libicu72 \
@@ -169,17 +176,36 @@ else
   log "清理 C# bin/obj 陈旧产物..."
   find "$SDK_DIR/csharp" -type d \( -name bin -o -name obj \) -prune \
     -exec rm -rf {} + 2>/dev/null || true
-  log "运行 C# SDK 测试（dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj）..."
-  # 注意：.NET 8 SDK 无法解析 .slnx 解决方案格式（MSB1006/MSB4068），必须直接
-  # 指向测试工程 csproj，而不是 dotnet test 整个解决方案。
-  if (cd "$SDK_DIR/csharp" && dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj \
-      --logger "trx;LogFileName=e2e-csharp.trx") \
-      2>&1 | tee "$OUT_DIR/dotnet.log"; then
-    SUMMARY+=("dotnet : PASS")
-    PASS=$((PASS + 1))
-  else
-    SUMMARY+=("dotnet : FAIL（详见 $OUT_DIR/dotnet.log）")
+  # 多目标编译：CI 只跑 net8.0 测试，netstandard2.1 目标只有本步骤会编译，
+  # 否则 ns2.1 专属的破坏会一路漏到发布 job 才暴露。
+  log "编译 C# SDK 全部目标框架（netstandard2.1 + net8.0）..."
+  if ! (cd "$SDK_DIR/csharp" && dotnet build src/Rfb.Sdk/Rfb.Sdk.csproj) \
+      2>&1 | tee "$OUT_DIR/dotnet-build.log"; then
+    SUMMARY+=("dotnet : FAIL（多目标编译失败，详见 $OUT_DIR/dotnet-build.log）")
     FAIL=$((FAIL + 1))
+  else
+    log "运行 C# SDK 测试（dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj）..."
+    # 注意：.NET 8 SDK 无法解析 .slnx 解决方案格式（MSB1006/MSB4068），必须直接
+    # 指向测试工程 csproj，而不是 dotnet test 整个解决方案。
+    if (cd "$SDK_DIR/csharp" && dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj \
+        --logger "trx;LogFileName=e2e-csharp.trx") \
+        2>&1 | tee "$OUT_DIR/dotnet.log"; then
+      # 防空跑：通过计数从 TRX 的 <Counters total=.../> 读取，避免依赖
+      # dotnet 本地化后的控制台文案（"Passed!"/"已通过!"）。
+      trx="$SDK_DIR/csharp/tests/Rfb.Sdk.Tests/TestResults/e2e-csharp.trx"
+      dotnet_tests=$( { grep -m1 -oE 'total="[0-9]+"' "$trx" 2>/dev/null || true; } \
+        | grep -oE '[0-9]+' || true)
+      if [ "${dotnet_tests:-0}" -gt 0 ]; then
+        SUMMARY+=("dotnet : PASS ($dotnet_tests tests)")
+        PASS=$((PASS + 1))
+      else
+        SUMMARY+=("dotnet : FAIL（0 tests，防空跑；详见 $OUT_DIR/dotnet.log）")
+        FAIL=$((FAIL + 1))
+      fi
+    else
+      SUMMARY+=("dotnet : FAIL（详见 $OUT_DIR/dotnet.log）")
+      FAIL=$((FAIL + 1))
+    fi
   fi
 fi
 

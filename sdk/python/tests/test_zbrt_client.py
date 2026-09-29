@@ -28,6 +28,18 @@ class ZbrtClientTests(unittest.TestCase):
     def test_ping_health_ack(self):
         self.assertTrue(self.client.ping())
 
+    def test_reply_with_mismatched_request_id_is_decode_error(self):
+        # PROTOCOL.md §3.4: replies must echo the request id.
+        self.server.mismatch_reply_id = True
+        with self.assertRaises(DecodeError):
+            self.client.ping()
+
+    def test_stream_frame_with_mismatched_request_id_is_decode_error(self):
+        self.server.mismatch_reply_id = True
+        stream = self.client.open_stream(["cat"], "/")
+        with self.assertRaises(DecodeError):
+            stream.next_event()
+
     def test_exec_collects_output_then_exit(self):
         code, stdout, stderr = self.client.exec(["echo", "hi"], "/", 10, b"")
         self.assertEqual(code, 0)
@@ -49,15 +61,6 @@ class ZbrtClientTests(unittest.TestCase):
         with self.assertRaises(RemoteError) as ctx:
             self.client.exec([], "/", 10, b"")
         self.assertIn("argv is empty", str(ctx.exception))
-
-    def test_eval_maps_to_eval_op_argv(self):
-        _code, stdout, _stderr = self.client.eval("print(1)", None, None)
-        self.assertEqual(stdout, b"eval out\n")
-        argv, cwd, _stdin, timeout_ms = self.server.received_executes[0]
-        # Shared contract (sdk/shared/README.md §1): argv=["eval", code].
-        self.assertEqual(argv, ["eval", "print(1)"])
-        self.assertIsNone(cwd)
-        self.assertEqual(timeout_ms, 0)
 
     def test_exec_timeout_ms_ceil_to_whole_seconds(self):
         # Rust baseline: timeout_ms = ceil(secs) * 1000 with a minimum of 1s.

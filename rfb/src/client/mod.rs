@@ -20,8 +20,8 @@ mod validation;
 mod zbrt;
 
 pub use error::RfbError;
-pub use facade::{GuestStream, RfbClient, Sandbox};
-pub use types::{CreateOptions, ExecResult, GuestTransport, StreamEvent, StreamEventKind};
+pub use facade::{GuestSandbox, GuestStream, RfbClient};
+pub use types::{CreateOptions, GuestExecResult, GuestTransport, StreamEvent, StreamEventKind};
 
 // Controller DTOs keep their `sdk/PROTOCOL.md` §1.3 serde shape; `Snapshot` is
 // the unified public name for the forkd snapshot record.

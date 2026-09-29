@@ -67,12 +67,22 @@ class _GuestNdjsonClient:
         self._timeout_s = timeout_s
 
     def _effective_timeout(self, timeout_s):
+        # Mirrors the Rust baseline (forkd/guest.rs): client timeout + exec
+        # deadline + a fixed 5 s margin, so the guest's own timeout error is
+        # what surfaces (not the client's).
         if timeout_s is None:
             return self._timeout_s
-        return max(self._timeout_s, float(timeout_s) + 5.0)
+        return self._timeout_s + float(timeout_s) + 5.0
 
     def _read_line(self, rfile) -> bytes:
-        raw = rfile.readline(MAX_LINE_BYTES + 1)
+        try:
+            raw = rfile.readline(MAX_LINE_BYTES + 1)
+        except (TimeoutError, socket.timeout) as e:
+            # Every timeout must surface as a TransportError so callers can
+            # catch the RfbError hierarchy (UNIFIED_API.md §7).
+            raise TransportError("guest read timeout") from e
+        except OSError as e:
+            raise TransportError(f"guest read failed: {e}") from e
         if not raw:
             raise RemoteError("guest closed before response")
         if len(raw) > MAX_LINE_BYTES or not raw.endswith(b"\n"):
@@ -134,7 +144,8 @@ class _GuestNdjsonClient:
             # wire — ceil with a minimum of 1, same as the eval path.
             "timeout": max(1, math.ceil(float(timeout_s))),
         }
-        return self._request(action, self._effective_timeout(timeout_s))[-1]
+        # `_request` applies the timeout slack exactly once.
+        return self._request(action, timeout_s)[-1]
 
     def eval(self, code: str, cwd, timeout_s) -> dict:
         action = {"action": "eval", "code": code}
@@ -144,7 +155,7 @@ class _GuestNdjsonClient:
             # RFB durations are milliseconds; forkd's eval timeout is seconds,
             # so round up to whole seconds with a minimum of 1.
             action["timeout"] = max(1, math.ceil(float(timeout_s)))
-        return self._request(action, self._effective_timeout(timeout_s))[-1]
+        return self._request(action, timeout_s)[-1]
 
     def tool(self, action: dict) -> dict:
         return self._request(action)[-1]
@@ -193,7 +204,12 @@ class _NdjsonStream:
         if self._terminal or self._closed:
             return None
         while True:
-            raw = self._rfile.readline(MAX_LINE_BYTES + 1)
+            try:
+                raw = self._rfile.readline(MAX_LINE_BYTES + 1)
+            except (TimeoutError, socket.timeout) as e:
+                raise TransportError("guest stream read timeout") from e
+            except OSError as e:
+                raise TransportError(f"guest stream read failed: {e}") from e
             if not raw:
                 self._terminal = True
                 self._close()

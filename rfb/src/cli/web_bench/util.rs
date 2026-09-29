@@ -88,9 +88,14 @@ pub(crate) async fn check_ready(client: &Client, base: &str, path: &str) -> Resu
 /// Sample CPU ticks (utime+stime), RSS bytes, and open fd count of `pid`.
 pub(crate) fn sample_pid(pid: u32) -> Option<ResourceSample> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = stat.split_whitespace().collect();
-    let utime: u64 = fields.get(13)?.parse().ok()?;
-    let stime: u64 = fields.get(14)?.parse().ok()?;
+    // comm (field 2) is wrapped in parentheses and may itself contain spaces
+    // or ')': only fields AFTER the last ')' have stable indices.
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // Field numbering restarts at 3 (state) after the comm parenthesis pair:
+    // utime/stime are /proc fields 14/15 → indices 11/12 here.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
     let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let rss_kib: u64 = status
         .lines()

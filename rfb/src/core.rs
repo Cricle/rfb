@@ -17,8 +17,8 @@ pub mod prelude {
     pub use super::guest;
     pub use super::{
         BackendKind, BoxFuture, Capability, ContractError, ExecResult, ExecSpec, ImageManifest,
-        ManifestError, PixelFormat, ProviderError, Resources, Sandbox, SandboxError,
-        SandboxProvider, SandboxSpec, TransportKind,
+        ManifestError, ProviderError, Resources, Sandbox, SandboxError, SandboxProvider,
+        SandboxSpec, TransportKind,
     };
 }
 
@@ -50,41 +50,6 @@ pub enum TransportKind {
     Vsock,
     /// A custom transport supplied by the application.
     Custom,
-}
-
-/// Framebuffer pixel layout advertised by a sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PixelFormat {
-    /// 3 bytes per pixel: red, green, blue.
-    Rgb8,
-    /// 3 bytes per pixel: blue, green, red.
-    Bgr8,
-    /// 4 bytes per pixel: red, green, blue, alpha (default).
-    #[default]
-    Rgba8,
-    /// 4 bytes per pixel: blue, green, red, alpha.
-    Bgra8,
-    /// 1 byte per pixel: grayscale.
-    Gray8,
-}
-
-impl PixelFormat {
-    /// Bytes per pixel for this format.
-    ///
-    /// ```
-    /// use rfb::PixelFormat;
-    /// assert_eq!(PixelFormat::Rgb8.bytes_per_pixel(), 3);
-    /// assert_eq!(PixelFormat::Rgba8.bytes_per_pixel(), 4);
-    /// assert_eq!(PixelFormat::Gray8.bytes_per_pixel(), 1);
-    /// ```
-    pub const fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Rgb8 | Self::Bgr8 => 3,
-            Self::Rgba8 | Self::Bgra8 => 4,
-            Self::Gray8 => 1,
-        }
-    }
 }
 
 /// Image manifest describing the guest image a sandbox runs.
@@ -239,16 +204,8 @@ impl Resources {
 pub enum Capability {
     /// Run a command in the guest.
     Execute,
-    /// Read the guest framebuffer.
-    ReadFramebuffer,
-    /// Write the guest framebuffer.
-    WriteFramebuffer,
-    /// Resize the guest display.
-    Resize,
     /// Snapshot the guest.
     Snapshot,
-    /// Deliver signals to the guest.
-    Signal,
     /// Report guest health.
     Health,
     /// Stream guest command output.
@@ -445,14 +402,6 @@ pub trait Sandbox: Send + Sync {
     fn capabilities(&self) -> &[Capability];
     /// Execute a command in the guest.
     fn exec<'a>(&'a self, spec: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>>;
-    /// Read the guest framebuffer.
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async {
-            Err(SandboxError::UnsupportedCapability(
-                Capability::ReadFramebuffer,
-            ))
-        })
-    }
     /// Report guest health.
     fn health<'a>(&'a self) -> BoxFuture<'a, Result<guest::Health, SandboxError>> {
         Box::pin(async { Err(SandboxError::UnsupportedCapability(Capability::Health)) })
@@ -533,6 +482,13 @@ pub trait Sandbox: Send + Sync {
     }
 }
 
+/// The shared 16 MiB buffer budget of every guest transport: frame payloads
+/// (ZBRT `MAX_PAYLOAD`), controller bodies, exec output accumulation, and
+/// stream aggregates all bound at this one number so a wire change moves one
+/// constant (the wire codec in rfb-runtime keeps its own canonical copy of
+/// the same value — the two must never diverge).
+pub const MAX_GUEST_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 /// Creates sandboxes for a backend.
 pub trait SandboxProvider: Send + Sync {
     /// Backend kind this provider creates.
@@ -546,6 +502,21 @@ pub trait SandboxProvider: Send + Sync {
         &'a self,
         spec: SandboxSpec,
     ) -> BoxFuture<'a, Result<Box<dyn Sandbox>, ProviderError>>;
+}
+
+/// The shared front half of every [`SandboxProvider::create`]: validate the
+/// spec fail-closed, then reject it when it asks for a capability the
+/// provider does not advertise. Every provider calls this so the semantics
+/// (and error variants) stay identical across backends.
+pub(crate) fn check_create_spec(
+    spec: &SandboxSpec,
+    supported: &[Capability],
+) -> Result<(), ProviderError> {
+    spec.validate().map_err(ProviderError::InvalidSpec)?;
+    if let Some(capability) = spec.capabilities.iter().find(|c| !supported.contains(c)) {
+        return Err(ProviderError::UnsupportedCapability(*capability));
+    }
+    Ok(())
 }
 
 /// Error validating or interpreting an image manifest.

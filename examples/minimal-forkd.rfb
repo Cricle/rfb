@@ -1,0 +1,10 @@
+schema = "rfb-build/v1"
+mode = "forkd-agent"
+output = "out/my-forkd.ext4"
+force = true
+
+[rust]
+apps = ["full/hello"]
+
+[files]
+"full/assets/banner.txt" = "/etc/motd"

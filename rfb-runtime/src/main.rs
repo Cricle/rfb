@@ -46,6 +46,13 @@ async fn main() -> io::Result<()> {
         ));
     }
     if forkd_agent {
+        // Forkd children all mount the snapshot's shared rootfs ext4. Without
+        // the PID-1 mounts the agent's `/workspace` sits on that shared image,
+        // so guest writes dirty the ext4 underneath a snapshotted VM state and
+        // the directory inodes corrupt (EBADMSG) for every later sandbox.
+        // The PID-1 init mounts proc/sys/dev and a per-VM workspace tmpfs;
+        // it is a no-op for non-PID-1 callers (host-side tests).
+        rfb_runtime::guest::init_pid1_with_console(false)?;
         return agent::run(
             &rfb_runtime::config::RuntimeConfig::from_environment().forkd_agent_addr,
         )

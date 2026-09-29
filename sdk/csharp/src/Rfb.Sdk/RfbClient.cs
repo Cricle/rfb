@@ -57,6 +57,10 @@ public sealed class RfbClient : IDisposable
     /// <summary>Poll every 100 ms until ready; "failed" → RemoteException; timeout → TransportException.</summary>
     public async Task<Snapshot> WaitSnapshot(string tag, double timeoutS = 60)
     {
+        // Fail closed like the Java/Python baselines: NaN/Infinity would
+        // otherwise leak ArgumentException/OverflowException instead of an
+        // RfbException subtype.
+        GuestValidation.Timeout(timeoutS);
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(timeoutS);
         while (true)
         {

@@ -443,6 +443,7 @@ class FakeZbrtServer:
         self.fail_fs_message = None  # str -> Error frame for Fs
         self.fail_next = None  # str -> Error frame for the next request, then clear
         self.hold_execute_open = False  # hold non-echo Execute until Cancel
+        self.mismatch_reply_id = False  # reply with a corrupted request_id
         self.connections = 0
         self.received_fs_ops = []
         self.received_cancels = []
@@ -504,6 +505,8 @@ class FakeZbrtServer:
                     if frame is None:
                         return
                     kind, request_id, payload = frame
+                    if outer.mismatch_reply_id:
+                        request_id = bytes(byte ^ 0xFF for byte in request_id)
                     if outer.fail_next is not None:
                         message = outer.fail_next
                         outer.fail_next = None

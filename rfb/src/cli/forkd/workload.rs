@@ -7,6 +7,7 @@ use crate::cli::forkd::sandbox::{
     create_sandbox, destroy_sandbox, guest_call, list_sandboxes, wait_for_guest_ready,
     GUEST_READY_DEADLINE,
 };
+use crate::cli::image_build::hex_lower;
 use crate::forkd_guest::ForkdGuestClient;
 use serde_json::{json, Value};
 
@@ -36,7 +37,7 @@ pub async fn workload(
 
     for si in 0..sandboxes {
         let result = async {
-            let sandbox = create_sandbox(url, tag, 1, Some(32))
+            let sandbox = create_sandbox(url, tag, 1, Some(32), false)
                 .await?
                 .into_iter()
                 .next()
@@ -120,7 +121,13 @@ pub async fn workload(
 
                 let stream = async {
                     let mut s = ForkdGuestClient::new(address.clone())
-                        .stream(vec!["/bin/echo".into(), format!("round-{ri}")], None, Some(false), None)
+                        .stream(
+                            vec!["/bin/echo".into(), format!("round-{ri}")],
+                            None,
+                            Some(false),
+                            None,
+                            None,
+                        )
                         .await
                         .map_err(|e| external(e.to_string()))?;
                     loop {
@@ -153,7 +160,7 @@ pub async fn workload(
                 use sha2::{Digest, Sha256};
                 let mut h = Sha256::new();
                 h.update(serde_json::to_vec(&summary).map_err(|e| io(e.to_string()))?);
-                format!("{:x}", h.finalize())
+                hex_lower(h.finalize())
             };
             let write = guest_call(
                 &address,
@@ -203,14 +210,20 @@ pub async fn workload(
         }
     }
 
-    // Orphan check.
+    // Orphan check. A list failure must fail the gate: reporting PASS without
+    // orphans evidence would claim the documented orphan=0 result blindly.
     let orphans: Vec<String> = match list_sandboxes(url).await {
         Ok(remaining) => remaining
             .iter()
             .filter(|s| created.contains(&s.id))
             .map(|s| s.id.clone())
             .collect(),
-        Err(_) => vec![],
+        Err(error) => {
+            return Err(external(format!(
+                "WORKLOAD_RFB FAIL orphan check failed: {}",
+                error.message
+            )));
+        }
     };
     let total_ops: usize = op_count.values().sum();
     if failed || !orphans.is_empty() {

@@ -9,6 +9,8 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "RFB sandbox contracts and integrations"
+keywords = ["sandbox", "firecracker", "microvm", "vsock", "zeroboot"]
+categories = ["development-tools", "virtualization"]
 
 [lib]
 name = "rfb"
@@ -20,10 +22,10 @@ forkd = ["dep:reqwest", "dep:tokio", "dep:url"]
 # The ZBRT V1 protocol types live in rfb-runtime (`zeroboot_protocol`); `rfb`
 # re-exports them so host/provider consumers share one wire implementation
 # without a `rfb` <-> `rfb-runtime` dependency cycle.
-zeroboot = ["dep:anyhow", "dep:tokio", "dep:tokio-vsock", "dep:uuid", "dep:rfb-runtime", "dep:tempfile"]
+zeroboot = ["dep:anyhow", "dep:tokio", "dep:tokio-vsock", "dep:uuid", "dep:rfb-runtime", "dep:tempfile", "dep:sha2", "dep:libc"]
 # The CLI reuses the runtime's RFB1 framed codec and session contract for its
 # rfb1 acceptance/verify commands instead of reimplementing the wire format.
-cli = ["dep:clap", "dep:sha2", "dep:rfb-runtime", "rfb-runtime/host-vsock", "forkd", "zeroboot"]
+cli = ["dep:clap", "dep:sha2", "dep:toml", "dep:rfb-runtime", "rfb-runtime/host-vsock", "forkd", "zeroboot"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +36,8 @@ tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"], op
 url = { version = "2", optional = true }
 anyhow = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
+toml = { version = "0.9", optional = true, default-features = false, features = ["parse", "serde"] }
 uuid = { version = "1", features = ["v4"], optional = true }
 rfb-runtime = { path = "../rfb-runtime", version = "0.0.1", optional = true, default-features = false, features = ["core"] }
 # Only the zeroboot provider (and, through it, the cli feature) uses
@@ -43,6 +46,7 @@ tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }
 
 [[bin]]
 name = "rfb-cli"

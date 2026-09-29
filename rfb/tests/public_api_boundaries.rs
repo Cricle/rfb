@@ -13,17 +13,13 @@ use rfb::guest::{
 // CI compiles it.
 #[allow(unused_imports)]
 use rfb::{
-    BackendKind, Capability, ContractError, ExecSpec, ImageManifest, PixelFormat, Resources,
-    SandboxError, SandboxSpec, TransportKind,
+    BackendKind, Capability, ContractError, ExecSpec, ImageManifest, Resources, SandboxError,
+    SandboxSpec, TransportKind,
 };
 use std::time::Duration;
 
 #[test]
 fn core_enums_and_resource_limits_have_stable_wire_forms() {
-    assert_eq!(PixelFormat::default(), PixelFormat::Rgba8);
-    assert_eq!(PixelFormat::Rgb8.bytes_per_pixel(), 3);
-    assert_eq!(PixelFormat::Bgra8.bytes_per_pixel(), 4);
-    assert_eq!(PixelFormat::Gray8.bytes_per_pixel(), 1);
     assert_eq!(
         serde_json::to_value(BackendKind::VirtualMachine).unwrap(),
         "virtual_machine"

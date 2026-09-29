@@ -93,12 +93,49 @@ impl PathPolicy {
             return Err(PolicyError::Escape);
         }
         let candidate = root.join(relative);
-        if candidate
+        if !candidate
             .components()
             .collect::<Vec<_>>()
             .starts_with(&root.components().collect::<Vec<_>>())
         {
-            Ok(candidate)
+            return Err(PolicyError::Escape);
+        }
+        // Symlink containment: a workspace-relative name may traverse a
+        // symlink the guest created via exec, pointing outside the workspace.
+        // Canonicalize the deepest existing ancestor and require the resolved
+        // path to stay under the canonical root. When the root itself does
+        // not exist (host-less tests) there is nothing to resolve and the
+        // lexical check above is the only guarantee. Residual TOCTOU (a
+        // symlink swapped between check and open) is accepted as intra-VM
+        // robustness only: pooled connections into ONE guest run concurrent
+        // exec turns on the same workspace, so one connection's exec can race
+        // another's fs op — the threat model is a sandbox confusing itself,
+        // never a host escape (guest code already runs inside the VM).
+        let canonical_root = match std::fs::canonicalize(root) {
+            Ok(canonical) => canonical,
+            Err(_) => return Ok(candidate),
+        };
+        let mut existing = candidate.clone();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut resolved = loop {
+            match std::fs::canonicalize(&existing) {
+                Ok(resolved) => break resolved,
+                Err(_) => match existing.file_name() {
+                    Some(name) => {
+                        missing.push(name.to_os_string());
+                        if !existing.pop() {
+                            return Err(PolicyError::Escape);
+                        }
+                    }
+                    None => return Err(PolicyError::Escape),
+                },
+            }
+        };
+        for part in missing.into_iter().rev() {
+            resolved.push(part);
+        }
+        if resolved.starts_with(&canonical_root) {
+            Ok(resolved)
         } else {
             Err(PolicyError::Escape)
         }

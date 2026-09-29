@@ -2,10 +2,11 @@
 //! debugfs/readelf helpers shared by image building and `rfb-cli` checks.
 
 use crate::cli::error::{external, io, validation, CliError};
+use crate::cli::image_build::build::debugfs_quote;
 use crate::cli::image_build::manifest::sha256;
 use crate::cli::tool::tool_available;
 use serde_json::{json, Value};
-use std::{path::Path, process::Command};
+use std::{fs, path::Path, process::Command};
 
 /// Read the rootfs protocol marker and entrypoint stat (contract gate).
 ///
@@ -136,26 +137,54 @@ pub fn build_static_runtime(
             "missing Rust target {target}; install it with rustup target add {target}"
         )));
     }
-    if target.contains("musl")
-        && std::env::var_os("CC_x86_64_UNKNOWN_LINUX_MUSL").is_none()
-        && !tool_available("musl-gcc")
-    {
-        return Err(validation(
-            "missing musl-gcc; install musl-tools or set CC_x86_64_UNKNOWN_LINUX_MUSL",
-        ));
+    if target.contains("musl") && !tool_available("musl-gcc") {
+        // The caller may provide its own cross C compiler / linker via the
+        // target-specific env keys; only fail when neither is wired. Note the
+        // cc crate reads the target in its original (lowercase) form for
+        // `CC_*`, while cargo uppercases it for `CARGO_TARGET_*_LINKER`.
+        let cc_target = target.replace('-', "_");
+        let upper = target.to_uppercase().replace('-', "_");
+        let cc_set = std::env::var_os(format!("CC_{cc_target}")).is_some()
+            || std::env::var_os(format!("CC_{}", target)).is_some();
+        let linker_set = std::env::var_os(format!("CARGO_TARGET_{upper}_LINKER")).is_some();
+        if !cc_set && !linker_set {
+            return Err(validation(
+                "missing musl-gcc; install musl-tools or set CC_<target>/CARGO_TARGET_<TARGET>_LINKER",
+            ));
+        }
     }
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            target,
-            "-p",
-            package,
-            "--features",
-            features.trim(),
-        ])
-        .current_dir(root)
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--release",
+        "--target",
+        target,
+        "-p",
+        package,
+        "--features",
+        features.trim(),
+    ])
+    .current_dir(root);
+    // Wire the musl cross toolchain by default. Without this, the cc crate
+    // compiles the embedded C code (vendored Lua, interpreter shims) against
+    // host glibc and the link dies with `undefined reference to errno` /
+    // `_dl_x86_cpu_features` from glibc's static libm. An env the caller set
+    // explicitly always wins. The cc crate reads the target in its original
+    // lowercase form (`CC_x86_64_unknown_linux_musl`, or dashed
+    // `CC_x86_64-unknown-linux-musl`); a fully uppercased key is ignored.
+    if target.contains("musl") {
+        let cc_target = target.replace('-', "_");
+        if std::env::var_os(format!("CC_{cc_target}")).is_none()
+            && std::env::var_os(format!("CC_{}", target)).is_none()
+        {
+            cmd.env(format!("CC_{cc_target}"), "musl-gcc");
+        }
+        let upper = target.to_uppercase().replace('-', "_");
+        if std::env::var_os(format!("CARGO_TARGET_{upper}_LINKER")).is_none() {
+            cmd.env(format!("CARGO_TARGET_{upper}_LINKER"), "musl-gcc");
+        }
+    }
+    let status = cmd
         .status()
         .map_err(|error| external(format!("cargo build failed to start: {error}")))?;
     if !status.success() {
@@ -222,6 +251,123 @@ pub(super) fn is_dynamically_linked(path: &Path) -> Result<bool, CliError> {
     }
 }
 
+/// Whether the binary's bytes contain `needle` — used to verify a runtime was
+/// really built with an optional embedded interpreter before an image install
+/// hardlinks it as an applet (a dead hardlink fails closed only at guest time).
+/// Streams 64 KiB chunks with needle-length overlap, so the binary is never
+/// fully resident (it is ~20 MB with interpreters baked in).
+pub(super) fn binary_contains(path: &Path, needle: &[u8]) -> Result<bool, CliError> {
+    let mut file = fs::File::open(path).map_err(|error| io(error.to_string()))?;
+    const CHUNK: usize = 64 * 1024;
+    let mut previous = Vec::new();
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let len = read_fill(&mut file, &mut buffer).map_err(|error| io(error.to_string()))?;
+        if len == 0 {
+            return Ok(false);
+        }
+        let mut window = Vec::with_capacity(previous.len() + len);
+        window.extend_from_slice(&previous);
+        window.extend_from_slice(&buffer[..len]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        // Keep the last needle.len()-1 bytes so a needle spanning the chunk
+        // boundary is still found.
+        let keep = needle.len().saturating_sub(1).min(window.len());
+        previous = window[window.len() - keep..].to_vec();
+    }
+}
+
+/// Fill `buf` from `reader`, returning the filled length (short only at EOF).
+fn read_fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match std::io::Read::read(reader, &mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// Byte-compare an installed image file against its source in 64 KiB chunks —
+/// neither side is ever fully resident (the runtime binary alone is ~20 MB),
+/// so image builds stay flat-memory regardless of payload size. Mirrors
+/// [`run_debugfs`]'s error semantics: a byte mismatch, a failed debugfs
+/// status, or non-banner stderr is a verification failure even when the
+/// streams happen to look equal.
+pub fn verify_installed_file(
+    image: &Path,
+    source: &Path,
+    destination: &str,
+) -> Result<(), CliError> {
+    let mut child = Command::new("debugfs")
+        .args(["-R", &format!("cat {}", debugfs_quote(destination))])
+        .arg(image)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| external(format!("debugfs failed to start: {error}")))?;
+    let mut actual = child.stdout.take().expect("piped stdout");
+    let stderr_handle = child.stderr.take().expect("piped stderr");
+    // Drain stderr on its own thread: a chatty debugfs must never deadlock
+    // the stdout compare loop against a full pipe buffer.
+    let stderr_bytes = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut { stderr_handle }, &mut buffer);
+        buffer
+    });
+    let mut expected = fs::File::open(source).map_err(|error| io(error.to_string()))?;
+    const CHUNK: usize = 64 * 1024;
+    let mut expected_buf = vec![0u8; CHUNK];
+    let mut actual_buf = vec![0u8; CHUNK];
+    let mut mismatch = false;
+    loop {
+        let expected_len = read_fill(&mut expected, &mut expected_buf);
+        let actual_len = read_fill(&mut actual, &mut actual_buf);
+        match (expected_len, actual_len) {
+            (Ok(expected_len), Ok(actual_len))
+                if expected_len == actual_len
+                    && expected_buf[..expected_len] == actual_buf[..actual_len] =>
+            {
+                if expected_len == 0 {
+                    break;
+                }
+            }
+            _ => {
+                mismatch = true;
+                break;
+            }
+        }
+    }
+    if mismatch {
+        let _ = child.kill();
+    }
+    let stderr = stderr_bytes.join().unwrap_or_default();
+    let status = child
+        .wait()
+        .map_err(|error| external(format!("debugfs wait failed: {error}")))?;
+    let stderr_banner_only = String::from_utf8_lossy(&stderr)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .all(|line| line.starts_with("debugfs "));
+    if mismatch {
+        return Err(external(format!(
+            "image file verification failed: {destination}"
+        )));
+    }
+    if !status.success() || (!stderr.is_empty() && !stderr_banner_only) {
+        return Err(external(format!(
+            "debugfs cat failed ({destination}): {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Run a debugfs request against an image, optionally capturing stdout.
 ///
 /// # Errors
@@ -232,11 +378,12 @@ pub fn run_debugfs(image: &Path, request: &str, capture_stdout: bool) -> Result<
     // debugfs write mode; this prevents a validation/inspection path from
     // opening an image writable.
     let mut command = Command::new("debugfs");
-    if request
-        .split_whitespace()
-        .next()
-        .is_some_and(|op| matches!(op, "mkdir" | "write" | "set_inode_field" | "ln"))
-    {
+    if request.split_whitespace().next().is_some_and(|op| {
+        matches!(
+            op,
+            "mkdir" | "write" | "set_inode_field" | "ln" | "rm" | "unlink"
+        )
+    }) {
         command.arg("-w");
     }
     let output = command

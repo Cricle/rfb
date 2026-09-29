@@ -102,6 +102,34 @@ pub enum ImageCommand {
     /// All-in-one: build the static runtime, assemble the rootfs, and (with
     /// `--kernel`) verify the whole stack under Firecracker.
     BuildAll(BuildAllArgs),
+    /// Build an image from a declarative `build.rfb` TOML script (interpreters,
+    /// offline packages, Rust apps, extra files) in one command.
+    BuildScript(BuildScriptArgs),
+}
+
+/// Arguments for `rfb-cli image build-script`.
+#[derive(clap::Args, Debug)]
+pub struct BuildScriptArgs {
+    /// Workspace root (the directory containing the workspace Cargo.toml);
+    /// the cargo build stage runs here.
+    #[arg(
+        long,
+        default_value = ".",
+        value_name = "ROOT",
+        help = "Workspace root (Cargo.toml parent)"
+    )]
+    pub root: PathBuf,
+    /// Path to the build script (TOML; default `build.rfb` in the current
+    /// directory). Relative host paths inside resolve against the script's
+    /// own directory.
+    #[arg(value_name = "SCRIPT", default_value = "build.rfb")]
+    pub script: PathBuf,
+    /// Override the script's `force` flag and overwrite an existing output.
+    #[arg(
+        long,
+        help = "Overwrite an existing output regardless of the script's force flag"
+    )]
+    pub force: bool,
 }
 
 /// forkd controller/guest orchestration subcommands.
@@ -133,7 +161,7 @@ pub enum ForkdCommand {
 #[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub enum Rfb1Command {
-    /// Run RFB1 StartTurn/full-protocol acceptance against a real Firecracker v1.16.1 VM.
+    /// Run RFB1 StartTurn/full-protocol acceptance against a real Firecracker v1.12.x VM.
     Acceptance(Rfb1AcceptanceArgs),
 }
 
@@ -580,6 +608,13 @@ pub struct ForkdSandboxArgs {
     /// Snapshot tag to create the sandbox from (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
+    /// Give the sandbox its own network namespace. Required for concurrent
+    /// sandboxes: the shared host tap admits only one live sandbox at a time.
+    /// Needs a root-provisioned netns pool (`scripts/netns-setup.sh N` from the
+    /// forkd checkout); each guest is then reachable only through the
+    /// controller, which runs commands inside that namespace.
+    #[arg(long)]
+    pub per_child_netns: bool,
 }
 
 /// Arguments for `rfb-cli forkd sandbox-destroy`.

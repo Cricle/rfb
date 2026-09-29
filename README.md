@@ -6,7 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/rfb-sdk)](https://pypi.org/project/rfb-sdk/)
 [![NuGet](https://img.shields.io/nuget/v/Rfb.Sdk)](https://www.nuget.org/packages/Rfb.Sdk/)
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.cricle/rfb-sdk)](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **English** | [简体中文](README.zh.md)
 
@@ -22,13 +22,39 @@ rfb-rig = "0.0.1"
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
 
-CLI: `cargo install rfb-sdk --features cli` (binary: `rfb-cli`). The prebuilt **linux-x64** `rfb-cli` binary is also distributed through the package registries:
+CLI: `cargo install rfb-sdk --features cli` (binary: `rfb-cli`). The prebuilt **linux-x64** `rfb-cli` binary is also distributed as a binary-only package (no wrapper code):
 
 ```bash
-pip install rfb-cli          # PyPI wheel bundling the binary
 dotnet add package Rfb.Cli   # NuGet (binary in tools/, copied to output)
-npm install -g rfb-cli       # npm (binary-only package)
+npm install -g rfb-cli       # npm (bin entry points straight at the ELF)
 ```
+
+### Custom images from a `build.rfb` script
+
+One TOML file describes the image — interpreters, offline packages, prebuilt Rust apps, extra files — and `rfb-cli image build-script` drives the whole chain (static runtime build → rootfs assembly → verification):
+
+```toml
+schema = "rfb-build/v1"
+mode = "zeroboot-zbrt"
+output = "out/my-sandbox.ext4"
+force = true
+
+[interpreters]
+python = true        # /bin/python3 (embeds RustPython)
+lua = true           # /bin/lua (embeds mlua 5.4)
+
+[packages]
+py-site = "sites/py" # offline pure-Python packages -> /usr/lib/python3/site-packages
+lua-lib = "sites/lua"
+
+[rust]
+apps = ["hello"]     # prebuilt musl binaries -> /usr/local/bin
+
+[files]
+"assets/banner.txt" = "/etc/motd"
+```
+
+See [docs/example-build.rfb](docs/example-build.rfb) for the annotated reference script. Interpreter features are fail-closed: a runtime built without `rustpython`/`mlua` is rejected at image build time instead of installing dead applets.
 
 Published crates contain Rust sources and crate resources only — no Firecracker binary, Linux kernel, ext4 images, snapshots, or forkd service. Those must be provisioned explicitly by the deployment system.
 
@@ -72,6 +98,18 @@ rfb-cli doctor --json   # host capability report
 ```
 
 Protocol lines — RFB1 (framed vsock), forkd (TCP/NDJSON), and ZBRT (ZeroBoot binary frame) — are not interchangeable. Missing capabilities must fail closed.
+
+The ZeroBoot provider keeps one VM but opens a pool of ZBRT connections into it, because the V1 contract allows one active command per connection. Four environment variables size that VM for a host (defaults in parentheses): `RFB_ZBRT_VM_MEM_MIB` (128; the measured Firecracker floor is 48), `RFB_ZBRT_VM_VCPU` (1), `RFB_ZBRT_SESSIONS` (8, the number of commands that can run at once), and `RFB_ZBRT_SNAPSHOT_SHARDS` (2, only meaningful with hot start). `rfb-ben zbrt --vcpus 1,2 --mem-mib 512` measures the resulting scaling curve on a real KVM host.
+
+Setting `RFB_ZBRT_SNAPSHOT_DIR=<dir>` (on tmpfs) turns on snapshot hot start: the provider boots its parent VM once, pauses it, and snapshots it into `<dir>/parent/`; every later sandbox restores from that snapshot instead of paying a cold boot (~1 s -> a few hundred ms). The snapshot carries an identity fingerprint (kernel, rootfs, machine shape, port), so a config change rebuilds it automatically. Children share the parent's memory file copy-on-write and its rootfs image (guest writes land on the per-VM workspace tmpfs), so neither a memory nor an image copy is paid per create. Note: the vsock relay path is baked into the snapshot by the patched Firecracker build in `resx/`, so hot-mode creates serialize per snapshot dir; `RFB_ZBRT_SNAPSHOT_SHARDS=N` (default 2) gives each shard its own parent snapshot and lock, running restores fully in parallel (measured: 100 concurrent creates, 100/100 ok — ~106 ms/create at 2 shards, ~54 ms at 4 shards; gated in CI by `tests/zeroboot_concurrency.rs`). Snapshot files are owner-only (0700/0600) — `memory.bin` contains the VM's full memory.
+
+## Distributed / cluster sandboxes
+
+`rfb::cluster::ClusterProvider` spans N forkd controller nodes (`forkd-controller serve` on each host — no extra server component): it schedules sandbox creation to the least-in-flight healthy node (or round-robin), fails over to the remaining nodes when one is down, trips nodes after 3 consecutive failures, and recovers them via `probe()`. Exec/stream/filesystem traffic goes directly to the sandbox's guest address; teardown routes to the owning node. All nodes boot the same snapshot tag. See `sdk/BACKEND_SETUP.md` §7 and `rfb/tests/cluster.rs`.
+
+## Sandbox fork (zeroboot)
+
+`ZeroBootSandbox::fork(self)` checkpoints a live VM (pause → full snapshot) and restores TWO fresh VMs from that checkpoint, returning `(continued original, fork)` — both inherit the full live state, because the workspace tmpfs is guest memory captured by the dump (real-VM verified: files written before the fork are visible in the fork and in the fork of the fork). One fork costs ~0.5-1 s (the patched Firecracker build has no incremental diff, unlike forkd's live-fork), the checkpoint dir is shared-owned by both siblings and removed with the last one, and the sandbox is forkable only in hot mode (`RFB_ZBRT_SNAPSHOT_DIR`). See `sdk/BACKEND_SETUP.md` §6b-4 and `rfb/tests/zeroboot_fork.rs`.
 
 ## Runtime asset boundary
 

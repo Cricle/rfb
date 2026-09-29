@@ -24,6 +24,39 @@ description: 教 AI 使用 rfb-cli 与 forkd 控制器/沙箱交互：创建快�
 
 ## 快速流程
 
+### 0. 自定义镜像（build.rfb）
+
+需要带解释器（python/lua）、离线包、预编译 Rust 应用或附加文件的沙箱镜像时，
+写一个 `build.rfb`（TOML）让 `rfb-cli` 一条命令出镜像：
+
+```toml
+schema = "rfb-build/v1"
+mode = "zeroboot-zbrt"            # zeroboot-zbrt / forkd-agent / rfb-vsock
+output = "out/my-sandbox.ext4"
+force = true
+
+[interpreters]
+python = true                     # /bin/python3（内嵌 RustPython）
+lua = true                        # /bin/lua（内嵌 mlua 5.4）
+
+[packages]
+py-site = "sites/py"              # 离线纯 Python 包（pip 不可用）
+lua-lib = "sites/lua"
+
+[rust]
+apps = ["hello"]                  # 预编译 musl 二进制 → /usr/local/bin
+
+[files]
+"assets/banner.txt" = "/etc/motd"
+```
+
+```bash
+rfb-cli image build-script build.rfb   # 或 rfb-cli image build-script docs/example-build.rfb
+```
+
+相对路径按脚本所在目录解析；解释器 feature 没编进 runtime 时 fail-closed（不装死链接）。
+参考脚本：`docs/example-build.rfb`。
+
 ### 1. 宿主预检
 
 ```bash
@@ -44,6 +77,11 @@ rfb-cli forkd snapshot-info --tag my-snap
 ```bash
 rfb-cli forkd sandbox-create --tag my-snap
 # 输出 JSON 包含 sandbox id 和 guest_addr
+# 共享 tap 同时只允许一个存活沙箱；并发需先用 root 建 netns 池
+# （forkd 仓库的 scripts/netns-setup.sh N，需重启 controller），再加：
+#   rfb-cli forkd sandbox-create --tag my-snap --per-child-netns
+# 注意：netns 内 guest 只能由 controller 进 netns 代理访问，直连
+# guest_addr 的 NDJSON/ZBRT 传输在该模式下不可用。
 ```
 
 ### 4. 在沙箱内执行命令
@@ -94,8 +132,8 @@ rfb-cli forkd sandbox-destroy --id <sandbox-id>
 
 | 特性 | NDJSON (TCP) | ZBRT (vsock) |
 |---|---|---|
-| exec stdin | ✗（静默丢弃） | ✓ |
-| eval | ✓ | ✓（通过 Execute argv=["eval",code]） |
+| exec stdin | ✗（本地 fail closed，抛 Validation） | ✓ |
+| eval | ✓ | ✗（本地 fail closed：ZBRT v1 无 eval opcode） |
 | stream/交互 | ✓（started/out/err/exit） | ✓（Output/Exit 帧） |
 | 文件读写 | ✓ | ✓（Fs 帧） |
 | PTY | ✗ | ✗ |

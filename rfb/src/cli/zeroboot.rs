@@ -88,22 +88,10 @@ fn decode_response(
         )));
     }
     let kind_byte = header[5];
-    let kind = match kind_byte {
-        1 => Kind::Hello,
-        2 => Kind::HelloAck,
-        3 => Kind::Execute,
-        4 => Kind::Output,
-        5 => Kind::Exit,
-        6 => Kind::Cancel,
-        7 => Kind::CancelAck,
-        8 => Kind::Fs,
-        9 => Kind::FsResult,
-        10 => Kind::Health,
-        11 => Kind::HealthAck,
-        12 => Kind::Error,
-        13 => Kind::Result,
-        other => return Err(validation(format!("unknown ZBRT kind: {other}"))),
-    };
+    // Single-sourced kind table (rfb-runtime zeroboot_protocol); unknown
+    // bytes fail closed here.
+    let kind = crate::protocol::Kind::parse(kind_byte)
+        .map_err(|error| validation(format!("unknown ZBRT kind: {kind_byte}: {error}")))?;
     Ok((kind, payload))
 }
 
@@ -159,6 +147,20 @@ fn exchange(
             Kind::Output => {
                 let output = Output::decode(&payload)
                     .map_err(|error| validation(format!("{name}: invalid Output: {error}")))?;
+                // Same aggregate cap as the provider/SDK clients: a broken or
+                // hostile guest must not OOM the CLI through unbounded output
+                // accumulation.
+                if stdout
+                    .len()
+                    .saturating_add(stderr.len())
+                    .saturating_add(output.data.len())
+                    > crate::protocol::MAX_PAYLOAD
+                {
+                    return Err(validation(format!(
+                        "{name}: guest output exceeded the {} MiB limit",
+                        crate::protocol::MAX_PAYLOAD / (1024 * 1024)
+                    )));
+                }
                 if output.stream == 0 {
                     stdout.extend(output.data);
                 } else {
@@ -192,24 +194,10 @@ fn exchange(
 
 /// Validate the result payload shape for the simple command contract:
 /// `exit_code:i32, stdout_len:u32, stderr_len:u32` then stdout/stderr bytes.
+/// Delegates to the canonical decoder in the provider module.
 fn parse_result(payload: &[u8], name: &str) -> Result<(i32, Vec<u8>, Vec<u8>), CliError> {
-    if payload.len() < 12 {
-        return Err(validation(format!(
-            "{name}: Result payload too short ({} bytes)",
-            payload.len()
-        )));
-    }
-    let exit = i32::from_be_bytes(payload[0..4].try_into().unwrap());
-    let stdout_len = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
-    let stderr_len = u32::from_be_bytes(payload[8..12].try_into().unwrap()) as usize;
-    if payload.len() != 12 + stdout_len + stderr_len {
-        return Err(validation(format!(
-            "{name}: Result payload length mismatch"
-        )));
-    }
-    let stdout = payload[12..12 + stdout_len].to_vec();
-    let stderr = payload[12 + stdout_len..].to_vec();
-    Ok((exit, stdout, stderr))
+    crate::zeroboot::parse_legacy_result(payload)
+        .map_err(|error| validation(format!("{name}: {error}")))
 }
 
 /// Full ZBRT acceptance: echo/true/false, unsupported error, bounded deadline,

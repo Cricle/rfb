@@ -37,6 +37,7 @@ pub fn build_all(args: &BuildAllArgs) -> Result<Value, CliError> {
         with_lua,
         py_site_dir: args.py_site_dir.clone(),
         lua_lib_dir: args.lua_lib_dir.clone(),
+        extra_files: Vec::new(),
     };
     let rootfs = build_rootfs(
         &binary,

@@ -46,7 +46,19 @@ pub async fn wait_for_guest_ready(address: &str, deadline: Duration) -> Result<V
     }
 }
 
+/// Controller client for one-off CLI calls: no token (loopback controller
+/// deployments are unauthenticated by convention; a token-bearing deployment
+/// goes through FORKD_TOKEN via the facade, not these helpers), 30s budget.
+fn controller_client(url: &str) -> Result<ForkdClient, CliError> {
+    ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
+        .map_err(|error| validation(error.to_string()))
+}
+
 /// Create `n` sandboxes from a bootable snapshot. Returns the parsed response.
+///
+/// `per_child_netns` is required for concurrent sandboxes: the default shared
+/// host tap admits only one live sandbox at a time and the controller rejects
+/// further creates with 503 until it is deleted.
 ///
 /// # Errors
 ///
@@ -56,13 +68,13 @@ pub async fn create_sandbox(
     tag: &str,
     n: usize,
     memory_limit_mib: Option<u64>,
+    per_child_netns: bool,
 ) -> Result<Vec<SandboxInfo>, CliError> {
-    let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
-        .map_err(|error| validation(error.to_string()))?;
+    let client = controller_client(url)?;
     let request = CreateSandboxRequest {
         snapshot_tag: tag,
         n,
-        per_child_netns: false,
+        per_child_netns,
         memory_limit_mib,
         prewarm: false,
         live_fork: false,
@@ -81,8 +93,7 @@ pub async fn create_sandbox(
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn destroy_sandbox(url: &str, sandbox_id: &str) -> Result<(), CliError> {
-    let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
-        .map_err(|error| validation(error.to_string()))?;
+    let client = controller_client(url)?;
     match client.delete_sandbox(sandbox_id).await {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -103,8 +114,7 @@ pub async fn destroy_sandbox(url: &str, sandbox_id: &str) -> Result<(), CliError
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn list_sandboxes(url: &str) -> Result<Vec<SandboxInfo>, CliError> {
-    let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
-        .map_err(|error| validation(error.to_string()))?;
+    let client = controller_client(url)?;
     client
         .list_sandboxes()
         .await
@@ -117,8 +127,7 @@ pub async fn list_sandboxes(url: &str) -> Result<Vec<SandboxInfo>, CliError> {
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn ping_sandbox(url: &str, sandbox_id: &str) -> Result<Value, CliError> {
-    let client = ForkdClient::new(url.to_owned(), None, Duration::from_secs(30))
-        .map_err(|error| validation(error.to_string()))?;
+    let client = controller_client(url)?;
     client
         .ping(sandbox_id)
         .await

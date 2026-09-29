@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// Unified result of `exec` and `eval` across both guest transports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecResult {
+pub struct GuestExecResult {
     /// Process exit code (`-1` when the turn was cancelled).
     pub exit_code: i32,
     /// Collected stdout bytes.
@@ -15,7 +15,7 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
-impl ExecResult {
+impl GuestExecResult {
     /// Stdout decoded as UTF-8 (lossy).
     pub fn stdout_text(&self) -> String {
         String::from_utf8_lossy(&self.stdout).into_owned()

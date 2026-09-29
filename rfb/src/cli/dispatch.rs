@@ -19,6 +19,12 @@ use crate::cli::tool;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Controller-client timeout for forkd benchmark iterations. Sandbox create
+/// restores a snapshot and waits out the guest clock sync (10s on its own), so
+/// the historical 10s HTTP timeout made every iteration fail at "create" while
+/// looking like a benchmark result.
+const BENCHMARK_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Run the parsed top-level command.
 ///
 /// # Errors
@@ -111,6 +117,7 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
                 with_lua: args.with_lua,
                 py_site_dir: args.py_site_dir.clone(),
                 lua_lib_dir: args.lua_lib_dir.clone(),
+                extra_files: Vec::new(),
             };
             let value = image_build::build_rootfs(
                 &args.runtime,
@@ -142,6 +149,12 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
         ImageCommand::BuildAll(args) => {
             let value = image_build::build_all(&args)?;
             render_output(json_out, value, "image built".to_owned());
+            Ok(())
+        }
+        ImageCommand::BuildScript(args) => {
+            let force = if args.force { Some(true) } else { None };
+            let value = image_build::build_from_script(&args.root, &args.script, force)?;
+            render_output(json_out, value, "image built from script".to_owned());
             Ok(())
         }
     }
@@ -225,7 +238,10 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
             if args.n == 0 {
                 return Err(validation("--n must be a positive integer"));
             }
-            let value = block_on(forkd::benchmark(&url, tag, args.n, Duration::from_secs(10)))?;
+            // Sandbox create restores a snapshot and waits out the guest clock
+            // sync (10s alone), so the controller client needs far more than
+            // one HTTP timeout of 10s or every iteration fails at "create".
+            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
             render_output(json_out, value, "benchmark".to_owned());
             Ok(())
         }
@@ -245,7 +261,13 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
         ForkdCommand::SandboxCreate(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::create_sandbox(&url, tag, 1, Some(32)))?;
+            let value = block_on(forkd::create_sandbox(
+                &url,
+                tag,
+                1,
+                Some(32),
+                args.per_child_netns,
+            ))?;
             render_output(json_out, json!(value), "sandbox created".to_owned());
             Ok(())
         }
@@ -315,7 +337,7 @@ fn bench(json_out: bool, command: BenchCommand) -> Result<(), CliError> {
         BenchCommand::Forkd(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::benchmark(&url, tag, args.n, Duration::from_secs(10)))?;
+            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
             render_output(json_out, value, "benchmark".to_owned());
             Ok(())
         }
@@ -408,7 +430,7 @@ fn run_target(json_out: bool, target: RunTarget) -> Result<(), CliError> {
         RunTarget::Benchmark(args) => {
             let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::benchmark(&url, tag, args.n, Duration::from_secs(10)))?;
+            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
             render_output(json_out, value, "benchmark".to_owned());
             Ok(())
         }

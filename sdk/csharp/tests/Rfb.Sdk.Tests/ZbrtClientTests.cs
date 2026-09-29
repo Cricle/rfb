@@ -166,92 +166,43 @@ public class ZbrtClientTests
     {
         using var client = new ZbrtTcpClient("127.0.0.1:1", Timeout);
         var e = await Assert.ThrowsAsync<TransportException>(() => client.ConnectAsync());
-        Assert.Contains("connect failed", e.Message);
+        // WSL2's localhost NAT turns an unbound port into a timeout
+        // ("guest connect timeout") rather than an immediate reset
+        // ("connect failed") — both are valid transport failures.
+        Assert.True(
+            e.Message.Contains("connect failed") || e.Message.Contains("guest connect timeout"),
+            $"unexpected transport message: {e.Message}");
     }
 }
 
 /// <summary>
-/// sdk/shared/conformance/eval_zbrt_vectors.json — eval-over-ZBRT golden vectors:
-/// encode direction (full frame hex, field-level) plus validation-rejection cases
-/// (ValidationException with zero frames sent, fail closed).
+/// ZBRT fail-closed contract for eval: ZBRT v1 has no eval opcode and the
+/// reference guest maps Execute verbatim onto <c>exec</c>, so the old
+/// "facade convention" (argv=["eval", code]) surfaced the guest's
+/// <c>eval: not found</c> exit code as a successful result. The facade now
+/// rejects eval over ZBRT locally, with zero frames on the wire.
 /// </summary>
 public class EvalZbrtVectorTests
 {
-    private static readonly byte[] RequestId = Hex.ToBytes("000102030405060708090a0b0c0d0e0f");
-
-    // EVAL_ZBRT_BASIC: eval('1+1', cwd='/workspace', timeout_s=5)
-    private const string BasicHex =
-        "5a42525401030000000102030405060708090a0b0c0d0e0f0000002702000000046576616c00000003312b31010000000a2f776f726b73706163650000000000001388";
-
-    // EVAL_ZBRT_DEFAULTS: eval('print(40+2)') — no cwd, no timeout
-    private const string DefaultsHex =
-        "5a42525401030000000102030405060708090a0b0c0d0e0f0000002102000000046576616c0000000b7072696e742834302b3229000000000000000000";
-
-    private static ZbrtFrame EvalFrame(string code, string? cwd, double? timeoutS)
-    {
-        var timeoutMs = timeoutS.HasValue ? (uint)(Math.Ceiling(timeoutS.Value) * 1000) : 0u;
-        return new ZbrtFrame
-        {
-            Kind = ZbrtKind.Execute,
-            RequestId = RequestId,
-            Payload = ZbrtFrameCodec.EncodeExecute(new[] { "eval", code }, cwd, [], timeoutMs),
-        };
-    }
-
     [Fact]
-    public void Eval_Zbrt_MatchesSharedVector()
-    {
-        var frame = EvalFrame("1+1", "/workspace", 5);
-        Assert.Equal(BasicHex, Hex.Of(ZbrtFrameCodec.Encode(frame)));
-        var exec = ZbrtFrameCodec.DecodeExecute(frame.Payload);
-        Assert.Equal(2, exec.Argv.Count);
-        Assert.Equal(new[] { "eval", "1+1" }, exec.Argv);
-        Assert.Equal("/workspace", exec.Cwd);
-        Assert.Empty(exec.Stdin);
-        Assert.Equal(5000u, exec.TimeoutMs);
-
-        var defaults = EvalFrame("print(40+2)", null, null);
-        Assert.Equal(DefaultsHex, Hex.Of(ZbrtFrameCodec.Encode(defaults)));
-        var exec2 = ZbrtFrameCodec.DecodeExecute(defaults.Payload);
-        Assert.Equal(2, exec2.Argv.Count);
-        Assert.Equal(new[] { "eval", "print(40+2)" }, exec2.Argv);
-        Assert.Null(exec2.Cwd);
-        Assert.Empty(exec2.Stdin);
-        Assert.Equal(0u, exec2.TimeoutMs);
-    }
-
-    [Fact]
-    public async Task Eval_Zbrt_ValidationRejected_SendsNoFrames()
+    public async Task Eval_OverZbrt_FailsClosedWithoutSendingFrames()
     {
         using var guest = new FakeZbrtServer();
         var (sandbox, controller) = await NewSandboxOverZbrtAsync(guest);
         using (controller)
         {
-            // EVAL_ZBRT_VALIDATION_REJECTED: whitespace-only code
+            await Assert.ThrowsAsync<ValidationException>(
+                () => sandbox.Eval("1+1", cwd: "/workspace", timeoutS: 5));
+            await Assert.ThrowsAsync<ValidationException>(() => sandbox.Eval("print(40+2)"));
+
+            // Local validation still runs first and also stays off the wire.
             await Assert.ThrowsAsync<ValidationException>(() => sandbox.Eval("   "));
-            // EVAL_ZBRT_TIMEOUT_ZERO_REJECTED
             await Assert.ThrowsAsync<ValidationException>(() => sandbox.Eval("1", timeoutS: 0));
-            // negative / non-finite timeouts rejected too (Rust baseline timeout_secs)
             await Assert.ThrowsAsync<ValidationException>(() => sandbox.Eval("1", timeoutS: -1));
             await Assert.ThrowsAsync<ValidationException>(
                 () => sandbox.Eval("1", timeoutS: double.PositiveInfinity));
 
             Assert.Equal(0, guest.AcceptCount); // fail closed — nothing reached the wire
-        }
-    }
-
-    [Fact]
-    public async Task Eval_Zbrt_ResponseMapping_MatchesSharedVector()
-    {
-        using var guest = new FakeZbrtServer();
-        var (sandbox, controller) = await NewSandboxOverZbrtAsync(guest);
-        using (controller)
-        {
-            var result = await sandbox.Eval("1+1", cwd: "/workspace", timeoutS: 5);
-            Assert.Equal(0, result.ExitCode);
-            Assert.Equal("2"u8.ToArray(), result.Stdout);
-            Assert.Empty(result.Stderr);
-            Assert.False(result.TimedOut);
         }
     }
 

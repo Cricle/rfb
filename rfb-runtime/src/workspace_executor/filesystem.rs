@@ -95,8 +95,10 @@ impl WorkspaceGuestExecutor {
         // Temp file + rename so a crash mid-write leaves the previous content
         // intact instead of a truncated file (same directory = one filesystem).
         write_atomic(&path, &request.content).map_err(|e| e.to_string())?;
-        // Nothing mutated the workspace between projection and this write
-        // (the executor is serial), so the projected total is the new total.
+        // The size cache is shared per workspace root and this guard is held
+        // across the write, so no other executor (including one on another
+        // pooled connection) could have mutated the workspace in between: the
+        // projected total is the new total.
         *cache = Some(projected);
         Ok(())
     }

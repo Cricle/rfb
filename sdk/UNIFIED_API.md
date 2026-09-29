@@ -10,9 +10,9 @@
 
 | 类别 | 类型 |
 |---|---|
-| 客户端 / 门面 | `RfbClient`、`Sandbox`、`GuestStream` |
+| 客户端 / 门面 | `RfbClient`、`Sandbox`、`GuestStream`（Rust 门面为避免与 `rfb::Sandbox` trait 撞名，结构体名为 `client::GuestSandbox`，语义即本表的 `Sandbox`） |
 | 事件 | `StreamEvent`、`StreamEventKind`（`started` / `stdout` / `stderr` / `exit`） |
-| 结果 DTO | `ExecResult`、`DirEntry`、`GrepMatch`、`FileRead`（§6） |
+| 结果 DTO | `ExecResult`（Rust 门面同名 `client::GuestExecResult`）、`DirEntry`、`GrepMatch`、`FileRead`（§6） |
 | controller DTO | `Snapshot`、`SandboxInfo` |
 | 错误基类 + 5 子类 | 见 §7 |
 
@@ -48,8 +48,8 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 | 方法 | 签名要点 | 行为要点 |
 |---|---|---|
 | `ping()` | → `bool` | NDJSON：仅 `pong==true` 算健康（`healthy` 字段不作数）；ZBRT：HealthAck 的 `healthy` |
-| `exec(args, cwd="/", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **静默丢弃**（Rust 基线；仅 ZBRT 送达）；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时优先后者） |
-| `eval(code, cwd=None, timeout_s=None)` | code 去空白非空、≤ 1 MiB；timeout > 0 | 输出映射 `stdout`（`output`，旧 `out` 等价），`stderr` 恒空，exit 取 `status` 缺省 0；ZBRT 无 eval opcode → 一轮 Execute `argv=["eval", code]`、空 stdin（`sdk/shared/README.md §1`） |
+| `exec(args, cwd="/", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
+| `eval(code, cwd=None, timeout_s=None)` | code 去空白非空、≤ 1 MiB；timeout > 0 | 输出映射 `stdout`（`output`，旧 `out` 等价），`stderr` 恒空，exit 取 `status`（旧 `exit_code` 等价，缺省 0）；**ZBRT 下本地 fail closed**（ValidationError，零帧上线：v1 无 eval opcode，见 `sdk/shared/README.md §1`） |
 | `ls(path=".")` / `find(path, pattern)` / `grep(path, pattern)` | fs 路径 + pattern 校验 | `max_results=1000`（grep 另 `max_bytes=51200`）；find 返回 `[str]`，grep 返回 `[GrepMatch]` |
 | `read(path, offset=None, max_bytes=None)` | `max_bytes` 必须 `1..=51200` | → `FileRead{data, truncated, total_bytes}` |
 | `write(path, data, append=False, mode=None)` | 负载 ≤ 51200 字节 | → `bytes_written`（缺失 → Decode） |
@@ -113,7 +113,7 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 2. `create_sandbox(tag)[0]` → exec `["echo","hello"]` → `exit_code=0`、`stdout="hello\n"`；
 3. `write("notes.txt", b"hello")` → `read` 回读字节相等（append 可选）；
 4. `ls / find / grep` 返回同形结果；
-5. `eval("1+1")` → stdout 承载输出；ZBRT 下帧字节命中共享向量；
+5. `eval("1+1")` → stdout 承载输出（NDJSON）；ZBRT 下本地 fail closed（Validation，零帧，见 §1）；
 6. `stream`：started → stdout（send_input 回显）→ stop → exit；
 7. `delete()` → 2xx/404 均成功；
 8. 全部校验失败路径（空 argv、逃逸路径、超限、非法 transport、ZBRT pty/env）在**发送前**抛 Validation。

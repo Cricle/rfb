@@ -45,7 +45,7 @@ pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value,
         return Ok(json!({"status": "skipped", "reason": "snapshot unavailable"}));
     }
 
-    let sandbox = create_sandbox(url, tag, 1, Some(32))
+    let sandbox = create_sandbox(url, tag, 1, Some(32), false)
         .await?
         .into_iter()
         .next()
@@ -84,6 +84,7 @@ pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value,
                 vec!["/bin/echo".into(), "rfb-cli-acceptance".into()],
                 None,
                 Some(false),
+                None,
                 None,
             )
             .await

@@ -66,8 +66,8 @@ public sealed class Sandbox
         return await Zbrt.HealthAsync().ConfigureAwait(false);
     }
 
-    /// <summary>Run `args` in the guest; stdin is ZBRT-only (NDJSON drops it).</summary>
-    public async Task<ExecResult> Exec(IReadOnlyList<string> args, string cwd = "/", double timeoutS = 60.0, byte[]? stdin = null)
+    /// <summary>Run `args` in the guest; stdin is ZBRT-only (NDJSON fails closed). <c>cwd</c> defaults to the workspace root.</summary>
+    public async Task<ExecResult> Exec(IReadOnlyList<string> args, string cwd = "/workspace", double timeoutS = 60.0, byte[]? stdin = null)
     {
         if (args.Count == 0)
         {
@@ -79,14 +79,21 @@ public sealed class Sandbox
 
         if (Transport == "ndjson")
         {
-            // Rust baseline: the NDJSON exec wire contract has no stdin
-            // channel; non-empty stdin is silently dropped (delivered only
-            // over ZBRT).
+            // The NDJSON exec wire contract has no stdin channel: non-empty
+            // stdin would run the command WITHOUT its input, so fail closed
+            // (mirrors the Rust baseline).
+            if (stdin is { Length: > 0 })
+            {
+                throw new ValidationException("stdin is only supported over the ZBRT transport");
+            }
             var v = await Guest.ExecAsync(cwd, args, ForkdGuestNdjson.TimeoutSecs(timeoutS)).ConfigureAwait(false);
             return GuestResults.ParseExec(v);
         }
 
         var outcome = await Zbrt.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS)).ConfigureAwait(false);
+        // ZBRT v1 has no timed-out wire flag: the guest's executor surfaces a
+        // deadline miss as an Error frame (an exception here), so the flag is
+        // structurally false on this transport (mirrors the Rust baseline).
         return new ExecResult(outcome.ExitCode, outcome.Stdout, outcome.Stderr, false);
     }
 
@@ -107,9 +114,10 @@ public sealed class Sandbox
             return GuestResults.ParseEval(v);
         }
 
-        var argv = new List<string> { "eval", code };
-        var outcome = await Zbrt.ExecuteAsync(argv, cwd, [], TimeoutMs(timeoutS)).ConfigureAwait(false);
-        return new ExecResult(outcome.ExitCode, outcome.Stdout, outcome.Stderr, false);
+        // ZBRT v1 has no eval opcode and the reference guest maps Execute
+        // verbatim onto `exec` — fail closed instead of running a literal
+        // `eval <code>` command (mirrors the Rust facade).
+        throw new ValidationException("eval is not supported over the ZBRT transport");
     }
 
     /// <summary>Directory entries under `path` (default ".").</summary>

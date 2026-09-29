@@ -203,7 +203,6 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
     // config, vsock, then InstanceStart.
     let mut boot_args = rfb_runtime::boot_args::BootArgs::new()
         .random_trust_cpu()
-        .root_rw("/dev/vda")
         .init(init_path);
     if vsock_flag_present {
         boot_args = boot_args.vsock();
@@ -223,7 +222,7 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
             "drive_id": "rootfs",
             "path_on_host": rootfs.to_string_lossy(),
             "is_root_device": true,
-            "is_read_only": false,
+            "is_read_only": true,
         }),
     )?;
     api_put(
@@ -288,14 +287,23 @@ pub fn boot_firecracker(
 }
 
 /// Effective guest memory for CLI-driven Firecracker boots (RFB1 acceptance
-/// and ZeroBoot verify). Defaults to 512 MiB; `RFB_FIRECRACKER_MEMORY_MB`
-/// overrides it for capacity evaluation, matching the runtime controller env.
+/// and ZeroBoot verify). One knob with the provider path: `RFB_ZBRT_VM_MEM_MIB`
+/// wins (so CLI verify and provider creates always agree on the same VM
+/// shape — the provider-only name once made small-mem verify runs silently
+/// boot at the default); `RFB_FIRECRACKER_MEMORY_MB` is still honored for
+/// capacity evaluation, matching the runtime controller env. Default 128 MiB
+/// (the provider default; measured floor is 48).
 fn mem_size_mib() -> u32 {
-    std::env::var("RFB_FIRECRACKER_MEMORY_MB")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|mib| *mib > 0)
-        .unwrap_or(512)
+    for name in ["RFB_ZBRT_VM_MEM_MIB", "RFB_FIRECRACKER_MEMORY_MB"] {
+        if let Some(mib) = std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|mib| *mib > 0)
+        {
+            return mib;
+        }
+    }
+    128
 }
 
 fn api_put(socket: &Path, path: &str, body: &Value) -> Result<(), CliError> {

@@ -1,9 +1,13 @@
 // Forkd HTTP controller and TCP guest provider for RFB.
-use super::{
+use crate::forkd::{
+    CreateSandboxRequest, ForkdClientError, ForkdGuestError, ForkdGuestStream, SandboxInfo,
+    SnapshotInfo,
+};
+use crate::{controller, forkd_guest as guest};
+use crate::{
     guest as core_guest, BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, ProviderError,
     Sandbox, SandboxError, SandboxProvider, SandboxSpec, TransportKind,
 };
-use crate::{controller, forkd_guest as guest};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 
@@ -74,7 +78,10 @@ impl Default for ForkdConfig {
             token: None,
             timeout: Duration::from_secs(10),
             snapshot_tag: None,
-            guest_timeout: Duration::from_secs(10),
+            // Aligned with the ZeroBoot provider's Config::default timeout so
+            // an ExecSpec without an explicit deadline gets the same default
+            // on both backends (this is also the per-frame read budget).
+            guest_timeout: Duration::from_secs(30),
             guest_profile: profile,
             guest_capabilities: profile.capabilities(),
         }
@@ -131,11 +138,11 @@ impl ForkdClient {
         Self::new(ForkdConfig::from_env())
     }
 
-        /// Construct a forkd client from the given configuration.
-        ///
-        /// # Errors
-        ///
-        /// Returns `Err` when the operation fails; the error type carries the cause.
+    /// Construct a forkd client from the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
     pub fn new(config: ForkdConfig) -> Result<Self, ForkdClientError> {
         let controller = controller::ForkdClient::new(
             config.base_url.clone(),
@@ -146,6 +153,10 @@ impl ForkdClient {
             config: Arc::new(config),
             controller,
         })
+    }
+    /// The configured controller base URL.
+    pub fn base_url(&self) -> &str {
+        &self.config.base_url
     }
     /// Validate a sandbox identifier's character syntax.
     ///
@@ -295,6 +306,15 @@ impl ForkdSandbox {
     pub fn id(&self) -> &str {
         &self.info.id
     }
+    /// Base URL of the controller node that owns this sandbox (cluster
+    /// bookkeeping and node-scoped operations).
+    pub fn node_base_url(&self) -> &str {
+        &self.client.config.base_url
+    }
+    /// Raw controller metadata for this sandbox.
+    pub fn info(&self) -> &SandboxInfo {
+        &self.info
+    }
     /// Build a guest client connected to this sandbox's TCP address.
     pub fn guest(&self) -> ForkdGuest {
         let mut g = ForkdGuest::new(self.info.guest_addr.clone());
@@ -324,12 +344,18 @@ impl Sandbox for ForkdSandbox {
             args.extend(spec.args);
             // The forkd guest confines every path (including exec cwd) to the
             // workspace root; the agent rejects "/" as "invalid guest path".
+            // Default deadline = the configured guest timeout, not a magic
+            // constant, so the knob and the ZeroBoot default stay aligned.
             let v = self
                 .guest()
                 .exec_in(
                     spec.cwd.as_deref().unwrap_or("/workspace"),
                     args,
-                    spec.timeout.map(duration_to_timeout_secs).unwrap_or(10),
+                    spec.timeout
+                        .map(duration_to_timeout_secs)
+                        .unwrap_or_else(|| {
+                            duration_to_timeout_secs(self.client.config.guest_timeout)
+                        }),
                 )
                 .await
                 .map_err(forkd_error)?;
@@ -421,7 +447,21 @@ impl Sandbox for ForkdSandbox {
             };
             let stream = self
                 .guest()
-                .stream(args, spec.cwd.as_deref(), spec.pty, env)
+                .stream(
+                    args,
+                    spec.cwd.as_deref(),
+                    spec.pty,
+                    env,
+                    // The stream's per-event read budget covers the guest
+                    // exec deadline (zeroboot bounds the same request by an
+                    // absolute deadline; here each quiet gap gets the same
+                    // ceiling instead of the fixed client timeout).
+                    Some(
+                        self.client.config.guest_timeout
+                            + spec.timeout.unwrap_or_default()
+                            + crate::forkd_guest::EXEC_READ_MARGIN,
+                    ),
+                )
                 .await
                 .map_err(|e| SandboxError::Transport(e.to_string()))?;
             Ok(Box::new(ForkdGuestStreamAdapter(stream)) as Box<dyn core_guest::GuestStream + 'a>)
@@ -512,8 +552,11 @@ impl core_guest::GuestStream for ForkdGuestStreamAdapter {
     }
 }
 
-fn duration_to_timeout_secs(duration: Duration) -> u64 {
-    duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() != 0)).max(1)
+pub(crate) fn duration_to_timeout_secs(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0))
+        .max(1)
 }
 
 fn forkd_error(error: ForkdGuestError) -> SandboxError {
@@ -606,14 +649,7 @@ impl SandboxProvider for ForkdClient {
         spec: SandboxSpec,
     ) -> BoxFuture<'a, Result<Box<dyn Sandbox>, ProviderError>> {
         Box::pin(async move {
-            spec.validate().map_err(ProviderError::InvalidSpec)?;
-            if let Some(c) = spec
-                .capabilities
-                .iter()
-                .find(|c| !self.capabilities().contains(c))
-            {
-                return Err(ProviderError::UnsupportedCapability(*c));
-            }
+            crate::core::check_create_spec(&spec, self.capabilities())?;
             let tag = self
                 .config
                 .snapshot_tag

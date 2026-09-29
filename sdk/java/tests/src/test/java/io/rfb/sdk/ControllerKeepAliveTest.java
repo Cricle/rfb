@@ -140,7 +140,7 @@ class ControllerKeepAliveTest {
             for (int i = 0; i < 5; i++) {
                 List<Snapshot> snapshots = http.listSnapshots();
                 assertEquals(1, snapshots.size());
-                assertEquals("base", snapshots.get(0).tag);
+                assertEquals("base", snapshots.get(0).getTag());
             }
             // All 5 requests must have ridden one pooled keep-alive connection.
             assertEquals(1, server.accepts.get());

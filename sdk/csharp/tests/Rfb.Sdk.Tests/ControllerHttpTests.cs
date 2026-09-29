@@ -163,7 +163,14 @@ public class ControllerHttpTests
     {
         var http = new ForkdControllerHttp("http://127.0.0.1:1", null, TimeSpan.FromSeconds(5));
         var e = await Assert.ThrowsAsync<TransportException>(() => http.ListSnapshotsAsync());
-        Assert.Contains("forkd request failed", e.Message);
+        // A refused connection is a transport failure; on WSL2's localhost NAT
+        // an unbound port yields a timeout ("forkd request timeout") instead
+        // of an immediate reset ("forkd request failed") — both are valid
+        // TransportException shapes for "controller unreachable".
+        Assert.True(
+            e.Message.Contains("forkd request failed")
+                || e.Message.Contains("forkd request timeout"),
+            $"unexpected transport message: {e.Message}");
     }
 
     [Fact]

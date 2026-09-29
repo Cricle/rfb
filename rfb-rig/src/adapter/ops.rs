@@ -144,6 +144,14 @@ async fn edit(sb: Arc<dyn Sandbox>, value: Value) -> Result<ToolOutput, ToolExec
     let read = guest::ReadRequest::new(args.path.clone());
     read.validate().map_err(|e| invalid(e.to_string()))?;
     let content = sb.read_file(read).await.map_err(map_sandbox_error)?;
+    // A truncated read means the backend hit its per-read byte cap: writing
+    // the replacement back would destroy the unseen tail of the file, so
+    // fail closed instead.
+    if content.truncated {
+        return Err(invalid(
+            "file exceeds the backend read cap; edit is not supported for this file",
+        ));
+    }
     let text = String::from_utf8(content.data).map_err(|_| invalid("file is not valid UTF-8"))?;
     if args.old_text.is_empty() {
         return Err(invalid("old_text must not be empty"));

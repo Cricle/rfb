@@ -17,6 +17,10 @@
 pub mod agent;
 /// Guest kernel command line builder shared by every Firecracker driver.
 pub mod boot_args;
+/// Shell-free builtins shared by the guest transports (forkd agent, ZBRT).
+/// Both transports imply `guest`, which is what pulls in `serde_json`.
+#[cfg(feature = "guest")]
+pub mod builtin;
 /// RFB1 frame encoder/decoder with runtime limits.
 pub mod codec;
 /// Runtime configuration (ports, paths, timeouts — all overridable).
@@ -60,8 +64,6 @@ pub mod resources;
 /// Guest runtime state machine (identity, sequencing, lifecycle).
 #[cfg(feature = "guest")]
 pub mod runtime_service;
-/// Sandbox backend classification.
-pub mod sandbox;
 /// RFB1 session/control wire contracts.
 pub mod session;
 /// Linux guest transport over tokio-vsock.

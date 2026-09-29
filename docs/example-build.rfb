@@ -1,0 +1,46 @@
+# build.rfb — RFB sandbox image build script (declarative, offline).
+#
+# Build it with:   rfb-cli image build-script docs/example-build.rfb
+# (run from the repository root; relative paths inside the script resolve
+#  against the script's own directory)
+#
+# The command drives the full chain: static musl runtime build (cargo
+# features derived from [interpreters]) -> ext4 rootfs assembly -> digest
+# verification -> sidecar artifacts (.sha256 / .manifest.json / artifact.json).
+
+schema = "rfb-build/v1"
+# Image protocol layout: "zeroboot-zbrt" (ZBRT/vsock), "forkd-agent"
+# (NDJSON/TCP), or "rfb-vsock" (RFB1 framed). Interpreters require
+# "zeroboot-zbrt".
+mode = "zeroboot-zbrt"
+# Output image path (relative to this script's directory).
+output = "out/my-sandbox.ext4"
+# Overwrite an existing output (CLI --force overrides this too).
+force = true
+# Optional image size in MiB; default sizes from the installed content.
+#size-mb = 64
+# Optional Rust target triple; default x86_64-unknown-linux-musl.
+#target = "x86_64-unknown-linux-musl"
+
+[interpreters]
+# Embed RustPython and install /bin/python3 (adds the `rustpython` feature).
+python = true
+# Embed Lua 5.4 and install /bin/lua (adds the `mlua` feature).
+lua = true
+
+[packages]
+# Offline pure-Python packages baked to /usr/lib/python3/site-packages
+# (the guest sys.path root). No network in the sandbox — no pip.
+py-site = "sites/py"
+# Offline pure-Lua modules baked to /usr/lib/lua/5.4 (package.path root).
+lua-lib = "sites/lua"
+
+[rust]
+# Guest sandboxes carry no toolchain, so Rust support means deploying
+# prebuilt static (musl) binaries: each entry is installed as
+# /usr/local/bin/<file name> with mode 0755.
+apps = ["hello"]
+
+[files]
+# Arbitrary extra payload files: host path -> absolute guest path (mode 0644).
+"assets/banner.txt" = "/etc/motd"

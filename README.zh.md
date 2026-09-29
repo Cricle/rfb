@@ -6,7 +6,7 @@
 [![PyPI](https://img.shields.io/pypi/v/rfb-sdk)](https://pypi.org/project/rfb-sdk/)
 [![NuGet](https://img.shields.io/nuget/v/Rfb.Sdk)](https://www.nuget.org/packages/Rfb.Sdk/)
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.cricle/rfb-sdk)](https://central.sonatype.com/artifact/io.github.cricle/rfb-sdk)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
 [English](README.md) | **简体中文**
 
@@ -22,13 +22,39 @@ rfb-rig = "0.0.1"
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
 
-CLI：`cargo install rfb-sdk --features cli`（二进制名 `rfb-cli`）。预编译的 **linux-x64** `rfb-cli` 二进制也通过包管理器分发：
+CLI：`cargo install rfb-sdk --features cli`（二进制名 `rfb-cli`）。预编译的 **linux-x64** `rfb-cli` 二进制也以纯二进制包分发（不含任何包装壳）：
 
 ```bash
-pip install rfb-cli          # PyPI wheel 内置二进制
 dotnet add package Rfb.Cli   # NuGet（二进制位于 tools/，复制到输出目录）
-npm install -g rfb-cli       # npm（仅二进制包）
+npm install -g rfb-cli       # npm（bin 入口直连 ELF）
 ```
+
+### 用 `build.rfb` 脚本自定义镜像
+
+一个 TOML 文件声明整张镜像——解释器、离线包、预编译 Rust 应用、附加文件——`rfb-cli image build-script` 一条命令跑完整条链（静态 runtime 构建 → rootfs 组装 → 校验）：
+
+```toml
+schema = "rfb-build/v1"
+mode = "zeroboot-zbrt"
+output = "out/my-sandbox.ext4"
+force = true
+
+[interpreters]
+python = true        # /bin/python3（内嵌 RustPython）
+lua = true           # /bin/lua（内嵌 mlua 5.4）
+
+[packages]
+py-site = "sites/py" # 离线纯 Python 包 → /usr/lib/python3/site-packages
+lua-lib = "sites/lua"
+
+[rust]
+apps = ["hello"]     # 预编译 musl 二进制 → /usr/local/bin
+
+[files]
+"assets/banner.txt" = "/etc/motd"
+```
+
+带注释的参考脚本见 [docs/example-build.rfb](docs/example-build.rfb)。解释器 fail-closed：runtime 没编 `rustpython`/`mlua` feature 时镜像构建直接报错，绝不装死链接。
 
 crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Linux kernel、ext4 镜像、快照或 forkd 服务；这些必须由部署系统显式提供。
 
@@ -72,6 +98,14 @@ rfb-cli doctor --json   # 宿主能力报告
 ```
 
 协议线——RFB1（framed vsock）、forkd（TCP/NDJSON）、ZBRT（ZeroBoot binary frame）——互不通用；缺少能力时必须 fail closed。
+
+## 热启动、100 并发与集群沙箱
+
+默认值即实测最佳配置：`RFB_ZBRT_VM_MEM_MIB=128`（Firecracker 实测下限 48）、`RFB_ZBRT_VM_VCPU=1`、`RFB_ZBRT_SESSIONS=8`（单 VM 并发命令数；实测 16 会话有效并发 14.97）、`RFB_ZBRT_SNAPSHOT_SHARDS=2`（热启动下每分片独立父快照与锁，恢复完全并行——实测 100 并发 create **100/100**，2 分片摊薄 ~106ms/个、4 分片 ~54ms；CI 门禁 `tests/zeroboot_concurrency.rs`）。快照文件自动收紧为 0700/0600（`memory.bin` 含 VM 全量内存）。2GB 内存机器：热启动 + 48MiB/VM，100 个活 VM 峰值 **PSS 仅 ~170MiB**（RSS 会把共享页重复计入 8 倍以上，勿按 RSS 判断容量）。
+
+`rfb::cluster::ClusterProvider` 把 N 台 forkd controller 节点组成集群：按最少在途（或轮询）调度沙箱创建，节点故障自动 failover，连续 3 次失败熔断、`probe()` 恢复；exec/stream/文件直连 guest 地址，销毁路由回所属节点。见 `sdk/BACKEND_SETUP.md` §7 与 `rfb/tests/cluster.rs`。
+
+**沙箱 fork（zeroboot）**：`ZeroBootSandbox::fork(self)` checkpoint 活动 VM（pause → 全量快照）后恢复出两个全新 VM，返回 `(原沙箱延续, fork)`——workspace tmpfs 属 guest 内存、被 dump 整体捕获，fork 继承 fork 时刻的全部状态（真机验证：fork 前写入的文件在 fork 与 fork 的 fork 中均可读）。单次 fork ~0.5-1s（补丁版无增量 diff，forkd 的 live-fork 才有）；checkpoint 目录由两个子沙箱共享持有、最后一个 drop 自动删除；仅热模式（`RFB_ZBRT_SNAPSHOT_DIR`）可 fork。见 `sdk/BACKEND_SETUP.md` §6b-4 与 `rfb/tests/zeroboot_fork.rs`。
 
 ## 大型运行时资产边界
 

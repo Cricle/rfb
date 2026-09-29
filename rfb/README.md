@@ -1,4 +1,6 @@
-# RFB CLI 0.1.0
+# RFB CLI
+
+`rfb-sdk` crate (lib name `rfb`, CLI binary `rfb-cli`) — command reference. The version follows the workspace release tag.
 
 RFB exposes one protocol line: **ZBRT VERSION=1 full protocol**. The CLI does not maintain a v1/v2 split. `rfb1` is the compatibility command name for the framed-vsock RFB1 StartTurn flow; `zeroboot verify` is the ZeroBoot full-protocol ZBRT verification flow.
 

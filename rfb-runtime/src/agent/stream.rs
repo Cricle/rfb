@@ -28,16 +28,22 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(());
     }
     // Establish the deadline before spawning so the complete request, not just
-    // child execution after spawn, is bounded by the caller's timeout.
+    // child execution after spawn, is bounded by the caller's timeout. An
+    // overflowing timeout (an absurd u64 of seconds) saturates to "no explicit
+    // deadline" instead of panicking on Instant + Duration.
     let deadline = request
         .get("timeout")
         .and_then(Value::as_u64)
-        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+        .and_then(|seconds| tokio::time::Instant::now().checked_add(Duration::from_secs(seconds)));
     if let Some(kind) = builtin(request) {
         // Keep the same request validation and wire lifecycle without creating
-        // a process (shell-free rootfs images may lack /bin/echo).
+        // a process (shell-free rootfs images may lack /bin/echo). netprobe
+        // blocks (DNS + connect); keep it off the async runtime thread.
         validate_builtin_request(request)?;
-        let result = builtin_result(request, kind);
+        let owned = request.clone();
+        let result = tokio::task::spawn_blocking(move || builtin_result(&owned, kind))
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
         write_json(writer, json!({"stream":"started","pid":null,"pty":false})).await?;
         if !result["out"].as_str().unwrap_or_default().is_empty() {
             write_json(writer, json!({"out":result["out"].clone()})).await?;
@@ -74,6 +80,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut ob = vec![0u8; 8192];
     let mut eb = vec![0u8; 8192];
     let mut input = Vec::new();
+    // Latch pipes at EOF: a read on an EOF'd pipe is immediately ready, so an
+    // unlatched branch busy-polls the select until the child reaps. Once a
+    // pipe has delivered EOF (`read` returning 0), stop polling it.
+    let mut out_open = true;
+    let mut err_open = true;
     // Keep the timeout branch pending when no timeout was requested.  Do not
     // substitute an arbitrary multi-year duration: a request timeout is a
     // deadline, and its clock starts before spawning the child.
@@ -92,7 +103,7 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // terminal frame. The process-group kill above also covers
                 // descendants that inherited the pipes.
                 let _ = child.wait().await;
-                drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                 // `done` is the host's terminal marker for a null exit_code;
                 // without it a null exit_code frame fails to decode on the
                 // host. No `err`/`error` key here: the host would deliver a
@@ -106,24 +117,26 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // A fast child can exit before either pipe-read branch wins
                 // the select. Always drain both pipes before the terminal
                 // frame so output and exit status cannot race on the wire.
-                drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                 write_json(writer,json!({"exit_code":status.code(),"timed_out":false})).await?;
                 return Ok(())
             }
-            n=out.read(&mut ob)=>{
+            n=out.read(&mut ob), if out_open=>{
                 let n=n?;
                 if n>0 { write_json(writer,json!({"out":String::from_utf8_lossy(&ob[..n])})).await?; }
+                else { out_open = false; }
             }
-            n=err.read(&mut eb)=>{
+            n=err.read(&mut eb), if err_open=>{
                 let n=n?;
                 if n>0 { write_json(writer,json!({"err":String::from_utf8_lossy(&eb[..n])})).await?; }
+                else { err_open = false; }
             }
             outcome = read_line_bounded(reader, &mut input, MAX_LINE) => {
                 match outcome? {
                     LineReadOutcome::Eof => {
                         terminate(&mut child).await;
                         let _ = child.wait().await;
-                        drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                         // A client-side stdin EOF ends the session with a clean
                         // terminal frame (no `error` key: the host turns any
                         // string `error` into a fatal Remote failure).
@@ -136,7 +149,7 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         // until its read timeout.
                         terminate(&mut child).await;
                         let _ = child.wait().await;
-                        drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                         write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                         return Ok(());
                     }
@@ -146,7 +159,7 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 if v.get("action").and_then(Value::as_str)==Some("stop") {
                     terminate(&mut child).await;
                     let _ = child.wait().await;
-                    drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                    drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                     // `done` lets the host decode this null-exit_code terminal
                     // frame instead of failing with "invalid guest stream
                     // event".
@@ -171,7 +184,7 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         Err(_) => {
                             terminate(&mut child).await;
                             let _ = child.wait().await;
-                            drain_streams(&mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                            drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
                             write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                             return Ok(());
                         }
@@ -234,6 +247,31 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
             }
         }
     }
+}
+
+/// Hard cap for the post-exit pipe drain: the child exited, but a daemonized
+/// grandchild can hold the inherited pipes open forever. Without a cap the
+/// drain arm hangs the whole stream (select polls nothing else, so the
+/// timeout/stop branches never fire). On cap expiry the process group is
+/// killed (closing the inherited pipes) and the drain is retried once —
+/// post-kill drains finish in milliseconds.
+const DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn drain_streams_bounded(
+    child: &mut tokio::process::Child,
+    out: &mut (impl AsyncRead + Unpin),
+    err: &mut (impl AsyncRead + Unpin),
+    ob: &mut [u8],
+    eb: &mut [u8],
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> io::Result<()> {
+    for _ in 0..2 {
+        match tokio::time::timeout(DRAIN_CAP, drain_streams(out, err, ob, eb, writer)).await {
+            Ok(result) => return result,
+            Err(_) => terminate(child).await, // grandchild holds the pipes
+        }
+    }
+    Ok(())
 }
 
 async fn drain_streams<R1: AsyncRead + Unpin, R2: AsyncRead + Unpin, W: AsyncWrite + Unpin>(

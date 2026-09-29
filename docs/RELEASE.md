@@ -19,11 +19,11 @@
 | 渠道 | 产物 | 发布方式 |
 |---|---|---|
 | crates.io | `rfb-runtime` → `rfb-sdk` → `rfb-rig`（0.0.1） | `scripts/release.sh`：门禁（fmt/test/doc）+ 按依赖序逐个 `package`+`publish`，渠道间等待索引传播；`--token` CLI 直传凭据 |
-| PyPI | `rfb-sdk`（SDK 绑定）+ `rfb-cli`（仅 linux-x64 二进制 wheel，平台标签 `manylinux_2_39_x86_64`；构建用 `wheel tags --remove`，避免 any-wheel 把 ELF 带到 mac/Windows） | `python -m build` + twine；二进制来自 crates job 的 artifact |
+| PyPI | `rfb-sdk`（SDK 绑定） | `python -m build` + `pypa/gh-action-pypi-publish`（凭据 `PYPI_KEY`）。CLI 不做 PyPI 渠道：二进制发布不引入 Python 包装壳，CLI 走 crates.io 源码安装、GitHub Release、npm 与 NuGet |
 | Maven Central | `io.github.cricle:rfb-sdk` | GPG 签名 + central-publishing-maven-plugin（自动发布，等待 published） |
 | NuGet | `Rfb.Sdk`（SDK）+ `Rfb.Cli`（binary-only 包） | `dotnet pack` + `dotnet nuget push --skip-duplicate`；二进制同上来自 artifact |
 | npm | `rfb-sdk`（TypeScript SDK，构建+测试后发布）+ `rfb-cli`（仅二进制包，bin 入口直连 ELF） | `npm publish`（`NODE_AUTH_TOKEN`=NPM_KEY）；凭据必须是 **granular access token**：包权限 Read and write、范围 All packages、创建时勾选 bypass 2FA（classic/automation token 会被 npm 拒绝：403 EOTP） |
-| GitHub Release | `rfb-<tag>.tar.gz`、`rfb-cli-linux-x64`、`SHA256SUMS` | crates job 构建并上传 rfb-cli artifact，pypi/nuget/npm job 经 needs 下载后打包 |
+| GitHub Release | `rfb-<tag>.tar.gz`、`rfb-cli-linux-x64`、`SHA256SUMS` | crates job 构建并上传 rfb-cli artifact，nuget/npm job 经 needs 下载后打包 |
 
 主 crate 发布名是 `rfb-sdk`（crates.io 裸名 `rfb` 被 2022 年的无关项目占用）；
 lib 名保持 `rfb`，`rfb-cli` 二进制不变。
@@ -34,7 +34,7 @@ lib 名保持 `rfb`，`rfb-cli` 二进制不变。
 
 - crates.io：`scripts/release.sh` 内 `crate_published()` 查
   `crates.io/api/v1/crates/<name>/<version>`；
-- PyPI：`pypi_guard` / `pypi_cli_guard` 步骤查 `pypi.org/pypi/<name>/<version>/json`；
+- PyPI：`pypi_guard` 步骤查 `pypi.org/pypi/rfb-sdk/<version>/json`；
 - NuGet：`nuget_guard` 步骤查 flat-container；push 侧另有 `--skip-duplicate` 兜底；
 - Maven：`maven_guard` 查 repo1.maven.org 的 POM。
 
@@ -48,7 +48,7 @@ lib 名保持 `rfb`，`rfb-cli` 二进制不变。
 | Secret | 内容 |
 |---|---|
 | `CRATES_KEY` | crates.io token |
-| `PYPI_KEY` | PyPI API token（注意 token 范围需覆盖 `rfb-sdk` 与 `rfb-cli` 两个项目，或用全局 token） |
+| `PYPI_KEY` | PyPI API token（token 范围覆盖 `rfb-sdk`，或用全局 token） |
 | `MAVEN_KEY` | Central 的 settings.xml `<server>` 块，`<id>` 必须为 `central`（workflow 会把任何 server id 归一为 central） |
 | `GPG_PRIVATE_KEY` | armored 私钥全文（Maven Central 强制签名） |
 | `GPG_PASSPHRASE` | 私钥口令 |
@@ -74,9 +74,8 @@ Central 校验签名时使用。私钥备份见仓库外的运维文档。
 | Rust crate | Rust 1.90+（edition 2021，`rust-version` 已在各 Cargo.toml 声明） | CI 用 stable 构建；MSRV 由 Cargo.lock 依赖下限决定 |
 | Java SDK（io.github.cricle:rfb-sdk） | **Java 8+**（8/11/16/17/21…） | 内部值类型为 Java 8 兼容手写类（原 record 已降级）；HTTP 层用 HttpURLConnection（无 java.net.http 依赖） |
 | C# SDK（Rfb.Sdk） | netstandard2.1 / net8.0 | System.Text.Json 经条件包引用（net8 内置）；PolySharp（编译期，PrivateAssets）提供 Range/Index 等语法糖；ns2.0 因缺 Span/BinaryPrimitives 且拒绝引入 System.Memory 依赖链而不再目标 |
-| Python SDK（rfb-sdk） | Python 3（`requires-python = ">=3"`） | 纯 stdlib + Jackson 无关；tests 用 unittest |
-| rfb-cli 二进制 | linux-x64（glibc，ubuntu-24.04 构建） | crates.io 源码安装无此限制；musl 静态版可后续加 |
-| Python rfb-cli wheel | linux-x64（manylinux_2_39） | 仅打包预编译二进制，无 Python 包装代码 |
+| Python SDK（rfb-sdk） | Python 3.9+（`requires-python = ">=3.9"`） | 纯 stdlib；tests 用 unittest |
+| rfb-cli 二进制 | linux-x64（glibc，ubuntu-24.04 构建） | crates.io 源码安装无此限制；分发渠道：crates.io、GitHub Release、npm（`rfb-cli`，bin 直连 ELF）、NuGet（`Rfb.Cli`，tools 直放二进制）——全部为纯二进制/清单，无包装壳 |
 
 ## 6. 失败速查表（真实踩坑记录）
 
