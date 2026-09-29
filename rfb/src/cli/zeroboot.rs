@@ -12,7 +12,9 @@ use crate::cli::host::detect;
 use crate::cli::image_build::sha256;
 use crate::cli::rfb1::{boot_firecracker_with, connect_vsock_uds, BootOptions};
 use crate::cli::tool::HostKind;
-use crate::protocol::{Error as ProtocolError, Execute, Frame, Kind, Output};
+use crate::protocol::{
+    Error as ProtocolError, Execute, Frame, Hello, HelloAck, Kind, Output, ZBRT_V1_CAPABILITIES,
+};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -95,6 +97,45 @@ fn decode_response(
     Ok((kind, payload))
 }
 
+/// Mandatory ZBRT handshake on a fresh connection (PROTOCOL.md §3.4): the
+/// guest refuses every non-Hello frame with `Error("protocol handshake
+/// required")`, so each raw client sends Hello and requires the matching
+/// HelloAck before any business frame.
+fn handshake(stream: &mut UnixStream, name: &str) -> Result<(), CliError> {
+    let mut request_id = [0u8; 16];
+    let label = format!("{name}:hello").into_bytes();
+    request_id[..label.len().min(16)].copy_from_slice(&label[..label.len().min(16)]);
+    let hello = Frame {
+        kind: Kind::Hello,
+        flags: 0,
+        request_id,
+        payload: Hello {
+            client: "rfb-cli".to_owned(),
+            capabilities: ZBRT_V1_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+        }
+        .encode()
+        .map_err(|error| external(format!("{name}: encode Hello: {error}")))?,
+    };
+    hello
+        .encode(&mut *stream)
+        .map_err(|error| external(format!("{name}: write Hello: {error}")))?;
+    let header = read_exact(stream, crate::protocol::HEADER_LEN)?;
+    let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
+    let payload = read_payload(stream, len)?;
+    let (kind, payload) = decode_response(&header, payload, request_id)?;
+    if kind != Kind::HelloAck {
+        return Err(validation(format!(
+            "{name}: expected HelloAck, got {kind:?}"
+        )));
+    }
+    HelloAck::decode(&payload)
+        .map_err(|error| validation(format!("{name}: invalid HelloAck: {error}")))?;
+    Ok(())
+}
+
 /// One ZBRT exchange on a fresh vsock connection. `code` is the guest command;
 /// the Execute frame carries a 4-byte big-endian deadline (ms) followed by the
 /// command. Returns (kind, payload) without logging payload contents.
@@ -125,6 +166,7 @@ fn exchange(
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|error| io(error.to_string()))?;
+    handshake(&mut stream, name)?;
     let frame = Frame {
         kind: Kind::Execute,
         flags: 0,
@@ -434,8 +476,10 @@ pub fn verify(
         }
         checks.push(json!({"name": "concurrent_8", "ok": true}));
 
-        // malformed Execute -> Error frame
+        // malformed Execute -> Error frame (the handshake passes first so the
+        // guest's strict decoder, not the handshake guard, rejects it)
         let mut stream = connect(&uds, DEFAULT_PORT)?;
+        handshake(&mut stream, "malformed")?;
         let mut rid = [0u8; 16];
         rid[..9].copy_from_slice(b"malformed");
         let malformed = Frame {

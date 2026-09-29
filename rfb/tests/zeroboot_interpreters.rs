@@ -26,7 +26,9 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 use rfb::cli::rfb1::{boot_firecracker_with, connect_vsock_uds, BootOptions};
-use rfb::protocol::{Error, Execute, Exit, Frame, Kind, Output};
+use rfb::protocol::{
+    Error, Execute, Exit, Frame, Hello, HelloAck, Kind, Output, ZBRT_V1_CAPABILITIES,
+};
 
 const GUEST_CID: u32 = 3;
 const GUEST_PORT: u16 = 5000;
@@ -115,6 +117,34 @@ fn execute(vm: &Vm, name: &str, argv: &[&str], stdin: &str, timeout_ms: u32) -> 
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set write timeout");
+
+    // Mandatory ZBRT handshake (PROTOCOL.md §3.4): the guest refuses every
+    // non-Hello frame until it has seen one.
+    let mut hello_id = [0u8; 16];
+    hello_id[..6].copy_from_slice(b"hello!");
+    let hello = Frame {
+        kind: Kind::Hello,
+        flags: 0,
+        request_id: hello_id,
+        payload: Hello {
+            client: "rfb-e2e-interpreters".to_owned(),
+            capabilities: ZBRT_V1_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+        }
+        .encode()
+        .unwrap_or_else(|error| panic!("{name}: encode Hello: {error}")),
+    };
+    hello
+        .encode(&mut stream)
+        .unwrap_or_else(|error| panic!("{name}: write Hello frame: {error}"));
+    let ack =
+        Frame::decode(&mut stream).unwrap_or_else(|error| panic!("{name}: read HelloAck: {error}"));
+    assert_eq!(ack.request_id, hello_id, "{name}: HelloAck id mismatch");
+    assert_eq!(ack.kind, Kind::HelloAck, "{name}: expected HelloAck");
+    HelloAck::decode(&ack.payload)
+        .unwrap_or_else(|error| panic!("{name}: invalid HelloAck: {error}"));
 
     let mut request_id = [0u8; 16];
     let label = name.as_bytes();

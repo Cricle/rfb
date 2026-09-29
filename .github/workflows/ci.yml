@@ -24,6 +24,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # all-features（rustpython/mlua）+ 全 targets + musl 的构建峰值会顶满
+      # runner 的剩余盘（本轮已出现过 No space left on device）；先清掉预装
+      # 大件换回 ~20GB。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
           toolchain: stable
