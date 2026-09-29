@@ -127,6 +127,43 @@ This repository keeps `resx/firecracker/firecracker-v1.16.1-x86_64.tgz` as the o
 
 See [docs/RELEASE.md](docs/RELEASE.md) for the full release pipeline, one-time setup and a failure quick-reference.
 
+## Forkd-only minimal build (split discipline)
+
+A **forkd-only minimal variant** of this workspace is generated mechanically —
+never hand-maintained:
+
+```bash
+scripts/split-minimal.sh --check /tmp/simple   # surgery + compile gate
+```
+
+- The minimal tree is **regenerated from the latest main every time** (no
+  long-lived branch, no merges, no conflicts): deleting zeroboot, `ben`, and
+  their hooks is a deterministic transformation kept in
+  `scripts/split-minimal.sh`.
+- **Rules for main-branch changes (mandatory — this is what keeps the surgery
+  working):**
+  1. **zeroboot code lives only in zeroboot files** (`rfb/src/zeroboot/`,
+     `rfb/src/cli/zeroboot.rs`, `rfb/src/cli/zeroboot_backend.rs`,
+     `rfb/tests/zeroboot_*`, `rfb-runtime/src/zeroboot_connection.rs`,
+     `rfb-runtime/src/zeroboot_guest.rs` and their tests). Never spread
+     zeroboot logic into shared modules — put it in those files and expose a
+     small hook.
+  2. **Shared hooks stay one-or-few lines** (`cli/mod.rs` module registration,
+     `commands.rs`'s `Zeroboot { .. }` variant, `dispatch.rs`'s forwarding
+     arm, `lib.rs`'s module declarations, the `zeroboot` feature line in both
+     `Cargo.toml`s). The surgery deletes exactly those lines; keeping them
+     few and contiguous is what makes that reliable.
+  3. **New zeroboot files must be added to `REMOVE` in
+     `scripts/split-minimal.sh`** in the same commit that adds them.
+  4. After touching anything zeroboot-related, run
+     `scripts/split-minimal.sh --check` locally — it fails loudly on leftover
+     references (whitelist: the shared `zeroboot_protocol` wire, the
+     `zeroboot-zbrt` rootfs image format, the backend factory's fail-closed
+     branch) or on a broken minimal compile.
+- `firecracker.rs` (the Firecracker HTTP-API driver) and `protocol.rs` (the
+  ZBRT wire format) are **shared** with the RFB1 path and are kept by the
+  surgery; only the ZeroBoot provider/session layer is removed.
+
 ## License
 
 MIT — see [LICENSE-MIT](LICENSE-MIT).
