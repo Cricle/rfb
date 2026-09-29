@@ -51,8 +51,11 @@ pub(crate) fn execute(source: Source) -> i32 {
 }
 
 /// Stack reserved for the interpreter thread (virtual reservation; RSS only
-/// grows with actual use).
-const RUN_THREAD_STACK_BYTES: usize = 256 * 1024 * 1024;
+/// grows with actual use). Sized to fit the default 128 MiB guest: a 256 MiB
+/// reservation is refused by the kernel's overcommit heuristic in a guest
+/// that small (thread spawn fails with EAGAIN), and 64 MiB still covers the
+/// importlib bootstrap plus the 1000-frame recursion limit.
+const RUN_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// CPython's default recursion limit; also avoids the debug-build default of
 /// 256 frames, which is too small for the frozen importlib bootstrap.

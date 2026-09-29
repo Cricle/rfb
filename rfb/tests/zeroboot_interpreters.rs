@@ -213,6 +213,30 @@ fn zeroboot_guest_interpreters() {
     assert_eq!(code, 0, "python3 -c exit code");
     assert_eq!(stdout, b"2\n", "python3 -c stdout");
 
+    // Deep recursion proves the interpreter thread's stack is sized for the
+    // full 1000-frame limit, not just a shallow bootstrap.
+    let (code, stdout, stderr) = exited(
+        "python-recursion",
+        execute(
+            &vm,
+            "python-recursion",
+            &[
+                "python3",
+                "-c",
+                "def f(n):\n return 0 if n == 0 else f(n - 1) + 1\nprint(f(900))",
+            ],
+            "",
+            30000,
+        ),
+    );
+    assert_eq!(
+        code,
+        0,
+        "python3 recursion failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"900\n", "python3 recursion stdout");
+
     // python3 with a script on stdin (argv "-").
     let (code, stdout, _stderr) = exited(
         "python-stdin",
