@@ -11,6 +11,7 @@
 // whole lifecycle — create, operations, drop — inside ONE `futures_block_on`.
 // Embedders must do the same: never move a live sandbox across runtimes.
 
+use futures_lite::future;
 use rfb::core::{Capability, ExecSpec, Sandbox, SandboxProvider, SandboxSpec, TransportKind};
 use rfb::guest::{
     CancelRequest, FindRequest, GrepRequest, LsRequest, ReadRequest, StreamEvent, StreamSpec,
@@ -18,7 +19,7 @@ use rfb::guest::{
 };
 use rfb::zeroboot::{Config, ZeroBootProvider};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn resx(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -270,12 +271,41 @@ fn health_stream_and_cancel_roundtrip() {
         assert!(saw_exit, "stream never terminated");
         stream.stop().await.expect("stream stop");
 
-        // Cancel on a quiescent session is an idempotent round-trip.
+        // Cancel an in-flight exec: the running `sleep` must be torn down and
+        // the provider must report a real cancellation. The short delay lets
+        // the Execute frame reach the guest before the Cancel overtakes it.
+        let started = Instant::now();
+        let (exec, ()) = future::zip(
+            sandbox.exec(exec_spec("sleep", &["30"])),
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let cancelled = sandbox
+                    .cancel(CancelRequest { id: None })
+                    .await
+                    .expect("cancel in-flight");
+                assert!(cancelled.cancelled, "in-flight cancel was not reported");
+            }),
+        )
+        .await;
+        let exec = exec.expect("exec after cancel");
+        assert_eq!(exec.status, Some(-1), "cancelled exec status");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel did not end the running command promptly"
+        );
+
+        // Cancel on a quiescent sandbox is an idempotent no-op: the call
+        // succeeds and reports honestly that nothing was in flight
+        // (`CancelResult.cancelled` means "an in-flight operation was
+        // cancelled", and the guest's idempotent ack is exercised above).
         let cancelled = sandbox
             .cancel(CancelRequest { id: None })
             .await
             .expect("cancel");
-        assert!(cancelled.cancelled);
+        assert!(
+            !cancelled.cancelled,
+            "quiescent cancel claimed a cancellation"
+        );
     });
 }
 

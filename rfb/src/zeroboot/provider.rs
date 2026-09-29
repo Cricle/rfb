@@ -519,6 +519,11 @@ impl ZeroBootSession {
                         timed_out: false,
                     });
                 }
+                Kind::CancelAck => {
+                    // A targeted cancel for this request was acknowledged
+                    // (its frame reused this request id, so it routes here);
+                    // the cancel-induced Exit follows as the terminal frame.
+                }
                 Kind::Error => break Err(remote_error(&frame.payload)),
                 other => {
                     break Err(SessionError::Protocol(format!(
