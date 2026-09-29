@@ -252,14 +252,14 @@ class ZbrtConnectionTest {
         });
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = server.address();
+        info.setId("sb-1");
+        info.setGuestAddr(server.address());
         Sandbox sandbox = Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
         ExecResult result = sandbox.exec(List.of("echo", "hi"), "/workspace", 60.0);
-        assertEquals(Integer.valueOf(0), result.exitCode);
+        assertEquals(Integer.valueOf(0), result.getExitCode());
         assertEquals("hi", result.stdoutText());
         assertEquals("", result.stderrText());
-        assertEquals(Boolean.FALSE, Boolean.valueOf(result.timedOut));
+        assertEquals(Boolean.FALSE, Boolean.valueOf(result.isTimedOut()));
     }
 
     @Test
@@ -271,8 +271,8 @@ class ZbrtConnectionTest {
         });
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = server.address();
+        info.setId("sb-1");
+        info.setGuestAddr(server.address());
         Sandbox sandbox = Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
         assertTrue(sandbox.ping());
     }
@@ -282,8 +282,8 @@ class ZbrtConnectionTest {
         server = new FakeZbrtServer(io -> io.read());
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = server.address();
+        info.setId("sb-1");
+        info.setGuestAddr(server.address());
         Sandbox zbrt = Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
         Sandbox ndjson = Sandbox.attach(client, info, RfbClient.TRANSPORT_NDJSON);
         // fail closed on both transports: empty argv and bad cwd never reach the wire
@@ -297,8 +297,8 @@ class ZbrtConnectionTest {
     void evalOverZbrtRejectsBlankCodeBeforeConnect() {
         RfbClient client = new RfbClient("http://127.0.0.1:1", "", 5.0);
         SandboxInfo info = new SandboxInfo();
-        info.id = "sb-1";
-        info.guestAddr = "127.0.0.1:1"; // nothing is listening; nothing may be sent
+        info.setId("sb-1");
+        info.setGuestAddr("127.0.0.1:1"); // nothing is listening; nothing may be sent
         Sandbox sandbox = Sandbox.attach(client, info, RfbClient.TRANSPORT_ZBRT);
         assertThrows(ValidationError.class, () -> sandbox.eval("   "));
     }

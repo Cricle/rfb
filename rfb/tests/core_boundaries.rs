@@ -2,16 +2,6 @@ use rfb::prelude::*;
 use std::time::Duration;
 
 #[test]
-fn pixel_formats_report_storage_widths() {
-    assert_eq!(PixelFormat::Rgb8.bytes_per_pixel(), 3);
-    assert_eq!(PixelFormat::Bgr8.bytes_per_pixel(), 3);
-    assert_eq!(PixelFormat::Rgba8.bytes_per_pixel(), 4);
-    assert_eq!(PixelFormat::Bgra8.bytes_per_pixel(), 4);
-    assert_eq!(PixelFormat::Gray8.bytes_per_pixel(), 1);
-    assert_eq!(PixelFormat::default(), PixelFormat::Rgba8);
-}
-
-#[test]
 fn image_manifest_defaults_and_digest_boundaries_validate() {
     let image = ImageManifest::new("example:latest");
     assert_eq!(image.transport, "oci");
@@ -111,12 +101,6 @@ async fn sandbox_default_operations_report_missing_capabilities() {
     assert_eq!(
         sandbox.health().await,
         Err(SandboxError::UnsupportedCapability(Capability::Health))
-    );
-    assert_eq!(
-        sandbox.framebuffer().await,
-        Err(SandboxError::UnsupportedCapability(
-            Capability::ReadFramebuffer
-        ))
     );
     assert_eq!(
         sandbox.ping().await,

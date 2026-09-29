@@ -45,6 +45,7 @@ const ACCEPTANCE_CHECKS: &[&str] = &[
 const ACCEPTANCE_NEGATIVES: &[&str] = &["ls_escape", "ls_zero_limit", "grep_too_many_bytes"];
 const BENCH_STAGES: &[&str] = &[
     "create",
+    "ready",
     "controller_ping",
     "health",
     "stream",
@@ -275,7 +276,7 @@ fn sandbox_has_no_internet_egress() {
     let tag = common::snapshot_tag();
     common::block_on(async {
         let url = "http://127.0.0.1:8889";
-        let sandbox = rfb::cli::forkd::create_sandbox(url, &tag, 1, Some(32))
+        let sandbox = rfb::cli::forkd::create_sandbox(url, &tag, 1, Some(32), false)
             .await
             .expect("sandbox create")
             .into_iter()
@@ -337,7 +338,11 @@ fn provenance_binding_roundtrip_verified() {
     // firecracker from the assets the snapshot actually booted, rootfs from
     // the built image, snapshot artifacts from the on-disk snapshot dir.
     let rootfs = common::rootfs("forkd-agent.ext4");
-    let kernel = common::resx("kernel/vmlinux-arcbox-0.0.24");
+    // The kernel the snapshot actually booted (FORKD_KERNEL, as wired by the
+    // E2E workflow) — arcbox is only the local default.
+    let kernel = std::env::var_os("FORKD_KERNEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| common::resx("kernel/vmlinux-arcbox-0.0.24"));
     let home = std::env::var("HOME").unwrap_or_default();
     let snap_dir = PathBuf::from(home)
         .join(".local/share/forkd/snapshots")
@@ -577,7 +582,12 @@ fn snapshot_lifecycle_private_rootfs_and_delete() {
 fn sha256_file(path: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).expect("read rootfs for digest");
-    format!("{:x}", Sha256::digest(&bytes))
+    // Independent lowercase-hex encoder; digest 0.11 outputs no longer
+    // implement LowerHex.
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +615,7 @@ impl Drop for SandboxGuard {
 /// makes every later create fail with 503).
 fn spawn_guarded_sandbox(tag: &str) -> (rfb::forkd::SandboxInfo, SandboxGuard) {
     let sandbox = common::block_on(async {
-        rfb::cli::forkd::create_sandbox(CONTROLLER_URL, tag, 1, None)
+        rfb::cli::forkd::create_sandbox(CONTROLLER_URL, tag, 1, None, false)
             .await
             .expect("sandbox create")
             .into_iter()
@@ -864,6 +874,7 @@ fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
                 Some("/workspace"),
                 None,
                 None,
+                None,
             )
             .await
             .expect("open stream");
@@ -900,6 +911,7 @@ fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
                 Some("/workspace"),
                 None,
                 None,
+                None,
             )
             .await
             .expect("open sleep stream");
@@ -924,7 +936,7 @@ fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
     let pty_error = common::block_on(async {
         use rfb::forkd_guest::ForkdGuestClient;
         let mut stream = ForkdGuestClient::new(address.clone())
-            .stream(vec!["/bin/true".into()], None, Some(true), None)
+            .stream(vec!["/bin/true".into()], None, Some(true), None, None)
             .await
             .expect("open pty stream");
         loop {
@@ -948,11 +960,17 @@ fn guest_stream_event_lifecycle_stop_and_pty_rejection() {
 fn sandbox_create_rejects_invalid_and_unknown_tags() {
     common::require_real();
     common::block_on(async {
-        let invalid = rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "bad/tag!", 1, None).await;
+        let invalid =
+            rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "bad/tag!", 1, None, false).await;
         assert!(invalid.is_err(), "path-like tag must be rejected");
-        let unknown =
-            rfb::cli::forkd::create_sandbox(CONTROLLER_URL, "rfb-e2e-no-such-tag-xyz", 1, None)
-                .await;
+        let unknown = rfb::cli::forkd::create_sandbox(
+            CONTROLLER_URL,
+            "rfb-e2e-no-such-tag-xyz",
+            1,
+            None,
+            false,
+        )
+        .await;
         assert!(unknown.is_err(), "unknown snapshot tag must be rejected");
     });
 }
@@ -1024,6 +1042,7 @@ fn shared_tap_rejects_multi_spawn_and_sequential_sandboxes_are_isolated() {
         &tag,
         2,
         None,
+        false,
     ))
     .expect_err("n>1 on the shared tap must be rejected");
     assert!(
@@ -1090,6 +1109,75 @@ fn shared_tap_rejects_multi_spawn_and_sequential_sandboxes_are_isolated() {
             read.is_err(),
             "second sandbox must not see the first's file"
         );
+    });
+}
+
+#[test]
+#[ignore = "requires a live forkd stack; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
+fn per_child_netns_reports_pool_state_and_supports_concurrency() {
+    common::require_real();
+    let tag = common::snapshot_tag();
+
+    // per_child_netns=true needs a root-provisioned netns pool on the host
+    // (forkd's `scripts/netns-setup.sh N`), and each guest is only reachable
+    // through the controller, which enters that netns. Two contracts hold
+    // depending on the host: without a pool the create must fail with an
+    // actionable message, with a pool every sandbox must stay independently
+    // usable while the others are alive.
+    let sandboxes = match common::block_on(rfb::cli::forkd::create_sandbox(
+        CONTROLLER_URL,
+        &tag,
+        3,
+        Some(32),
+        true,
+    )) {
+        Ok(sandboxes) => sandboxes,
+        Err(error) => {
+            assert!(
+                error.message.contains("netns") && error.message.contains("netns-setup"),
+                "netns pool exhaustion must name the provisioning script: {error:?}"
+            );
+            return;
+        }
+    };
+    assert_eq!(sandboxes.len(), 3, "all three sandboxes must be created");
+    let ids: BTreeSet<String> = sandboxes.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(ids.len(), 3, "each sandbox must get its own id: {ids:?}");
+
+    struct Guards(Vec<String>);
+    impl Drop for Guards {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                let _ = common::block_on(rfb::cli::forkd::destroy_sandbox(CONTROLLER_URL, id));
+            }
+        }
+    }
+    let guards = Guards(ids.iter().cloned().collect());
+
+    common::block_on(async {
+        // Controller-mediated ping enters each sandbox's netns, so success
+        // while all three are alive is the concurrency evidence.
+        for sandbox in &sandboxes {
+            rfb::cli::forkd::ping_sandbox(CONTROLLER_URL, &sandbox.id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "sandbox {} must answer ping while peers are alive: {error:?}",
+                        sandbox.id
+                    )
+                });
+        }
+    });
+    drop(guards);
+    common::block_on(async {
+        for sandbox in &sandboxes {
+            let ping = rfb::cli::forkd::ping_sandbox(CONTROLLER_URL, &sandbox.id).await;
+            assert!(
+                ping.is_err(),
+                "sandbox {} must be gone after destroy",
+                sandbox.id
+            );
+        }
     });
 }
 

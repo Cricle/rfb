@@ -1095,3 +1095,59 @@ fn file_rpcs_are_unavailable_while_a_turn_is_in_flight() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+/// The applets the forkd agent serves in-process (echo/true/false) must behave
+/// identically on ZBRT, which now shares the same definitions: same stdout,
+/// same exit codes, and the same refusal to shadow a relative workspace path.
+#[test]
+fn workspace_executor_serves_builtin_applets_like_the_forkd_agent() {
+    let root = temp_workspace();
+    let mut executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut terminal = |prompt: &str| {
+        let request = SessionRequest {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            prompt: prompt.into(),
+        };
+        let events = executor.start_turn(&request).unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .expect("turn completes");
+        serde_json::from_slice::<serde_json::Value>(&completed.payload).unwrap()
+    };
+
+    let echo = terminal(r#"{"op":"exec","args":["/bin/echo","hello","world"],"cwd":"."}"#);
+    assert_eq!(echo["stdout"], "hello world\n");
+    assert_eq!(echo["exit_code"], 0);
+    assert_eq!(echo["success"], true);
+
+    // `-n` matches the /bin/echo applet byte for byte, so an in-process echo
+    // cannot be told apart from the spawned one by its output.
+    let no_newline = terminal(r#"{"op":"exec","args":["echo","-n","x"],"cwd":"."}"#);
+    assert_eq!(no_newline["stdout"], "x");
+
+    assert_eq!(
+        terminal(r#"{"op":"exec","args":["true"],"cwd":"."}"#)["exit_code"],
+        0
+    );
+    let failed = terminal(r#"{"op":"exec","args":["false"],"cwd":"."}"#);
+    assert_eq!(failed["exit_code"], 1);
+    assert_eq!(failed["success"], false);
+
+    // A relative path is a workspace file the caller addressed explicitly, so
+    // it must be spawned (and fail when absent) rather than shadowed.
+    let relative = terminal(r#"{"op":"exec","args":["tools/echo","x"],"cwd":"."}"#);
+    assert_eq!(relative["exit_code"], -1);
+    assert_eq!(relative["success"], false);
+
+    // The builtin never uses the working directory, but an out-of-workspace
+    // cwd must still fail closed on every transport.
+    let escape = executor.start_turn(&SessionRequest {
+        session_id: "s".into(),
+        request_id: "r".into(),
+        prompt: r#"{"op":"exec","args":["echo","x"],"cwd":"../outside"}"#.into(),
+    });
+    assert!(escape.is_err(), "out-of-workspace cwd must be rejected");
+    let _ = fs::remove_dir_all(root);
+}

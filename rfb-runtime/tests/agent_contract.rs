@@ -1,10 +1,35 @@
 #[allow(dead_code)]
 #[path = "../src/agent/mod.rs"]
 mod agent;
+// agent/builtin.rs re-exports `crate::builtin`; include the same source under
+// the same path so that import resolves inside this test crate too.
+#[allow(dead_code)]
+#[path = "../src/builtin.rs"]
+mod builtin;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+/// Connect with retries on `PermissionDenied`. On Windows the ephemeral
+/// source-port allocator can sweep into a Hyper-V excluded range, failing
+/// otherwise-valid loopback connects with WSAEACCES (10013) in bursts; a
+/// retry allocates a different source port.
+async fn connect_retry(addr: &'static str) -> TcpStream {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("connect {addr}: {error}"),
+        }
+    }
+}
 
 /// Spawn the agent against a temporary workspace: CI runners run as a
 /// non-root user that cannot create `/workspace`, so every test points
@@ -46,7 +71,7 @@ fn forkd_agent_entrypoint_is_explicit_and_vsock_remains_default() {
 async fn ping_and_unknown_actions_are_ndjson_responses() {
     let task = spawn_agent("127.0.0.1:18888");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18888").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18888").await;
     assert_eq!(
         request(&mut stream, json!({"action":"ping"})).await["pong"],
         true
@@ -91,7 +116,7 @@ fn forkd_image_build_supports_a_separate_entrypoint() {
 async fn exec_timeout_returns_terminal_response_and_does_not_wait_for_child() {
     let task = spawn_agent("127.0.0.1:18892");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18892").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18892").await;
     let started = tokio::time::Instant::now();
     let response = request(
         &mut stream,
@@ -109,7 +134,7 @@ async fn exec_timeout_returns_terminal_response_and_does_not_wait_for_child() {
 async fn shell_free_builtins_execute_without_host_commands() {
     let task = spawn_agent("127.0.0.1:18895");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18895").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18895").await;
     let echo = request(
         &mut stream,
         json!({"action":"exec", "args":["/missing/bin/echo", "hello", "world"]}),
@@ -127,7 +152,7 @@ async fn shell_free_builtins_execute_without_host_commands() {
 async fn shell_free_builtin_stream_emits_started_output_and_exit() {
     let task = spawn_agent("127.0.0.1:18896");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18896").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18896").await;
     let (mut read, mut write) = stream.into_split();
     write
         .write_all(
@@ -164,7 +189,7 @@ async fn shell_free_builtin_stream_emits_started_output_and_exit() {
 async fn stream_fast_child_drains_output_before_exit_frame() {
     let task = spawn_agent("127.0.0.1:18894");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18894").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18894").await;
     let (mut read, mut write) = stream.into_split();
     let args: Vec<&str> = if cfg!(unix) {
         vec!["/bin/echo", "forkd-race-regression"]
@@ -212,7 +237,7 @@ async fn stream_fast_child_drains_output_before_exit_frame() {
 async fn stream_stdin_round_trip_writes_into_child_and_stops() {
     let task = spawn_agent("127.0.0.1:18897");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18897").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18897").await;
     let (mut read, mut write) = stream.into_split();
     write
         .write_all(
@@ -284,7 +309,7 @@ async fn stream_stdin_round_trip_writes_into_child_and_stops() {
 async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
     let task = spawn_agent("127.0.0.1:18893");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18893").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18893").await;
     let (mut read, mut write) = stream.into_split();
     write
         .write_all(
@@ -310,7 +335,7 @@ async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
     assert_eq!(terminal["timed_out"], true);
     assert_eq!(terminal["exit_code"], Value::Null);
     assert_eq!(terminal["done"], true);
-    // PROTOCOL.md §2.4: a timeout is a normal terminal outcome — a string
+    // PROTOCOL.md 搂2.4: a timeout is a normal terminal outcome 鈥?a string
     // `error` key would make the host raise Remote instead of exposing
     // `timed_out` to callers.
     assert!(
@@ -324,7 +349,7 @@ async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
 async fn exec_cwd_rejects_workspace_escape() {
     let task = spawn_agent("127.0.0.1:18891");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18891").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18891").await;
     let response = request(
         &mut stream,
         json!({"action":"exec", "args":["pwd"], "cwd":"/tmp"}),
@@ -338,7 +363,7 @@ async fn exec_cwd_rejects_workspace_escape() {
 async fn filesystem_paths_reject_escape_and_absolute_directory_paths() {
     let task = spawn_agent("127.0.0.1:18889");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18889").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18889").await;
     for path in ["../escape", "/etc", "workspace\\escape"] {
         let response = request(&mut stream, json!({"action":"ls", "path":path})).await;
         assert!(
@@ -386,7 +411,7 @@ async fn nested_subdirectory_write_and_read_round_trip() {
     }
     let task = spawn_agent("127.0.0.1:18887");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18887").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18887").await;
     let path = "/workspace/nested/deep/file.txt";
     let content = "nested-write-ok";
     let write = request(
@@ -423,7 +448,7 @@ async fn nested_subdirectory_write_and_read_round_trip() {
 async fn protocol_invalid_and_oversized_lines() {
     let task = spawn_agent("127.0.0.1:18901");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18901").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18901").await;
     stream.write_all(b"\nnot-json\n").await.unwrap();
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
@@ -457,7 +482,7 @@ async fn filesystem_search_edges_and_append() {
     }
     let task = spawn_agent("127.0.0.1:18902");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18902").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18902").await;
     assert!(
         request(&mut stream, json!({"action":"ls","path":"missing-nope"})).await["error"]
             .is_string()
@@ -504,7 +529,7 @@ async fn filesystem_search_edges_and_append() {
     task.abort();
 }
 
-/// Official forkd ping field contract (rfb-cli-usage.md §4): the response must
+/// Official forkd ping field contract (rfb-cli-usage.md 搂4): the response must
 /// carry `pong`, `numpy_version`, `pid`, `agent_lang`, `warmup_ready`, and
 /// `path`. The Rust replacement reports honest values for fields only the
 /// Python/Node interpreter can produce.
@@ -512,7 +537,7 @@ async fn filesystem_search_edges_and_append() {
 async fn ping_golden_contract_matches_official_field_set() {
     let task = spawn_agent("127.0.0.1:18903");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18903").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18903").await;
     let ping = request(&mut stream, json!({"action":"ping"})).await;
     assert_eq!(ping["pong"], true);
     assert_eq!(ping["numpy_version"], "not-installed");
@@ -549,7 +574,7 @@ async fn ping_golden_contract_matches_official_field_set() {
 async fn exec_builtin_golden_response_matches_frozen_contract() {
     let task = spawn_agent("127.0.0.1:18904");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18904").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18904").await;
     let result = request(
         &mut stream,
         json!({"action":"exec","args":["/missing/bin/echo","hello","world"]}),
@@ -574,7 +599,7 @@ async fn exec_builtin_golden_response_matches_frozen_contract() {
 async fn exec_contract_aliases_spawned_stdout_and_stderr() {
     let task = spawn_agent("127.0.0.1:18905");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18905").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18905").await;
     let result = request(
         &mut stream,
         json!({"action":"exec","args":["/bin/sh","-c","echo out; echo err >&2"]}),
@@ -595,7 +620,7 @@ async fn exec_contract_aliases_spawned_stdout_and_stderr() {
 async fn stream_started_frame_carries_pid_and_pty_fields() {
     let task = spawn_agent("127.0.0.1:18906");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18906").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18906").await;
     let (mut read, mut write) = stream.into_split();
     write
         .write_all(
@@ -622,7 +647,7 @@ async fn stream_started_frame_carries_pid_and_pty_fields() {
 async fn stream_started_frame_reports_spawned_pid() {
     let task = spawn_agent("127.0.0.1:18907");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let stream = TcpStream::connect("127.0.0.1:18907").await.unwrap();
+    let stream = connect_retry("127.0.0.1:18907").await;
     let (mut read, mut write) = stream.into_split();
     write
         .write_all(
@@ -656,7 +681,7 @@ async fn stream_started_frame_reports_spawned_pid() {
 async fn stream_pty_true_is_explicitly_rejected_not_silently_degraded() {
     let task = spawn_agent("127.0.0.1:18908");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18908").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18908").await;
     let result = request(
         &mut stream,
         json!({"action":"stream","args":["/no/such/echo","x"],"pty":true}),
@@ -676,7 +701,7 @@ async fn stream_pty_true_is_explicitly_rejected_not_silently_degraded() {
 async fn exec_timeout_keeps_official_aliases_and_terminal_state() {
     let task = spawn_agent("127.0.0.1:18909");
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let mut stream = TcpStream::connect("127.0.0.1:18909").await.unwrap();
+    let mut stream = connect_retry("127.0.0.1:18909").await;
     let result = request(
         &mut stream,
         json!({"action":"exec","args":["/bin/sh","-c","sleep 10"],"timeout":1}),
@@ -688,7 +713,7 @@ async fn exec_timeout_keeps_official_aliases_and_terminal_state() {
     assert_eq!(result["stdout"], "");
     assert_eq!(result["err"], "process timeout");
     assert_eq!(result["stderr"], "process timeout");
-    // PROTOCOL.md §2.4: no string `error` on the timeout terminal — the host
+    // PROTOCOL.md 搂2.4: no string `error` on the timeout terminal 鈥?the host
     // classifies any `error` as a fatal Remote failure and would swallow
     // `timed_out`.
     assert!(

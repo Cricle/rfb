@@ -25,14 +25,14 @@ jobs:
   forkd-real-e2e:
     name: forkd real-VM E2E (KVM)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       FORKD_URL: http://127.0.0.1:8889
       FORKD_TAP: forkd-tap0
       FORKD_BIN: ${{ github.workspace }}/resx/forkd/forkd
       FORKD_KERNEL: ${{ github.workspace }}/resx/kernel/vmlinux-arcbox-0.0.24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # 第 0 步：fail fast —— 没有 /dev/kvm 就不要浪费构建时间。
       # GitHub 托管 runner 通常已带 /dev/kvm 且对 runner 用户可读写；
@@ -66,14 +66,19 @@ jobs:
           sudo apt-get install -y musl-tools e2fsprogs binutils iproute2 iptables kmod
           rustup target add x86_64-unknown-linux-musl
 
-      # resx 内置资产完整性：forkd/forkd-controller/firecracker/kernel 全量校验。
-      - name: Verify resx checksums
+      # resx 内置资产完整性：forkd/forkd-controller/firecracker/kernel/rootfs
+      # 全量校验。随后按 runbook §0 的标准安装把 forkd 二进制放进 PATH
+      # （controller 按自身 PATH 找 firecracker；`forkd exec` 验证步骤也依赖它）。
+      - name: Verify resx checksums and install forkd binaries
         run: |
           set -euo pipefail
           sha256sum -c resx/SHA256SUMS
           # Windows 检出等场景可能丢失可执行位，统一恢复（controller 启动与
           # rfb-cli 委托 forkd 都要求可直接执行）。
           chmod +x resx/forkd/forkd resx/forkd/forkd-controller
+          sudo install -m 755 resx/forkd/forkd /usr/local/bin/forkd
+          sudo install -m 755 resx/forkd/forkd-controller /usr/local/bin/forkd-controller
+          forkd --version | head -1
 
       # Firecracker：先校验并解包 resx 自带的 v1.16.1 官方压缩包（chmod +x）。
       # 实际投入使用的二进制是 resx/firecracker/firecracker-v1.12.1：
@@ -96,6 +101,19 @@ jobs:
             /usr/local/bin/firecracker
           firecracker --version
 
+      # forkd guest 必须用带 virtio-net 的内核：resx 的 arcbox 没有虚拟网卡
+      # 驱动，用它建的快照 guest 永不就绪（实测 ping 全丢、ARP INCOMPLETE）。
+      # 下载官方 Firecracker CI 的 5.10.225 内核并覆盖 FORKD_KERNEL；ZBRT
+      # （vsock-only）不受影响，仍可用 arcbox。
+      - name: Download virtio-net guest kernel for forkd
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-5.10.225 \
+            -o resx/kernel/vmlinux-5.10.225
+          ls -la resx/kernel/vmlinux-5.10.225
+          echo "FORKD_KERNEL=$PWD/resx/kernel/vmlinux-5.10.225" >> "$GITHUB_ENV"
+
       # 构建：CLI（含 rfb-cli bin）→ musl 静态 rfb-runtime → forkd-agent rootfs。
       # 与 sdk/BACKEND_SETUP.md 的文档流程一致。
       - name: Build rfb-cli and forkd-agent rootfs
@@ -108,6 +126,39 @@ jobs:
             target/x86_64-unknown-linux-musl/release/rfb-runtime \
             resx/rootfs/forkd-agent.ext4 --mode forkd-agent --force
           ./target/release/rfb-cli image check-kernel resx/kernel/vmlinux-arcbox-0.0.24
+
+      # build.rfb 声明式脚本：一键构建带 python/lua 解释器、离线站点包、
+      # 预编译 Rust 应用与附加文件的自定义镜像（examples/full/full.rfb 与
+      # full/full-forkd.rfb），并用 debugfs 独立确认全部载荷进了镜像
+      # （fail-closed 校验之外的第二重确认）。
+      - name: Build custom images from build.rfb (interpreters + packages + rust app)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          # 示例 Rust 应用：musl 静态编译（脚本 [rust] apps 烤进 /usr/local/bin；
+          # 产物文件 examples/full/hello 与 crate 源码目录 hello-app/ 分开命名，
+          # 避免 cp 目标目录化）
+          cargo build --release --target x86_64-unknown-linux-musl \
+            --target-dir target \
+            --manifest-path examples/full/hello-app/Cargo.toml
+          cp target/x86_64-unknown-linux-musl/release/hello examples/full/hello
+          ./target/release/rfb-cli image build-script --root . \
+            examples/full/full.rfb 2>&1 | tee "$RUN_DIR/build-script.log"
+          test -f examples/full/out/full-sandbox.ext4
+          # 独立确认：解释器 applet、Rust 应用与附加文件都在镜像里
+          debugfs -R "ls -l /bin" examples/full/out/full-sandbox.ext4 \
+            | grep -E ' python3$| lua$'
+          debugfs -R "cat /usr/local/bin/hello" \
+            examples/full/out/full-sandbox.ext4 > /dev/null
+          debugfs -R "cat /etc/motd" \
+            examples/full/out/full-sandbox.ext4 \
+            | grep -q "RFB demo image"
+          # forkd 模式的同一套载荷（解释器 + 站点包 + Rust 应用 + 附加文件；
+          # runtime 构建已缓存，秒级）
+          ./target/release/rfb-cli image build-script --root . \
+            examples/full/full-forkd.rfb 2>&1 | tee "$RUN_DIR/build-script-forkd.log"
+          test -f examples/full/out/my-forkd.ext4
 
       # 临时 TAP：preflight 的 forkd_tap 检查要求 forkd-tap0 存在且 UP，
       # 地址段 10.42.0.1/24 与 real-machine-runbook.md 一致（全新 runner 无
@@ -256,6 +307,309 @@ jobs:
           emit_diag /tmp/e2e-diag.txt e2e-tests
           exit "$rc"
 
+      # 自定义镜像真机验证（zeroboot）：boot build.rfb 出的 examples/full
+      # 镜像，guest 里跑 python3/lua（含站点包导入）、Rust 应用与超时击杀 ——
+      # 复用既有的 zeroboot_interpreters 真机测试（fixture 目录指到
+      # build-script 产物）。
+      - name: Real-VM verify custom image (zeroboot interpreters + rust app)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR/interp-image"
+          cp examples/full/out/full-sandbox.ext4 "$RUN_DIR/interp-image/rootfs.ext4"
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
+          log=/tmp/zb-interp.log
+          set +e
+          RFB_REAL_E2E=1 \
+          RFB_E2E_ROOTFS_DIR="$RUN_DIR/interp-image" \
+          RFB_E2E_FIRECRACKER=/usr/local/bin/firecracker \
+            cargo test -p rfb-sdk --features cli --test zeroboot_interpreters \
+            -- --ignored --test-threads=1 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::自定义镜像真机验证失败 rc=$rc"
+            emit_diag "$log" zb-interp
+            exit "$rc"
+          fi
+
+      # 自定义镜像真机验证（forkd）：full-forkd 镜像建快照 → acceptance 全
+      # 门禁（含负向用例）→ forkd exec 跑烤进镜像的 Rust 应用与 python/lua。
+      # 就绪判定脚本顶格先行落盘，不依赖其它步骤的写入顺序。
+      - name: Real-VM verify custom image (forkd snapshot + acceptance + exec)
+        run: |
+          set -euo pipefail
+          TAG2="ci-e2e-script-$GITHUB_RUN_ID"
+          echo "TAG2=$TAG2" >> "$GITHUB_ENV"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          cat > /tmp/snap-ready.py <<'PY'
+          import json, sys
+          tag = sys.argv[1]
+          snaps = json.load(sys.stdin)
+          ok = any(s.get("tag") == tag
+                   and str(s.get("status", "")).lower() == "ready"
+                   and s.get("bootable") is True for s in snaps)
+          sys.exit(0 if ok else 1)
+          PY
+          FORKD_ROOTFS="$PWD/examples/full/out/my-forkd.ext4" \
+            ./target/release/rfb-cli forkd snapshot-create \
+            --tag "$TAG2" --tap forkd-tap0 --kernel "$FORKD_KERNEL" \
+            --json | tee "$RUN_DIR/snapshot-create-script.json"
+          for i in $(seq 1 180); do
+            if curl -fsS "$FORKD_URL/v1/snapshots" \
+                 | python3 /tmp/snap-ready.py "$TAG2"; then
+              echo "snapshot $TAG2 ready+bootable"
+              break
+            fi
+            [ "$i" = 180 ] && { echo "::error::快照 $TAG2 900s 未就绪"; exit 1; }
+            sleep 5
+          done
+          FORKD_SNAPSHOT_TAG="$TAG2" FORKD_ROOTFS="$PWD/examples/full/out/my-forkd.ext4" \
+            ./target/release/rfb-cli forkd acceptance --tag "$TAG2" --require-vm \
+            --json | tee "$RUN_DIR/acceptance-script.json"
+          SID=$(./target/release/rfb-cli forkd sandbox-create --tag "$TAG2" --json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+          ADDR=$(curl -s "$FORKD_URL/v1/sandboxes" | python3 -c "
+          import json,sys
+          print(next(s['guest_addr'] for s in json.load(sys.stdin) if s['id']=='$SID'))")
+          forkd exec --target "$ADDR" -- /usr/local/bin/hello ci-e2e \
+            | grep -q "rust-in-image"
+          forkd exec --target "$ADDR" -- python3 -c "import demo; print(demo.VALUE)" \
+            | grep -q "^42$"
+          forkd exec --target "$ADDR" -- lua -e "print(require('demo').answer())" \
+            | grep -q "^42$"
+          ./target/release/rfb-cli forkd sandbox-destroy "$SID" --json > /dev/null
+
+      # 沙箱全面基准（真实快照）：create/ping/stream/exec/cleanup 分位数 +
+      # 多沙箱 workload 聚合。JSON 同时进 run 日志与 logs 目录，随
+      # forkd-e2e-logs artifact 归档，便于跨 run 对比性能回归。
+      - name: Sandbox benchmark (forkd micro + workload, JSON archive)
+        run: |
+          set -euo pipefail
+          TAG="ci-e2e-$GITHUB_RUN_ID"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          export FORKD_SNAPSHOT_TAG="$TAG"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          ./target/release/rfb-cli forkd benchmark --tag "$TAG" --n 20 --json \
+            | tee "$RUN_DIR/bench-forkd.json"
+          ./target/release/rfb-cli forkd workload --tag "$TAG" \
+            --sandboxes 3 --rounds 2 --reuse-execs 25 --json \
+            | tee "$RUN_DIR/bench-workload.json"
+
+      # 沙箱启动吞吐 + 资源占用：共享 tap 模式下一次只允许一个存活沙箱
+      # （并发 create 会被 controller 以 503 拒绝；per_child_netns 需要 root
+      # 预置的 netns 池，且 netns 内的 guest 只能由 controller 进 netns 代理
+      # 访问），故这里测该部署模式下真实的「每秒启动数」：create→destroy
+      # 顺序循环；并行能力仅记录为 unsupported。同时在循环前/后/稳定期/
+      # 销毁后采样 forkd-controller 与全部 firecracker 进程的 RSS、CPU
+      # ticks、FD 数，结果写入 bench-resources.jsonl 随 artifact 归档。
+      - name: Sandbox start-rate benchmark (sequential cycles + memory/CPU sampling)
+        run: |
+          set -euo pipefail
+          TAG="ci-e2e-$GITHUB_RUN_ID"
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          export FORKD_SNAPSHOT_TAG="$TAG"
+          export FORKD_ROOTFS="$PWD/resx/rootfs/forkd-agent.ext4"
+          OUT="$RUN_DIR/bench-resources.jsonl"
+
+          # 采样：controller + firecracker 的 RSS(MiB)、CPU ticks、FD 合计。
+          # /proc/<pid>/stat 的 comm 含空格/括号，故在最后一个 ')' 之后按
+          # 空白切分：位置 12/13 对应 utime/stime（字段 14/15）。
+          # 注意：不能用 bash 的 $12 —— 那是 ${1} 后跟字面量 '2'（set -u 下
+          # 曾报 "S2: unbound variable"）。
+          proc_stats() {
+            local pid="$1" rss fds ticks
+            rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+            [ -n "$rss" ] || rss=0
+            fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+            ticks=$(awk -F')' \
+              '{ s = $NF; sub(/^[[:space:]]+/, "", s); split(s, f, /[[:space:]]+/); print f[12] + f[13] }' \
+              "/proc/$pid/stat" 2>/dev/null || echo 0)
+            [ -n "$ticks" ] || ticks=0
+            printf '%s %s %s\n' "$rss" "$fds" "$ticks"
+          }
+
+          sample() {
+            local label="$1" ctl_rss=0 fc_rss=0 fc_count=0 fds=0 ticks=0 p rss f t
+            for p in $(pgrep -f forkd-controller || true); do
+              read -r rss f t <<< "$(proc_stats "$p")"
+              ctl_rss=$((ctl_rss + rss))
+              fds=$((fds + f))
+              ticks=$((ticks + t))
+            done
+            for p in $(pgrep -x firecracker || true); do
+              read -r rss f t <<< "$(proc_stats "$p")"
+              fc_count=$((fc_count + 1))
+              fc_rss=$((fc_rss + rss))
+              fds=$((fds + f))
+              ticks=$((ticks + t))
+            done
+            printf '{"label":"%s","controller_rss_mb":%s,"firecracker_count":%s,"firecracker_rss_mb":%s,"cpu_ticks":%s,"fds":%s}\n' \
+              "$label" "$((ctl_rss / 1024))" "$fc_count" "$((fc_rss / 1024))" "$ticks" "$fds" \
+              | tee -a "$OUT"
+          }
+
+          # 宿主容量必须进 artifact：没有核数就无法区分「guest 不扩展」与
+          # 「runner 核不够」（两档 vCPU 会与 Firecracker 线程抢同一批核）。
+          echo "{\"label\":\"host\",\"nproc\":$(nproc),\"model\":\"$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo | sed 's/^ *//')\"}" | tee -a "$OUT"
+
+          N=6
+          sample idle
+          start=$(date +%s.%N)
+          created=0
+          for i in $(seq 1 "$N"); do
+            ok=0
+            for attempt in 1 2 3; do
+              if ./target/release/rfb-cli forkd sandbox-create --tag "$TAG" --json \
+                   > "$RUN_DIR/seq-$i.json" 2>&1; then
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            [ "$ok" = 1 ] || continue
+            created=$((created + 1))
+            sid=$(python3 -c '
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          if isinstance(data, list) and data:
+              data = data[0]
+          print(data.get("id", "") if isinstance(data, dict) else "")
+          ' "$RUN_DIR/seq-$i.json" 2>/dev/null || true)
+            [ -n "$sid" ] || continue
+            # destroy 会向 controller 确认列表里已无该 id 才返回，因此返回即
+            # 表示共享 tap 已释放，下一次 create 可以安全发起。
+            ./target/release/rfb-cli forkd sandbox-destroy "$sid" --json > /dev/null 2>&1 || true
+          done
+          end=$(date +%s.%N)
+          python3 -c '
+          import sys
+          n, created, start, end = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+          wall = max(end - start, 0.001)
+          print("{\"label\":\"sequential\",\"n_requested\":%d,\"n_created\":%d,\"wall_s\":%.3f,\"starts_per_sec\":%.2f}"
+                % (n, created, wall, created / wall))
+          ' "$N" "$created" "$start" "$end" | tee -a "$OUT"
+          echo '{"label":"parallel","status":"unsupported","reason":"shared tap admits one live sandbox; per_child_netns needs a root-provisioned netns pool (sudo scripts/netns-setup.sh N) and controller-mediated guest access"}' \
+            | tee -a "$OUT"
+          sample after-burst
+          sleep 3
+          sample steady
+          for f in "$RUN_DIR"/seq-*.json; do
+            sid=$(python3 -c '
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          if isinstance(data, list) and data:
+              data = data[0]
+          print(data.get("id", "") if isinstance(data, dict) else "")
+          ' "$f" 2>/dev/null || true)
+            [ -n "$sid" ] || continue
+            ./target/release/rfb-cli forkd sandbox-destroy "$sid" --json > /dev/null || true
+          done
+          sample after-destroy
+
+      # ZeroBoot/ZBRT 基准（与 forkd 并列的第二后端）：先构建 zeroboot-zbrt
+      # rootfs，再跑 full-protocol acceptance + 100 样本往返 bench，最后跑
+      # 容量基准（冷启动、并发阶梯 1/2/4/8/16、按内存档采样 Firecracker RSS）。
+      - name: ZeroBoot benchmark (acceptance + round trips + capacity ladder + RSS)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          mkdir -p "$RUN_DIR"
+          KERNEL="$PWD/resx/kernel/vmlinux-arcbox-0.0.24"
+          ZB_ROOTFS="$PWD/resx/rootfs/zeroboot-zbrt.ext4"
+          FC=/usr/local/bin/firecracker
+
+          ./target/release/rfb-cli image build-rootfs \
+            target/x86_64-unknown-linux-musl/release/rfb-runtime \
+            "$ZB_ROOTFS" --mode zeroboot-zbrt --force
+
+          ./target/release/rfb-cli zeroboot verify --bench --require-vm \
+            --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" --json \
+            | tee "$RUN_DIR/bench-zeroboot-verify.json"
+
+          # 阶梯同时扫 vCPU：会话池让并发命令真正并行，vCPU 才是吞吐的
+          # 上限轴；两档（1/2 vCPU）足以看出是否随核数扩展。
+          cargo build -p rfb-ben --release
+          ./target/release/rfb-ben zbrt \
+            --kernel "$KERNEL" --rootfs "$ZB_ROOTFS" --firecracker "$FC" \
+            --samples 100 --warmup 5 --levels 1,2,4,8,16 --rounds 4 \
+            --mem-mib 512 --vcpus 1,2 \
+            --json-out "$RUN_DIR/bench-zeroboot.json" | tee "$RUN_DIR/bench-zeroboot.log"
+
+          # Provider/SDK 真机验收（此前从未被任何驱动执行过的 #[ignore] 套件）：
+          # RFB_E2E_ZBRT_ROOTFS 指向 CI 构建出的 rootfs；fixture 目录里同时
+          # 放一份 zeroboot_real_e2e 期望的别名文件。
+          mkdir -p "$RUN_DIR/zb-rootfs"
+          cp "$ZB_ROOTFS" "$RUN_DIR/zb-rootfs/zeroboot-zbrt-e2e.ext4"
+          RFB_REAL_E2E=1 \
+          RFB_E2E_ZBRT_ROOTFS="$ZB_ROOTFS" \
+          RFB_E2E_FIRECRACKER="$FC" \
+            cargo test -p rfb-sdk --features cli --test zeroboot_provider_real \
+            -- --ignored --test-threads=1 2>&1 | tee "$RUN_DIR/zb-provider-real.log"
+          RFB_REAL_E2E=1 \
+          RFB_E2E_ROOTFS_DIR="$RUN_DIR/zb-rootfs" \
+          RFB_E2E_FIRECRACKER="$FC" \
+            cargo test -p rfb-sdk --features cli --test zeroboot_real_e2e \
+            -- --ignored --test-threads=1 2>&1 | tee "$RUN_DIR/zb-real-e2e.log"
+
+      # 100 并发热启动并发门（快照分片）：4 分片 + 64MiB/VM + 100 并发
+      # create（每分片摊薄 ~50ms/create）+ 100 并发 echo。内存账：100×64MiB
+      # + 4 父快照 CoW ≈ 7GB，16GB runner 可容纳。RFB_E2E_KERNEL 指向
+      # virtio-net 内核（热恢复对 arcbox 内核会 vsock panic）。
+      - name: Real-VM 100-concurrency gate (zeroboot snapshot shards)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          RUN="$PWD/examples/full/out/full-sandbox.ext4"
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
+          log="$RUN_DIR/zb-concurrency.log"
+          set +e
+          RFB_REAL_E2E=1 \
+          RFB_E2E_KERNEL="$PWD/resx/kernel/vmlinux-5.10.225" \
+          RFB_E2E_FIRECRACKER="$FC" \
+          RFB_E2E_CONCURRENCY=100 \
+          RFB_ZBRT_SNAPSHOT_DIR=/dev/shm/rfb-zbrt-snap \
+          RFB_ZBRT_SNAPSHOT_SHARDS=4 \
+          RFB_ZBRT_VM_MEM_MIB=64 \
+            cargo test -p rfb-sdk --features cli --release \
+            --test zeroboot_concurrency -- --ignored --nocapture 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::100 并发真机门失败 rc=$rc"
+            emit_diag "$log" zb-concurrency
+            exit "$rc"
+          fi
+          grep -q "100/100 execs ok" "$log"
+
+      # 真机 fork 门（zeroboot 快照分叉）：checkpoint 活动 VM → 恢复两个子
+      # VM（原沙箱延续 + fork），验证 workspace tmpfs 状态继承、两代沙箱
+      # 都可用、链式 fork（fork 的 fork）、checkpoint 目录随最后沙箱回收。
+      - name: Real-VM fork gate (zeroboot live checkpoint)
+        run: |
+          set -euo pipefail
+          RUN_DIR="$RUNNER_TEMP/forkd-e2e"
+          emit_diag() { bash scripts/ci-annotate.sh "$2" "$1" 3000; }
+          log="$RUN_DIR/zb-fork.log"
+          set +e
+          RFB_REAL_E2E=1 \
+          RFB_E2E_KERNEL="$PWD/resx/kernel/vmlinux-5.10.225" \
+          RFB_E2E_FIRECRACKER="$FC" \
+          RFB_E2E_ZBRT_ROOTFS="$PWD/examples/full/out/full-sandbox.ext4" \
+          RFB_ZBRT_SNAPSHOT_DIR=/dev/shm/rfb-zbrt-snap \
+          RFB_ZBRT_VM_MEM_MIB=64 \
+            cargo test -p rfb-sdk --features cli --release \
+            --test zeroboot_fork -- --ignored --nocapture 2>&1 | tee "$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] || ! grep -q "FORK_REAL_OK" "$log"; then
+            echo "::error::真机 fork 门失败 rc=$rc"
+            emit_diag "$log" zb-fork
+            exit "${rc:-1}"
+          fi
+
       # 清理必须无条件执行：删快照、停 controller、删 TAP、清临时目录。
       # 日志先归档到 logs 目录供下一步上传；本轮不设任何 token/key（无
       # FORKD_TOKEN），日志天然脱敏 —— 若未来引入认证，必须先过滤再上传。
@@ -271,6 +625,13 @@ jobs:
               --tag "$TAG" --force --json || \
               echo "warning: snapshot-delete $TAG 失败（可能未创建）"
           fi
+          # build-script 自定义镜像的第二快照（custom-image verify 步骤创建）。
+          if [ -n "${TAG2:-}" ] && [ -x target/release/rfb-cli ]; then
+            FORKD_ROOTFS="$PWD/examples/full/out/my-forkd.ext4" \
+              ./target/release/rfb-cli forkd snapshot-delete \
+              --tag "$TAG2" --force --json || \
+              echo "warning: snapshot-delete $TAG2 失败（可能未创建）"
+          fi
           if [ -f "$RUN_DIR/controller/pid" ]; then
             kill "$(cat "$RUN_DIR/controller/pid")" 2>/dev/null || true
           fi
@@ -285,7 +646,7 @@ jobs:
 
       - name: Upload sanitized logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: forkd-e2e-logs-${{ github.run_id }}
           path: ${{ runner.temp }}/forkd-e2e-logs/

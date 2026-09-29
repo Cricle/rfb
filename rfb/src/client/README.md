@@ -92,8 +92,8 @@ cargo test --workspace
 ## 已知限制
 
 1. **feature 门控**：`rfb::client` 需要 `forkd` feature；ZBRT 传输需要 `zeroboot` feature（默认 feature 集为空，与 crate 内 `forkd`/`backend` 模块的既有约定一致）。
-2. **NDJSON exec 不带 stdin**：`sdk/PROTOCOL.md` §2.2 的 `exec` 动作没有 stdin 字段，NDJSON 传输下 `exec` 的 `stdin` 参数被忽略（ZBRT 传输通过 `Execute.stdin` 传递）。
-3. **ZBRT eval 是约定映射**：ZBRT v1 没有 eval 操作，门面将 `eval(code)` 编码为 `Execute{argv: ["eval", code]}` 的 Execute 帧（见 `sdk/PROTOCOL.md` §3.2 会话语义之外的宿主侧约定）。
+2. **NDJSON exec 不带 stdin**：`sdk/PROTOCOL.md` §2.2 的 `exec` 动作没有 stdin 字段，NDJSON 传输下非空 `stdin` 本地 fail closed（抛 `Validation`，零帧——静默丢弃会让命令没有输入地运行；ZBRT 传输通过 `Execute.stdin` 传递）。
+3. **ZBRT eval fail closed**：ZBRT v1 没有 eval 操作，且参考 guest 把 Execute 原样当 `exec` 执行——门面对 ZBRT 传输的 `eval(code)` 抛 `Validation`（零帧），见 `sdk/shared/README.md §1`。
 4. **ZBRT 不支持 stdin 注入 / pty / env**：`GuestStream::send_input` 在 ZBRT 传输下抛 `Remote`；`stream(pty=Some(true))` 或非空 `env` 抛 `Validation`（fail closed）。
 5. **README 位置**：受任务约束（只能创建 `rfb/src/client/` 与 `rfb/tests/` 内的文件），本 README 放在 `rfb/src/client/README.md`。
 

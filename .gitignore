@@ -499,10 +499,6 @@ sdk/nodejs/lib/
 sdk/python/dist/
 sdk/python/build/
 sdk/python/*.egg-info/
-sdk/python-cli/dist/
-sdk/python-cli/build/
-sdk/python-cli/*.egg-info/
-sdk/python-cli/rfb_cli/_bin/
 # C# binary-only CLI payload (injected at release time)
 sdk/csharp/Rfb.Cli/tools/
 # Root-level release staging

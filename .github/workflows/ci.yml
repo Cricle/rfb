@@ -23,16 +23,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
       # 冷启动全特性编译（rustpython/mlua）约 8-12 分钟；rust-cache 复用
       # registry 与 target，key 跟随 Cargo.lock。
-      - uses: Swatinem/rust-cache@v2
-        with:
-          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       # all-features 会启用 rustpython（libffi-sys）等系统链接依赖
       - name: Install system packages
-        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev e2fsprogs musl-tools
+      # build_script_bakes_files_and_rust_apps_into_a_real_image（cli.rs）是
+      # 工具门控测试：有 cargo+musl target+mke2fs/debugfs 才会真正执行
+      # （静态 runtime 构建 + mke2fs/debugfs 组装 + debugfs 回读校验），
+      # 否则静默 skip。这里把依赖装齐，让它在 CI 里跑起来。
+      - name: Add musl target for tool-gated image tests
+        run: rustup target add x86_64-unknown-linux-musl
       - name: Check test layout and framework boundary
         run: |
           bash scripts/check-tests-folder.sh
@@ -182,7 +191,7 @@ jobs:
           fi
           git --version
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # 依赖安装（apt：python3/libicu/maven 等；dotnet：官方安装脚本）与三个
       # 套件的执行全部内聚在脚本内。容器默认即 root，无需 sudo。
@@ -214,7 +223,7 @@ jobs:
       # 失败也要留证据：脚本汇总/逐套件日志 + C# trx + Java surefire XML。
       - name: Upload E2E summary and test reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ci-sdk-e2e-${{ github.run_id }}
           path: |
@@ -223,3 +232,18 @@ jobs:
             sdk/java/tests/target/surefire-reports/
           if-no-files-found: ignore
           retention-days: 7
+
+  msrv:
+    name: MSRV check (Rust 1.90)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: 1.90.0
+      # A fast compile-only check (no clippy/tests) to catch dependency MSRV regressions.
+      # Dependabot may try to bump past the declared MSRV; this job fails before the
+      # version reaches CI's all-features build.
+      - name: cargo check –all-features
+        run: cargo check --workspace --all-features

@@ -9,6 +9,7 @@ mod all;
 mod artifact;
 mod build;
 mod manifest;
+mod script;
 mod verify;
 
 pub use all::build_all;
@@ -17,11 +18,15 @@ pub use artifact::{
     ArtifactVm,
 };
 pub use build::{
-    build, build_rootfs, image_diagnostics, init, profile_summary, RootfsOptions, LUA_LIB_DIR,
-    PY_SITE_PACKAGES,
+    build, build_rootfs, image_diagnostics, init, profile_summary, validate_extra_guest_path,
+    ExtraFile, RootfsOptions, LUA_LIB_DIR, PY_SITE_PACKAGES,
 };
+pub(crate) use manifest::hex_lower;
 pub use manifest::{
     load, safe_join, sha256, sha256_bytes, validate, ImageManifestWire, StagedFile,
     StagingManifest, FORKD_PROFILE, FORKD_PROTOCOL, FORKD_TRANSPORT,
 };
-pub use verify::{build_static_runtime, check_kernel, inspect_rootfs, run_debugfs};
+pub use script::{build_from_script, features_for, parse_script, SCRIPT_SCHEMA};
+pub use verify::{
+    build_static_runtime, check_kernel, inspect_rootfs, run_debugfs, verify_installed_file,
+};

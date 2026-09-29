@@ -142,7 +142,7 @@ fn fake_rpc_lifecycle_and_permission_boundaries() {
 #[test]
 fn rfb_contracts_are_local_and_non_networked() {
     assert_eq!(TransportKind::InProcess, TransportKind::InProcess);
-    assert!(Capability::Execute != Capability::ReadFramebuffer);
+    assert!(Capability::Execute != Capability::Snapshot);
     assert!(Resources {
         cpus: Some(0),
         ..Default::default()

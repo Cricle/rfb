@@ -6,6 +6,8 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "Rig integration for RFB sandbox testing"
+keywords = ["sandbox", "rig", "llm", "tools"]
+categories = ["development-tools::testing", "api-bindings"]
 
 [dependencies]
 rfb = { package = "rfb-sdk", path = "../rfb", version = "0.0.1" }

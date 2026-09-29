@@ -62,25 +62,33 @@ public class FacadeTests {
     }
 
     [Fact]
-    public async Task Exec_DropsStdinOverNdjson() {
+    public async Task Exec_RejectsStdinOverNdjson() {
         using var fx = await NewFixtureAsync("ndjson");
-        // Rust baseline: the NDJSON exec wire contract has no stdin channel;
-        // non-empty stdin is silently dropped (delivered only over ZBRT).
-        var result = await fx.Sandbox.Exec(new[] { "echo", "hi" }, stdin: new byte[] { 1, 2, 3 });
-        Assert.Equal(0, result.ExitCode);
+        // The NDJSON exec wire contract has no stdin channel: non-empty stdin
+        // would run the command WITHOUT its input, so fail closed.
+        await Assert.ThrowsAsync<ValidationException>(
+            () => fx.Sandbox.Exec(new[] { "echo", "hi" }, stdin: new byte[] { 1, 2, 3 }));
     }
 
-    [Theory]
-    [InlineData("ndjson")]
-    [InlineData("zbrt")]
-    public async Task Eval_OutputMapsToStdout_IdenticalShapes(string transport) {
-        using var fx = await NewFixtureAsync(transport);
+    [Fact]
+    public async Task Eval_OutputMapsToStdout() {
+        using var fx = await NewFixtureAsync("ndjson");
         var result = await fx.Sandbox.Eval("1+1", cwd: "/workspace", timeoutS: 5);
         Assert.Equal(0, result.ExitCode);
         Assert.Equal("2"u8.ToArray(), result.Stdout);
         Assert.Equal("2", result.StdoutText);
         Assert.Empty(result.Stderr);
         Assert.False(result.TimedOut);
+    }
+
+    [Fact]
+    public async Task Eval_OverZbrt_FailsClosed() {
+        // ZBRT v1 has no eval opcode and the reference guest maps Execute
+        // verbatim onto `exec`: the old "facade convention" surfaced the
+        // guest's `eval: not found` exit code as a successful result. The
+        // facade rejects eval over ZBRT locally instead.
+        using var fx = await NewFixtureAsync("zbrt");
+        await Assert.ThrowsAsync<ValidationException>(() => fx.Sandbox.Eval("1+1", cwd: "/workspace", timeoutS: 5));
     }
 
     [Theory]

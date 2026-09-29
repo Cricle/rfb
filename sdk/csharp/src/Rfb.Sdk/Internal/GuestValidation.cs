@@ -22,9 +22,12 @@ internal static class GuestValidation
         {
             return StrictUtf8.GetByteCount(s);
         }
-        catch (DecoderFallbackException)
+        catch (EncoderFallbackException)
         {
-            return int.MaxValue; // unencodable — treat as over-limit
+            // GetByteCount is the encoding side: an unpaired surrogate raises
+            // EncoderFallbackException (not DecoderFallbackException). Treat it
+            // as over-limit instead of leaking a non-RfbException.
+            return int.MaxValue;
         }
     }
 

@@ -55,27 +55,16 @@ pub fn init_pid1_with_console(attach_console: bool) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn mount_if_needed(source: &str, target: &str, fstype: &str) -> std::io::Result<()> {
+    // No "already mounted" probe: mount(NULL, target, NULL, MS_RDONLY) can
+    // never detect an existing mount (NULL fstype is ENODEV). Idempotency
+    // comes solely from the EBUSY tolerance below, which is exactly what a
+    // resumed (snapshot-restored) VM relies on — its mounts are inherited.
     let target_c = std::ffi::CString::new(target).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "mount target contains NUL",
         )
     })?;
-    if fs::metadata(target).is_ok()
-        // SAFETY: every pointer is either null (allowed for mount(2)) or a
-        // NUL-terminated CString that outlives the call.
-        && unsafe {
-            libc::mount(
-                std::ptr::null(),
-                target_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_RDONLY,
-                std::ptr::null(),
-            )
-        } == 0
-    {
-        return Ok(());
-    }
     let source = std::ffi::CString::new(source).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -85,13 +74,12 @@ fn mount_if_needed(source: &str, target: &str, fstype: &str) -> std::io::Result<
     let fstype = std::ffi::CString::new(fstype).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "mount type contains NUL")
     })?;
-    let target = target_c;
     // SAFETY: all three pointers come from live CStrings; flags/data are
     // plain values, so the kernel only reads the provided buffers.
     let rc = unsafe {
         libc::mount(
             source.as_ptr(),
-            target.as_ptr(),
+            target_c.as_ptr(),
             fstype.as_ptr(),
             0,
             std::ptr::null(),

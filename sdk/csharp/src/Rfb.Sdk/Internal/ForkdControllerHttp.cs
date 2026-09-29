@@ -132,20 +132,24 @@ internal sealed class ForkdControllerHttp : IDisposable
     }
 
     /// <summary>Non-2xx → HttpStatusException (body JSON `error` field, else first 1024 chars); else parse JSON.</summary>
-    private static async Task<JsonDocument> ParseAsync(RawResponse raw)
+    private static Task<JsonDocument> ParseAsync(RawResponse raw)
     {
-        if (!raw.IsSuccess)
-        {
-            throw new HttpStatusException(raw.Status, ExtractErrorMessage(raw.Body));
-        }
-
         try
         {
-            return JsonDocument.Parse(raw.Body);
+            if (!raw.IsSuccess)
+            {
+                throw new HttpStatusException(raw.Status, ExtractErrorMessage(raw.Body));
+            }
+
+            return Task.FromResult(JsonDocument.Parse(raw.Body));
+        }
+        catch (HttpStatusException e)
+        {
+            return Task.FromException<JsonDocument>(e);
         }
         catch (JsonException e)
         {
-            throw new DecodeException($"invalid forkd response: {e.Message}");
+            return Task.FromException<JsonDocument>(new DecodeException($"invalid forkd response: {e.Message}"));
         }
     }
 

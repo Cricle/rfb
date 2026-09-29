@@ -26,19 +26,19 @@ class DtoJsonTest {
     void snapshotInfoDeserializesWithDefaults() {
         Snapshot snapshot = io.rfb.sdk.internal.Json.MAPPER
                 .convertValue(parse("{\"tag\":\"base\"}"), Snapshot.class);
-        assertEquals("base", snapshot.tag);
-        assertEquals("", snapshot.dir);
-        assertEquals("", snapshot.status);
-        assertFalse(snapshot.bootable);
-        assertNull(snapshot.createdAtUnix);
-        assertNull(snapshot.branchedFrom);
-        assertNull(snapshot.pauseMs);
-        assertNull(snapshot.diffMs);
-        assertNull(snapshot.diffPhysicalBytes);
-        assertNull(snapshot.diffLogicalBytes);
-        assertNull(snapshot.warning);
-        assertNull(snapshot.digest);
-        assertNull(snapshot.provenance);
+        assertEquals("base", snapshot.getTag());
+        assertEquals("", snapshot.getDir());
+        assertEquals("", snapshot.getStatus());
+        assertFalse(snapshot.isBootable());
+        assertNull(snapshot.getCreatedAtUnix());
+        assertNull(snapshot.getBranchedFrom());
+        assertNull(snapshot.getPauseMs());
+        assertNull(snapshot.getDiffMs());
+        assertNull(snapshot.getDiffPhysicalBytes());
+        assertNull(snapshot.getDiffLogicalBytes());
+        assertNull(snapshot.getWarning());
+        assertNull(snapshot.getDigest());
+        assertNull(snapshot.getProvenance());
     }
 
     @Test
@@ -46,15 +46,15 @@ class DtoJsonTest {
         SandboxInfo info = io.rfb.sdk.internal.Json.MAPPER.convertValue(
                 parse("{\"id\":\"sb-1\",\"snapshot_tag\":\"base\",\"guest_addr\":\"127.0.0.1:7021\"}"),
                 SandboxInfo.class);
-        assertEquals("sb-1", info.id);
-        assertEquals("base", info.snapshotTag);
-        assertEquals("127.0.0.1:7021", info.guestAddr);
-        assertNull(info.netns);
-        assertNull(info.createdAtUnix);
-        assertNull(info.memoryLimitMib);
-        assertNull(info.pid);
-        assertFalse(info.hasBranched);
-        assertEquals(0, info.branchCount);
+        assertEquals("sb-1", info.getId());
+        assertEquals("base", info.getSnapshotTag());
+        assertEquals("127.0.0.1:7021", info.getGuestAddr());
+        assertNull(info.getNetns());
+        assertNull(info.getCreatedAtUnix());
+        assertNull(info.getMemoryLimitMib());
+        assertNull(info.getPid());
+        assertFalse(info.isHasBranched());
+        assertEquals(0, info.getBranchCount());
     }
 
     @Test
@@ -65,19 +65,19 @@ class DtoJsonTest {
                         + "\"diff_physical_bytes\":56,\"diff_logical_bytes\":78,\"warning\":\"w\","
                         + "\"status\":\"ready\",\"bootable\":true,\"digest\":\"sha256:abc\","
                         + "\"provenance\":{\"k\":1}}"), Snapshot.class);
-        assertEquals("base", snapshot.tag);
-        assertEquals("/snaps/base", snapshot.dir);
-        assertEquals(Long.valueOf(17), snapshot.createdAtUnix);
-        assertEquals("root", snapshot.branchedFrom);
-        assertEquals(Long.valueOf(12), snapshot.pauseMs);
-        assertEquals(Long.valueOf(34), snapshot.diffMs);
-        assertEquals(Long.valueOf(56), snapshot.diffPhysicalBytes);
-        assertEquals(Long.valueOf(78), snapshot.diffLogicalBytes);
-        assertEquals("w", snapshot.warning);
-        assertEquals("ready", snapshot.status);
-        assertTrue(snapshot.bootable);
-        assertEquals("sha256:abc", snapshot.digest);
-        assertNotNull(snapshot.provenance);
+        assertEquals("base", snapshot.getTag());
+        assertEquals("/snaps/base", snapshot.getDir());
+        assertEquals(Long.valueOf(17), snapshot.getCreatedAtUnix());
+        assertEquals("root", snapshot.getBranchedFrom());
+        assertEquals(Long.valueOf(12), snapshot.getPauseMs());
+        assertEquals(Long.valueOf(34), snapshot.getDiffMs());
+        assertEquals(Long.valueOf(56), snapshot.getDiffPhysicalBytes());
+        assertEquals(Long.valueOf(78), snapshot.getDiffLogicalBytes());
+        assertEquals("w", snapshot.getWarning());
+        assertEquals("ready", snapshot.getStatus());
+        assertTrue(snapshot.isBootable());
+        assertEquals("sha256:abc", snapshot.getDigest());
+        assertNotNull(snapshot.getProvenance());
     }
 
     @Test

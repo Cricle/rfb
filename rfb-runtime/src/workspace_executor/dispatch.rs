@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
+/// Per-file grep scan cap — mirrors the forkd agent's `GREP_SCAN_CAP` so both
+/// grep implementations refuse to materialize oversized files.
+const GREP_FILE_SCAN_CAP: u64 = 16 * 1024 * 1024;
+
 impl WorkspaceGuestExecutor {
     /// Dispatch one structured prompt into the typed workspace operations.
     pub(super) fn structured(
@@ -23,7 +27,7 @@ impl WorkspaceGuestExecutor {
             object.keys().any(|key| {
                 !matches!(
                     key.as_str(),
-                    "op" | "args" | "cwd" | "stdin" | "timeout_secs" | "timeout_ms"
+                    "op" | "args" | "cwd" | "stdin" | "stdin_b64" | "timeout_secs" | "timeout_ms"
                 )
             })
         }) {
@@ -230,6 +234,15 @@ impl WorkspaceGuestExecutor {
             if scanned >= max_bytes {
                 truncated = true;
                 break 'outer;
+            }
+            // Per-file cap BEFORE reading (mirrors the forkd agent's
+            // GREP_SCAN_CAP): the workspace tmpfs allows 256 MiB files, and
+            // materializing one whole would OOM a 512 MiB guest VM (PID-1 is
+            // the runtime — an OOM kill takes the sandbox down). Skip
+            // oversized files instead; the aggregate max_bytes budget keeps
+            // small-file scans bounded.
+            if meta.len() > GREP_FILE_SCAN_CAP {
+                continue;
             }
             let data = match fs::read(&current) {
                 Ok(data) => data,

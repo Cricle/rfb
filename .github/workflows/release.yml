@@ -29,6 +29,12 @@ on:
 permissions:
   contents: read
 
+# 同一 tag 的重跑串行化：TOCTOU 存在性检查/上传不允许并发交错，否则
+# 一次成功一次失败（docs/RELEASE.md 承诺的重跑安全依赖串行）。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   crates:
     name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
@@ -40,17 +46,24 @@ jobs:
     steps:
       # fetch-depth 0：release.sh 用 git describe --tags --exact-match 校验
       # tag 与 workspace 版本一致，浅克隆拿不到 tag 会导致发布误判失败。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: stable
       - name: Validate tag matches workspace version
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(x["version"] for x in json.load(sys.stdin)["packages"] if x["name"] == "rfb-sdk"))')
-          test "$TAG" = "v$VERSION" || { echo "tag $TAG != v$VERSION" >&2; exit 1; }
+          # 三个已发布的 crate 都必须与 tag 一致：只对 rfb-sdk 校验会让
+          # "部分 bump" 通过门禁，而 release.sh 会跳过 crates.io 上已存在的
+          # 版本，导致新 tag 悄悄发布旧版本依赖。
+          for name in rfb-runtime rfb-sdk rfb-rig; do
+            VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(next(x['version'] for x in json.load(sys.stdin)['packages'] if x['name'] == '$name'))")
+            test "$TAG" = "v$VERSION" || { echo "tag $TAG != v$VERSION for $name" >&2; exit 1; }
+          done
       - name: Publish (gates + package + three crates in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
@@ -83,16 +96,17 @@ jobs:
           sha256sum "dist/rfb-${TAG}.tar.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-cli-linux-x64" >> dist/SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           files: |
             dist/rfb-${{ github.ref_name }}.tar.gz
             dist/rfb-cli-linux-x64
             dist/SHA256SUMS
           generate_release_notes: true
-      # CLI 二进制供 pypi / nuget job 打包（rfb-cli / Rfb.Cli）。
+      # CLI 二进制供 npm / nuget job 打包（rfb-cli / Rfb.Cli；两者都是
+      # 仅清单 + 二进制的包，不含任何包装代码）。
       - name: Upload CLI binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rfb-cli-linux-x64
           path: dist/rfb-cli
@@ -100,13 +114,19 @@ jobs:
           retention-days: 1
 
   pypi:
-    name: Publish rfb-sdk + rfb-cli to PyPI
+    name: Publish rfb-sdk to PyPI
     needs: crates
     runs-on: ubuntu-latest
+    # OIDC trusted publishing：首次发布前需在
+    # https://pypi.org/manage/project/rfb-sdk/settings/ 启用
+    # "Trusted Publishing"（信任本仓库的当前名字和工作流）；配置完成后可撤回
+    # PYPI_KEY secret。配置前发布会因 OIDC 凭据无效而失败。
+    permissions:
+      id-token: write
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
       - name: Build sdist and wheel
@@ -125,7 +145,7 @@ jobs:
             bash scripts/ci-annotate.sh release-pypi "$log" 3000
             exit "$rc"
           fi
-      # 重跑保护：PyPI 上该版本已存在时跳过发布（twine 对重复文件会报错失败）。
+      # 重跑保护：PyPI 上该版本已存在时跳过发布（重复版本发布会报错失败）。
       - name: Skip publish if version already on PyPI (rfb-sdk)
         id: pypi_guard
         run: |
@@ -138,75 +158,25 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+      # Trusted publishing（OIDC）：不传 `password` 且 job 具有 id-token: write
+      # 时，action 自动走 OIDC 交换（无需长期 PYPI_KEY）；attestations 默认开启
+      # （PEP 740）。该 action 没有 trusted-publishing 输入。
       - name: Publish rfb-sdk to PyPI
         if: steps.pypi_guard.outputs.exists != 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
         with:
           packages-dir: sdk/python/dist
-          password: ${{ secrets.PYPI_KEY }}
-
-      # rfb-cli：二进制 wheel（仅 linux-x64，无任何 Python 包装代码）。
-      - name: Download CLI binary
-        uses: actions/download-artifact@v8
-        with:
-          name: rfb-cli-linux-x64
-          path: dist-cli/raw
-      - name: Build rfb-cli wheel
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade build wheel
-          mkdir -p sdk/python-cli/rfb_cli/_bin dist-cli
-          cp dist-cli/raw/rfb-cli sdk/python-cli/rfb_cli/_bin/rfb-cli
-          chmod +x sdk/python-cli/rfb_cli/_bin/rfb-cli
-          python -m build --wheel sdk/python-cli
-          wheel_file=$(ls sdk/python-cli/dist/*.whl)
-          # --remove：不带它 wheel tags 会同时留下原 py3-none-any wheel，
-          # 而 any-wheel 会把 linux-x64 二进制装到 mac/Windows 上（实测
-          # PyPI 0.0.1 曾同时出现两个文件）。
-          python -m wheel tags --remove --platform-tag manylinux_2_39_x86_64 "$wheel_file"
-          mv sdk/python-cli/dist/*.whl dist-cli/
-      - name: Skip publish if version already on PyPI (rfb-cli)
-        id: pypi_cli_guard
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          code=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/rfb-cli/${VERSION}/json" || true)
-          if [ "$code" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "rfb-cli ${VERSION} 已在 PyPI 上，跳过重复发布"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Publish rfb-cli to PyPI
-        if: steps.pypi_cli_guard.outputs.exists != 'true'
-        env:
-          PYPI_KEY: ${{ secrets.PYPI_KEY }}
-        run: |
-          set -uo pipefail
-          # 用 twine 而非 pypa action：上传失败的原因（403 token 范围 /
-          # 400 元数据）必须以 ::error:: 注解带出，否则无法排障。
-          python -m pip install --upgrade twine
-          log=/tmp/release-py-cli.log
-          set +e
-          python -m twine upload --verbose --non-interactive \
-            -u __token__ -p "$PYPI_KEY" dist-cli/*.whl 2>&1 | tee "$log"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::twine upload rfb-cli 失败 rc=$rc（尾部见注解）"
-            bash scripts/ci-annotate.sh release-py-cli "$log" 2000
-            exit "$rc"
-          fi
 
   maven:
     name: Publish rfb-sdk to Maven Central
+    needs: crates
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       HAS_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
@@ -280,18 +250,29 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Verify pom version matches the tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          pom_version=$(python3 -c "import xml.etree.ElementTree as ET; root = ET.parse('sdk/java/pom.xml').getroot(); print(root.find('{http://maven.apache.org/POM/4.0.0}version').text.strip())")
+          if [ "$pom_version" != "$VERSION" ]; then
+            echo "::error::sdk/java/pom.xml 版本 $pom_version != tag $VERSION：先同步 pom 版本再重试（Central 不接受重发同版本）"
+            exit 1
+          fi
       - name: Publish to Maven Central
         # Namespace 需在 Central portal 完成一次性验证（一次性的 portal 操作，GitHub 账号即可验证）；验证前发布
         # 必须真实失败（不掩盖），验证通过后自动恢复。
         if: steps.maven_guard.outputs.exists != 'true'
         env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          # maven-gpg-plugin 3.2+ 读取该环境变量；不要把口令放进 argv
+          # （/proc/<pid>/cmdline 对所有本机进程可见）。
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -uo pipefail
           log=/tmp/release-maven.log
           set +e
           mvn --batch-mode --no-transfer-progress -Pcentral-release deploy \
-            -f sdk/java/pom.xml -Dgpg.passphrase="$GPG_PASSPHRASE" 2>&1 | tee "$log"
+            -f sdk/java/pom.xml 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
@@ -312,8 +293,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: '8.0.x'
       # 重跑保护：已上架的包跳过 pack/push。
@@ -330,7 +311,7 @@ jobs:
           echo "cli_missing=$([ "$cli_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Download CLI binary
         if: steps.nuget_guard.outputs.cli_missing == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rfb-cli-linux-x64
           path: rfb-cli-bin
@@ -380,10 +361,13 @@ jobs:
     name: Publish rfb-sdk + rfb-cli to npm
     needs: crates
     runs-on: ubuntu-latest
+    # --provenance 需要 id-token write 权限（生成 npm 的 Sigstore 签名）。
+    permissions:
+      id-token: write
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -400,8 +384,8 @@ jobs:
           echo "sdk_missing=$([ "$sdk_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "cli_missing=$([ "$cli_code" != "200" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      # rfb-sdk：TypeScript SDK。prepublishOnly 的 npm test 会在 publish 时再跑
-      # 一次构建+测试，这里显式执行以把失败挡在 publish 之前并留下日志。
+      # rfb-sdk：TypeScript SDK。prepublishOnly 会在 publish 时重建 dist
+      # （npm run build）；测试必须在这里显式执行，否则不会挡在 publish 之前。
       - name: Publish rfb-sdk
         if: steps.npm_guard.outputs.sdk_missing == 'true'
         env:
@@ -414,7 +398,7 @@ jobs:
             cd sdk/nodejs
             npm ci --no-audit --no-fund
             npm test
-            npm publish
+            npm publish --provenance
           } 2>&1 | tee "$log"
           rc=$?
           set -e
@@ -427,7 +411,7 @@ jobs:
       # rfb-cli：仅二进制的 npm 包（linux-x64 原生二进制 + bin 入口，无 JS 包装）。
       - name: Download CLI binary
         if: steps.npm_guard.outputs.cli_missing == 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rfb-cli-linux-x64
           path: dist-cli/raw
@@ -476,7 +460,7 @@ jobs:
           set +e
           # `./` 前缀强制目录语义：不带它 npm 会把 dist/npm-cli 当 GitHub 简写
           # （owner/repo）解析并去 git ls-remote（实测 rc=128）。
-          npm publish ./dist/npm-cli 2>&1 | tee "$log"
+          npm publish ./dist/npm-cli --provenance 2>&1 | tee "$log"
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then

@@ -2,24 +2,26 @@
 
 ## 目的
 
-在一台**全新**的 Debian 12 环境里验证三个 SDK 测试套件完整有效：从零安装工具链
-（python3 / .NET 8 / openjdk-17 + maven），然后跑齐：
+在一台**全新**的 Debian 12 环境里验证四个 SDK 测试套件完整有效：从零安装工具链
+（python3 / .NET 8 / openjdk-17 + maven / nodejs + npm），然后跑齐：
 
 - Python SDK：`python3 -m unittest discover -s tests -v`
-- C# SDK：`dotnet test`（先清理 bin/obj 陈旧产物）
-- Java SDK：`mvn test`（surefire）
+- C# SDK：`dotnet build`（全目标框架）+ `dotnet test`（先清理 bin/obj 陈旧产物）
+- Java SDK：`mvn install -DskipTests` + `mvn test`（surefire）
+- Node.js SDK：`npm ci` + `npm test`（tsc 构建 + node 直跑测试文件）
 
 这样能捕捉"在开发机上能跑、在干净环境缺依赖/缺文件"类问题，保证 SDK 交付物
 自带完整可验证的测试资产。
 
 ## 覆盖矩阵
 
-| 套件 | 目录 | 命令 | 验证记录（rfb-e2e-debian，2026-09） |
-|------|------|------|--------------------------------------|
-| Python | `sdk/python` | `python3 -m unittest discover -s tests -v` | 119 个用例全绿 |
-| C# | `sdk/csharp` | `dotnet test`（.NET 8 SDK 8.0.424） | 构建与测试全绿 |
-| Java | `sdk/java` | `mvn test`（openjdk-17 + maven） | 8 个测试类 101 个用例，0 失败 0 错误 0 跳过 |
-| Rust | 不在本脚本范围 | — | 由 cargo 门禁（fmt/clippy/test）与 `rfb e2e.yml` 覆盖 |
+| 套件 | 目录 | 命令 | 验证记录（2026-09，CI debian:12 同脚本） |
+|------|------|------|------------------------------------------|
+| Python | `sdk/python` | `python3 -m unittest discover -s tests -v` | 135 个用例全绿 |
+| C# | `sdk/csharp` | `dotnet build` + `dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj` | netstandard2.1 + net8.0 编译通过；125 个用例全绿 |
+| Java | `sdk/java` | `mvn install -DskipTests` + `mvn test`（openjdk-17 + maven） | 108 个用例，0 失败 0 错误 0 跳过 |
+| Node.js | `sdk/nodejs` | `npm ci` + `npm test` | 38 个用例全绿 |
+| Rust | 不在本脚本范围 | — | 由 cargo 门禁（fmt/clippy/test）与 `.github/workflows/e2e.yml` 覆盖 |
 
 ## 本地用法（Windows + WSL2）
 
@@ -61,7 +63,7 @@ MSYS_NO_PATHCONV=1 wsl.exe -d rfb-e2e-debian -u root -- \
 ### 只跑部分套件 / 复用已装依赖
 
 ```bash
-E2E_SKIP_PYTHON=1 E2E_SKIP_DOTNET=1 E2E_SKIP_APT=1  # 例如只跑 Java
+E2E_SKIP_PYTHON=1 E2E_SKIP_DOTNET=1 E2E_SKIP_NODE=1 E2E_SKIP_APT=1  # 例如只跑 Java
 ```
 
 | 环境变量 | 作用 |
@@ -69,6 +71,7 @@ E2E_SKIP_PYTHON=1 E2E_SKIP_DOTNET=1 E2E_SKIP_APT=1  # 例如只跑 Java
 | `E2E_SKIP_PYTHON=1` | 跳过 Python 套件 |
 | `E2E_SKIP_DOTNET=1` | 跳过 C# 套件 |
 | `E2E_SKIP_JAVA=1` | 跳过 Java 套件 |
+| `E2E_SKIP_NODE=1` | 跳过 Node.js 套件 |
 | `E2E_SKIP_APT=1` | 跳过 apt 依赖安装（依赖已备好时） |
 | `E2E_OUT_DIR=...` | 日志/汇总输出目录（默认系统临时目录，退出即清） |
 | `DOTNET_CHANNEL` | dotnet SDK 大版本（默认 8.0） |
@@ -79,24 +82,23 @@ E2E_SKIP_PYTHON=1 E2E_SKIP_DOTNET=1 E2E_SKIP_APT=1  # 例如只跑 Java
 | 退出码 | 含义 |
 |--------|------|
 | 0 | 全部启用的套件通过 |
-| 1 | 有启用的套件失败（逐套件日志在输出目录 `python.log` / `dotnet.log` / `maven.log`） |
+| 1 | 有启用的套件失败（逐套件日志在输出目录 `python.log` / `dotnet.log` / `dotnet-build.log` / `maven.log` / `node.log`） |
 | 12 | 基础工具缺失（非 Debian 系 / 无 apt-get / 非 root 且无 sudo / curl 缺失等） |
 
 ## CI 行为
 
-`.github/workflows/sdk-e2e.yml`（`RFB SDK Debian E2E`）：
+`.github/workflows/ci.yml` 的 `SDK build and tests (debian:12)` job（非 main 分支推送触发；
+main 分支由 `e2e.yml` 跑真机 E2E）：
 
-- 触发：`workflow_dispatch`；push 到 `main` 且改动 `sdk/**` 或工作流文件本身；
-  每周一 02:30 UTC 的 weekly schedule。
 - 运行环境：`ubuntu-latest` 上的 `container: debian:12`，与本地 WSL 验证环境同源，
   无需 WSL —— 脚本自动识别非 WSL 环境，走同一套 apt + dotnet-install 依赖流程。
 - 步骤：装 git → checkout → `bash sdk/e2e/debian-e2e.sh` → `always()` 上传
   汇总日志 + C# trx + Java surefire XML artifact。
-- 约束与仓库其他工作流一致：`permissions: contents: read`、并发组排队、零 secret。
+- 约束与仓库其他工作流一致：`permissions: contents: read`、并发组取消旧运行、零 secret。
 
 ## Rust 为什么不在覆盖矩阵里
 
 Rust 侧（`rfb` / `rfb-runtime` 等 crate）由仓库强制的 cargo 门禁
 （`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
 `cargo test --workspace`）以及真机 E2E 工作流 `.github/workflows/e2e.yml` 覆盖，
-本脚本只聚焦三个 SDK 的"全新环境可验证性"。
+本脚本只聚焦四个 SDK 的"全新环境可验证性"。

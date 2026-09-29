@@ -112,8 +112,8 @@ public final class Sandbox {
      * Execute one command. {@code cwd} null resolves to the guest root
      * ({@code /workspace} over NDJSON; no cwd field over ZBRT). {@code stdin}
      * is delivered over the ZBRT transport; the NDJSON wire contract has no
-     * exec stdin channel, so non-empty stdin is silently dropped there
-     * (Rust baseline behavior).
+     * exec stdin channel, so non-empty stdin fails closed there (running the
+     * command without its input would be silent data loss).
      */
     public ExecResult exec(List<String> args, String cwd, double timeoutS, byte[] stdin) {
         if (args == null || args.isEmpty()) {
@@ -127,15 +127,21 @@ public final class Sandbox {
         }
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
             // The ZBRT deadline travels as whole seconds (ceil), not
-            // truncated milliseconds.
-            long timeoutMs = (long) Math.ceil(timeoutS) * 1000;
+            // truncated milliseconds; beyond the u32 wire range it clamps to
+            // the maximum (mirrors the Rust baseline's u32::MAX saturation).
+            long timeoutMs = Math.min(
+                    (long) Math.ceil(timeoutS) * 1000, 0xFFFFFFFFL);
             try (ZbrtConnection conn = openZbrt()) {
                 ZbrtConnection.Exec exec = conn.execute(args, cwd, stdin, timeoutMs);
                 return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
             }
         }
-        // Rust baseline: the NDJSON exec wire contract has no stdin channel;
-        // non-empty stdin is silently dropped (delivered only over ZBRT).
+        // The NDJSON exec wire contract has no stdin channel: non-empty stdin
+        // would run the command WITHOUT its input, so fail closed (delivered
+        // only over ZBRT; mirrors the Rust baseline).
+        if (stdin != null && stdin.length > 0) {
+            throw new ValidationError("stdin is only supported over the ZBRT transport");
+        }
         ObjectNode action = Json.object()
                 .put("action", "exec")
                 .put("cwd", cwd != null ? cwd : "/workspace")
@@ -147,8 +153,9 @@ public final class Sandbox {
         JsonNode v = ndjsonRequest(action);
         return new ExecResult(
                 statusCode(v, -1),
-                Json.valueBytes(firstOf(v, "out", "stdout")),
-                Json.valueBytes(firstOf(v, "err", "stderr")),
+                // UNIFIED_API.md §4: the current keys win when both are present.
+                Json.valueBytes(firstOf(v, "stdout", "out")),
+                Json.valueBytes(firstOf(v, "stderr", "err")),
                 v.path("timed_out").asBoolean(false));
     }
 
@@ -162,11 +169,10 @@ public final class Sandbox {
 
     /**
      * Evaluate a code snippet in the guest. Eval output maps to
-     * {@link ExecResult#stdout} on both transports. Over ZBRT (which has no
-     * eval opcode) the facade convention is one Execute turn with
-     * {@code argv=["eval", code]}, empty stdin and {@code timeout_ms} =
-     * whole seconds &times; 1000 (0 when {@code timeoutS} is null) — see
-     * {@code sdk/shared/README.md}.
+     * {@link ExecResult#stdout}. NDJSON carries {@code {"action":"eval"}};
+     * over ZBRT the call fails closed with {@link ValidationError} (ZBRT v1
+     * has no eval opcode and the reference guest would run a literal
+     * {@code eval <code>} command) — see {@code sdk/shared/README.md §1}.
      */
     public ExecResult eval(String code, String cwd, Double timeoutS) {
         Validation.evalCode(code);
@@ -182,16 +188,10 @@ public final class Sandbox {
             Validation.evalTimeoutSeconds(timeoutSecs);
         }
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
-            // Whole seconds as milliseconds; beyond the u32 wire range the
-            // deadline is dropped (mirrors the Rust baseline's unwrap_or(0)).
-            long timeoutMs = timeoutSecs > 0 && timeoutSecs <= 0xFFFFFFFFL / 1000
-                    ? timeoutSecs * 1000
-                    : 0;
-            try (ZbrtConnection conn = openZbrt()) {
-                ZbrtConnection.Exec exec = conn.execute(
-                        Arrays.asList("eval", code), cwd, new byte[0], timeoutMs);
-                return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
-            }
+            // ZBRT v1 has no eval opcode and the reference guest maps Execute
+            // verbatim onto `exec` — fail closed instead of running a literal
+            // `eval <code>` command (mirrors the Rust facade).
+            throw new ValidationError("eval is not supported over the ZBRT transport");
         }
         ObjectNode action = Json.object().put("action", "eval").put("code", code);
         if (cwd != null) {
@@ -202,8 +202,8 @@ public final class Sandbox {
         }
         JsonNode v = ndjsonRequest(action);
         return new ExecResult(
-                statusCode(v, 0),
-                Json.valueBytes(firstOf(v, "out", "output")),
+                statusCode(v, 0, "status", "exit_code"),
+                Json.valueBytes(firstOf(v, "output", "out")),
                 new byte[0],
                 v.path("timed_out").asBoolean(false));
     }
@@ -475,7 +475,16 @@ public final class Sandbox {
     }
 
     private static Integer statusCode(JsonNode v, int fallback) {
-        JsonNode code = firstOf(v, "exit_code", "status");
+        return statusCode(v, fallback, "exit_code", "status");
+    }
+
+    /**
+     * Current-key-first per UNIFIED_API.md §4: exec answers with
+     * {@code exit_code}, eval with {@code status} (PROTOCOL.md §2.4) — the
+     * caller names the pair in precedence order.
+     */
+    private static Integer statusCode(JsonNode v, int fallback, String current, String legacy) {
+        JsonNode code = firstOf(v, current, legacy);
         return code != null && code.isNumber() ? code.intValue() : fallback;
     }
 

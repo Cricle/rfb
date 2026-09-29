@@ -1,14 +1,15 @@
-//! [`RfbClient`] and [`Sandbox`] — the public facade over the three internal
+//! [`RfbClient`] and [`GuestSandbox`] — the public facade over the three internal
 //! protocol adapters (`sdk/UNIFIED_API.md` §2–§6).
 
 use std::time::Duration;
 
+#[cfg_attr(not(feature = "zeroboot"), allow(unused_imports))]
 use serde_json::{json, Value};
 
 use super::error::{transport_timeout, RfbError};
 use super::ndjson;
 use super::types::{
-    default_guest_timeout, CreateOptions, ExecResult, StreamEvent, StreamEventKind,
+    default_guest_timeout, CreateOptions, GuestExecResult, StreamEvent, StreamEventKind,
 };
 use super::validation;
 #[cfg(feature = "zeroboot")]
@@ -21,7 +22,7 @@ use crate::guest::{
 use crate::BoxFuture;
 
 /// The single public client type. Wraps the forkd controller HTTP client;
-/// guest operations are reached through the returned [`Sandbox`] facades.
+/// guest operations are reached through the returned [`GuestSandbox`] facades.
 #[derive(Clone)]
 pub struct RfbClient {
     pub(super) http: crate::controller::ForkdClient,
@@ -110,7 +111,7 @@ impl RfbClient {
         }
     }
 
-    /// `POST /v1/sandboxes` with [`CreateOptions`]; returns one [`Sandbox`]
+    /// `POST /v1/sandboxes` with [`CreateOptions`]; returns one [`GuestSandbox`]
     /// facade per created sandbox.
     ///
     /// # Errors
@@ -120,7 +121,7 @@ impl RfbClient {
         &self,
         snapshot_tag: &str,
         options: CreateOptions,
-    ) -> Result<Vec<Sandbox>, RfbError> {
+    ) -> Result<Vec<GuestSandbox>, RfbError> {
         let request = crate::controller::CreateSandboxRequest {
             snapshot_tag,
             n: options.n,
@@ -133,7 +134,7 @@ impl RfbClient {
         let infos = self.http.create_sandbox(&request).await?;
         Ok(infos
             .into_iter()
-            .map(|info| Sandbox::new(self.http.clone(), info, options.transport, self.timeout))
+            .map(|info| GuestSandbox::new(self.http.clone(), info, options.transport, self.timeout))
             .collect())
     }
 
@@ -142,7 +143,7 @@ impl RfbClient {
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
-    pub async fn create_sandbox1(&self, snapshot_tag: &str) -> Result<Sandbox, RfbError> {
+    pub async fn create_sandbox1(&self, snapshot_tag: &str) -> Result<GuestSandbox, RfbError> {
         self.create_sandbox(snapshot_tag, CreateOptions::default())
             .await?
             .into_iter()
@@ -155,14 +156,14 @@ impl RfbClient {
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
-    pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, RfbError> {
+    pub async fn list_sandboxes(&self) -> Result<Vec<GuestSandbox>, RfbError> {
         Ok(self
             .http
             .list_sandboxes()
             .await?
             .into_iter()
             .map(|info| {
-                Sandbox::new(
+                GuestSandbox::new(
                     self.http.clone(),
                     info,
                     GuestTransport::default(),
@@ -173,14 +174,17 @@ impl RfbClient {
     }
 
     /// Attach a facade to an existing sandbox: pass an owned/borrowed
-    /// [`Sandbox`] (attached as-is) or an id `&str` (resolved through
+    /// [`GuestSandbox`] (attached as-is) or an id `&str` (resolved through
     /// `list_sandboxes`). Uses the default transport; see
     /// [`connect_id_with`](Self::connect_id_with) for an explicit choice.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
-    pub async fn connect(&self, sandbox_or_id: impl ConnectTarget) -> Result<Sandbox, RfbError> {
+    pub async fn connect(
+        &self,
+        sandbox_or_id: impl ConnectTarget,
+    ) -> Result<GuestSandbox, RfbError> {
         sandbox_or_id.connect_to(self).await
     }
 
@@ -190,7 +194,7 @@ impl RfbClient {
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
-    pub async fn connect_id(&self, id: &str) -> Result<Sandbox, RfbError> {
+    pub async fn connect_id(&self, id: &str) -> Result<GuestSandbox, RfbError> {
         self.connect_id_with(id, GuestTransport::default()).await
     }
 
@@ -203,7 +207,7 @@ impl RfbClient {
         &self,
         id: &str,
         transport: GuestTransport,
-    ) -> Result<Sandbox, RfbError> {
+    ) -> Result<GuestSandbox, RfbError> {
         validation::sandbox_id(id)?;
         let sandboxes = self.list_sandboxes().await?;
         sandboxes
@@ -234,20 +238,20 @@ impl RfbClient {
     }
 }
 
-/// Types attachable to a client: a [`Sandbox`] facade or an id string.
+/// Types attachable to a client: a [`GuestSandbox`] facade or an id string.
 pub trait ConnectTarget {
-    fn connect_to(self, client: &RfbClient) -> BoxFuture<'static, Result<Sandbox, RfbError>>;
+    fn connect_to(self, client: &RfbClient) -> BoxFuture<'static, Result<GuestSandbox, RfbError>>;
 }
 
-impl ConnectTarget for &Sandbox {
-    fn connect_to(self, _client: &RfbClient) -> BoxFuture<'static, Result<Sandbox, RfbError>> {
+impl ConnectTarget for &GuestSandbox {
+    fn connect_to(self, _client: &RfbClient) -> BoxFuture<'static, Result<GuestSandbox, RfbError>> {
         let sandbox = self.clone();
         Box::pin(async move { Ok(sandbox) })
     }
 }
 
 impl ConnectTarget for &str {
-    fn connect_to(self, client: &RfbClient) -> BoxFuture<'static, Result<Sandbox, RfbError>> {
+    fn connect_to(self, client: &RfbClient) -> BoxFuture<'static, Result<GuestSandbox, RfbError>> {
         let client = client.clone();
         let id = self.to_owned();
         Box::pin(async move { client.connect_id(&id).await })
@@ -257,14 +261,14 @@ impl ConnectTarget for &str {
 /// Facade over one live sandbox. All guest operations are available in
 /// identical shapes on both [`GuestTransport`]s.
 #[derive(Clone)]
-pub struct Sandbox {
+pub struct GuestSandbox {
     http: crate::controller::ForkdClient,
     info: SandboxInfo,
     transport: GuestTransport,
     timeout: Duration,
 }
 
-impl Sandbox {
+impl GuestSandbox {
     pub(super) fn new(
         http: crate::controller::ForkdClient,
         info: SandboxInfo,
@@ -279,7 +283,7 @@ impl Sandbox {
         }
     }
 
-    /// Sandbox id.
+    /// GuestSandbox id.
     pub fn id(&self) -> &str {
         &self.info.id
     }
@@ -340,10 +344,13 @@ impl Sandbox {
         self.ops().ping().await
     }
 
-    /// Execute a command. `cwd` defaults to the guest root (`"/"`); `stdin`
-    /// is delivered on the ZBRT transport (NDJSON `exec` carries no stdin
-    /// field on the wire and ignores it); `timeout_s` is ceil-ed to whole
-    /// seconds for NDJSON and milli-seconds for ZBRT.
+    /// Execute a command. `cwd` is an opaque guest path — the guest maps both
+    /// `/` and `/workspace` to the workspace root (the language SDKs default
+    /// to `/workspace`); `stdin`
+    /// is delivered on the ZBRT transport — the NDJSON wire has no exec stdin
+    /// channel, so non-empty stdin over NDJSON fails closed (a silent drop
+    /// would run the command without its input); `timeout_s` is ceil-ed to
+    /// whole seconds for NDJSON and milli-seconds for ZBRT.
     ///
     /// # Errors
     ///
@@ -354,7 +361,7 @@ impl Sandbox {
         cwd: &str,
         timeout_s: f64,
         stdin: &[u8],
-    ) -> Result<ExecResult, RfbError> {
+    ) -> Result<GuestExecResult, RfbError> {
         if args.is_empty() {
             return Err(RfbError::Validation("args must not be empty".to_owned()));
         }
@@ -364,9 +371,9 @@ impl Sandbox {
         self.ops().exec(argv, cwd, secs, stdin.to_vec()).await
     }
 
-    /// Evaluate code. The eval `output` maps to `ExecResult::stdout` on both
-    /// transports. `cwd=None` uses the guest default; `timeout_s=None` means
-    /// no explicit deadline (NDJSON omits the key, ZBRT sends 0).
+    /// Evaluate code. The eval `output` maps to `GuestExecResult::stdout` on
+    /// both transports. `cwd=None` uses the guest default; `timeout_s=None`
+    /// means no explicit deadline (NDJSON omits the key, ZBRT sends 0).
     ///
     /// # Errors
     ///
@@ -376,7 +383,7 @@ impl Sandbox {
         code: &str,
         cwd: Option<&str>,
         timeout_s: Option<f64>,
-    ) -> Result<ExecResult, RfbError> {
+    ) -> Result<GuestExecResult, RfbError> {
         validation::eval_code(code)?;
         if let Some(cwd) = cwd {
             validation::file_path(cwd)?;
@@ -520,10 +527,18 @@ impl GuestOps {
         argv: Vec<String>,
         cwd: &str,
         secs: u64,
-        stdin: Vec<u8>,
-    ) -> Result<ExecResult, RfbError> {
+        #[cfg_attr(not(feature = "zeroboot"), allow(unused_variables))] stdin: Vec<u8>,
+    ) -> Result<GuestExecResult, RfbError> {
         match self {
             GuestOps::Ndjson(client) => {
+                // The NDJSON wire has no exec stdin channel: non-empty stdin
+                // would run the command WITHOUT its input, so fail closed
+                // (ZBRT delivers stdin).
+                if !stdin.is_empty() {
+                    return Err(RfbError::Validation(
+                        "stdin is only supported over the ZBRT transport".to_owned(),
+                    ));
+                }
                 let value = client.exec_in(cwd, argv, secs).await?;
                 ndjson::exec_result(&value)
             }
@@ -542,7 +557,7 @@ impl GuestOps {
         code: &str,
         cwd: Option<&str>,
         secs: Option<u64>,
-    ) -> Result<ExecResult, RfbError> {
+    ) -> Result<GuestExecResult, RfbError> {
         match self {
             GuestOps::Ndjson(client) => {
                 let request = crate::guest::EvalRequest {
@@ -554,18 +569,14 @@ impl GuestOps {
                 ndjson::eval_result(&value)
             }
             #[cfg(feature = "zeroboot")]
-            GuestOps::Zbrt(guest) => {
-                // ZBRT v1 has no eval op; the facade convention is an Execute
-                // turn whose argv names the structured `eval` op followed by
-                // the source (see README known limitations). Whole seconds are
-                // sent as milliseconds; `None` sends 0 (no explicit deadline).
-                let argv = vec!["eval".to_owned(), code.to_owned()];
-                let timeout_ms = secs
-                    .and_then(|s| u32::try_from(s.saturating_mul(1000)).ok())
-                    .unwrap_or(0);
-                guest
-                    .exec(argv, cwd.map(str::to_owned), Vec::new(), timeout_ms)
-                    .await
+            GuestOps::Zbrt(_) => {
+                // ZBRT v1 has no eval op and the reference guest maps Execute
+                // verbatim onto `exec` — the old "facade convention" sent a
+                // literal `eval <code>` command and surfaced its exit code -1
+                // as a successful result. Fail closed instead.
+                Err(RfbError::Validation(
+                    "eval is not supported over the ZBRT transport".to_owned(),
+                ))
             }
         }
     }
@@ -735,7 +746,7 @@ impl GuestOps {
     ) -> Result<GuestStream, RfbError> {
         match self {
             GuestOps::Ndjson(client) => {
-                let inner = client.stream(argv, cwd, pty, env).await?;
+                let inner = client.stream(argv, cwd, pty, env, None).await?;
                 Ok(GuestStream {
                     inner: StreamInner::Ndjson(inner),
                     exited: false,

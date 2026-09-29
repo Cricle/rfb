@@ -7,7 +7,7 @@ namespace Rfb.Sdk;
 /// Interactive guest stream (UNIFIED_API.md §5). Events: started | stdout |
 /// stderr | exit. Clean close → NextEvent returns null.
 /// </summary>
-public sealed class GuestStream
+public sealed class GuestStream : IDisposable
 {
     private readonly ForkdGuestNdjsonStream? _ndjson;
     private readonly ZbrtStreamSession? _zbrt;
@@ -15,6 +15,13 @@ public sealed class GuestStream
     internal GuestStream(ForkdGuestNdjsonStream session) => _ndjson = session;
 
     internal GuestStream(ZbrtStreamSession session) => _zbrt = session;
+
+    /// <summary>Release the underlying transport sockets (idempotent).</summary>
+    public void Dispose()
+    {
+        _ndjson?.Dispose();
+        _zbrt?.Dispose();
+    }
 
     /// <summary>Next stream event; null when the stream closed cleanly.</summary>
     public async Task<StreamEvent?> NextEvent()

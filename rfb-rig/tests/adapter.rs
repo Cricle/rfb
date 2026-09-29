@@ -10,8 +10,7 @@ use std::time::Duration;
 use futures::executor::block_on;
 use rfb::guest as guest_dtos;
 use rfb::{
-    BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, ImageManifest, Sandbox, SandboxError,
-    TransportKind,
+    BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, Sandbox, SandboxError, TransportKind,
 };
 use rfb_rig::{
     execute_schema, portable_dynamic_tools, rig_tools, sandbox_execute_tool, RigCapability,
@@ -80,14 +79,6 @@ impl Sandbox for FakeSandbox {
             })
         })
     }
-
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async {
-            Err(SandboxError::UnsupportedCapability(
-                Capability::ReadFramebuffer,
-            ))
-        })
-    }
 }
 
 /// A public fake that scripts a single precomputed result.
@@ -121,10 +112,6 @@ impl Sandbox for ScriptedSandbox {
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
         let result = self.result.clone();
         Box::pin(async move { result })
-    }
-
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
     }
 }
 
@@ -222,9 +209,6 @@ impl Sandbox for AllGuestSandbox {
         &CAPS
     }
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
-    }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
         Box::pin(async { Err(SandboxError::NotReady) })
     }
 }
@@ -412,9 +396,7 @@ fn execution_diagnostics_are_redacted_from_model_visible_output() {
 
 #[test]
 fn unsupported_capability_is_permission_denied() {
-    let sandbox = ScriptedSandbox::new(Err(SandboxError::UnsupportedCapability(
-        Capability::ReadFramebuffer,
-    )));
+    let sandbox = ScriptedSandbox::new(Err(SandboxError::UnsupportedCapability(Capability::Eval)));
     let adapter = SandboxExecuteAdapter::new(sandbox);
 
     let error = run(&adapter, json!({"command": "x"})).unwrap_err();
@@ -479,9 +461,6 @@ impl Sandbox for StructuredSandbox {
         &CAPS
     }
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
-    }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
         Box::pin(async { Err(SandboxError::NotReady) })
     }
     fn read<'a>(
@@ -653,9 +632,6 @@ impl Sandbox for ScriptedStructuredError {
         let error = self.error.clone();
         Box::pin(async move { Err(error) })
     }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
-    }
     fn read<'a>(
         &'a self,
         _: guest_dtos::ReadRequest,
@@ -749,9 +725,6 @@ impl Sandbox for StreamingSandbox {
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
         Box::pin(async { Err(SandboxError::NotReady) })
     }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
-    }
     fn stream<'a>(
         &'a self,
         spec: guest_dtos::StreamSpec,
@@ -836,9 +809,6 @@ impl Sandbox for ReadOnlySandbox {
         &CAPS
     }
     fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
-        Box::pin(async { Err(SandboxError::NotReady) })
-    }
-    fn framebuffer<'a>(&'a self) -> BoxFuture<'a, Result<ImageManifest, SandboxError>> {
         Box::pin(async { Err(SandboxError::NotReady) })
     }
 }
@@ -1042,7 +1012,7 @@ fn structured_execution_error_is_classified_and_redacted() {
 #[test]
 fn structured_unsupported_capability_is_permission_denied() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedStructuredError {
-        error: SandboxError::UnsupportedCapability(Capability::ReadFramebuffer),
+        error: SandboxError::UnsupportedCapability(Capability::Eval),
     });
     let error = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "a.txt"})).unwrap_err();
     assert_eq!(error.kind(), ToolErrorKind::PermissionDenied);

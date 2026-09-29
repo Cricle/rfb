@@ -41,7 +41,13 @@ pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
         tokio::spawn(async move {
             let executor = match WorkspaceGuestExecutor::new(&root, limits.clone()) {
                 Ok(executor) => executor,
-                Err(_) => return,
+                Err(error) => {
+                    // A misconfigured workspace (unwritable root, bad limits)
+                    // must never look like a healthy-but-silent guest: report
+                    // it, then drop the connection.
+                    eprintln!("rfb-zeroboot-guest: executor init failed for {root:?}: {error}");
+                    return;
+                }
             };
             let service = Arc::new(Mutex::new(RuntimeService::with_executor_impl(
                 limits, executor,

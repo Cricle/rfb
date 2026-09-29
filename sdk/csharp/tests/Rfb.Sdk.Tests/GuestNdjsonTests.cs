@@ -114,11 +114,13 @@ public class GuestNdjsonTests
 
         await stream.SendInputAsync("hello");
         var echo = await stream.NextEventAsync();
+        Assert.NotNull(echo);
         Assert.Equal("echo:hello", echo.Value.GetProperty("stdout").GetString());
 
         await stream.StopAsync(); // idempotency checked by second call
         await stream.StopAsync();
         var exit = await stream.NextEventAsync();
+        Assert.NotNull(exit);
         Assert.Equal(9, exit.Value.GetProperty("exit_code").GetInt32());
 
         await Assert.ThrowsAsync<RemoteException>(() => stream.SendInputAsync("late"));

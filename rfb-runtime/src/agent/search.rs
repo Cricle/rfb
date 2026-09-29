@@ -217,7 +217,14 @@ fn grep_walk(
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let p = e.path();
-        if e.file_type()?.is_dir() {
+        let ft = e.file_type()?;
+        if ft.is_symlink() {
+            // Never follow symlinks: a workspace symlink pointing outside
+            // (e.g. /etc/passwd) must not be grepped — this is the content
+            // analogue of the path-policy confinement on ls/find/read.
+            continue;
+        }
+        if ft.is_dir() {
             if out.len() < max && grep_walk(root, &p, pat, max, bytes, out)? {
                 return Ok(true);
             }
@@ -225,7 +232,9 @@ fn grep_walk(
         }
         // Bound the per-file cost: skip oversized files outright and stream
         // the rest line-by-line so a large file never materializes in memory.
-        if std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > GREP_SCAN_CAP {
+        // symlink_metadata: the entry is a regular file here (symlinks are
+        // filtered above), but never follow a link that raced in.
+        if std::fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0) > GREP_SCAN_CAP {
             continue;
         }
         let Ok(file) = std::fs::File::open(&p) else {

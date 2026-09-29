@@ -41,6 +41,12 @@ impl ChildGuard {
             .take()
             .ok_or_else(|| FirecrackerError::Protocol("child guard already consumed".into()))
     }
+    /// Exit status when the child has already died (try_wait also reaps it).
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.0
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten())
+    }
 }
 use std::time::{Duration, Instant};
 
@@ -186,9 +192,76 @@ struct MachineConfig {
     mem_size_mib: u32,
 }
 
+/// Guest VM shape: what Firecracker allocates at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmResources {
+    /// Guest memory in MiB.
+    pub mem_mib: u32,
+    /// Guest vCPU count. Every guest session runs its command on a worker
+    /// thread, so this is what lets concurrent commands use host cores.
+    pub vcpu_count: u32,
+}
+
+impl VmResources {
+    /// Build a shape from its two axes.
+    pub const fn new(mem_mib: u32, vcpu_count: u32) -> Self {
+        Self {
+            mem_mib,
+            vcpu_count,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct VmAction {
     action_type: String,
+}
+
+/// Body of `PATCH /vm`: the v1.x pause/resume control surface.
+#[derive(Serialize)]
+struct VmStatePatch {
+    state: &'static str,
+}
+
+/// Body of `PUT /snapshot/create` (this Firecracker build serves snapshot
+/// lifecycle endpoints on PUT, mirroring the other config endpoints).
+#[derive(Serialize)]
+struct SnapshotCreate {
+    snapshot_path: String,
+    mem_file_path: String,
+}
+
+/// Body of `PUT /snapshot/load`.
+#[derive(Serialize)]
+struct SnapshotLoad {
+    #[serde(rename = "enable_diff_snapshots")]
+    enable_diff_snapshots: bool,
+    snapshot_path: String,
+    mem_backend: MemBackend,
+    #[serde(rename = "resume_vm")]
+    resume_vm: bool,
+}
+
+/// Memory backend for `PUT /snapshot/load`: one shared backing file per
+/// parent snapshot, mapped `MAP_PRIVATE` by every restored child so each
+/// sandbox gets copy-on-write memory without a per-create 512 MiB copy.
+#[derive(Serialize)]
+struct MemBackend {
+    backend_path: String,
+    backend_type: &'static str,
+}
+
+/// One snapshot-load body, shared by both restore modes.
+fn snapshot_load_body(vmstate_path: &str, mem_file_path: &str) -> SnapshotLoad {
+    SnapshotLoad {
+        enable_diff_snapshots: true,
+        snapshot_path: vmstate_path.to_string(),
+        mem_backend: MemBackend {
+            backend_path: mem_file_path.to_string(),
+            backend_type: "File",
+        },
+        resume_vm: true,
+    }
 }
 
 impl FirecrackerVm {
@@ -197,55 +270,18 @@ impl FirecrackerVm {
         kernel_path: &str,
         rootfs_path: &str,
         work_dir: &str,
-        mem_mib: u32,
+        resources: VmResources,
         init_path: &str,
         vsock: Option<VsockConfig>,
     ) -> Result<Self> {
-        let socket_path = format!("{}/firecracker.sock", work_dir);
-
-        // Clean up
-        let _ = std::fs::remove_file(&socket_path);
-
-        // Start Firecracker
-        eprintln!("Starting Firecracker...");
-        let log_path = format!("{work_dir}/firecracker.log");
-        let log = std::fs::File::create(&log_path).map_err(|e| {
-            FirecrackerError::Protocol(format!("create Firecracker log at {log_path}: {e}"))
-        })?;
-        let process = Command::new(firecracker_path)
-            .args(["--api-sock", &socket_path])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
-            .spawn()
-            .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;
-        let mut process = ChildGuard::new(process);
-
-        // Wait for socket
-        let start = Instant::now();
-        while !Path::new(&socket_path).exists() {
-            if start.elapsed() > Duration::from_secs(5) {
-                return Err(FirecrackerError::Protocol(
-                    "Firecracker socket didn't appear".into(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-
-        let vsock_uds_path = vsock.as_ref().map(|v| v.uds_path.clone());
-        let vm = Self {
-            process: process.take()?,
-            socket_path,
-            vsock_uds_path,
-        };
+        let mut vm = Self::spawn_api(firecracker_path, work_dir)?;
 
         // Configure machine
         vm.api_put(
             "/machine-config",
             &MachineConfig {
-                vcpu_count: 1,
-                mem_size_mib: mem_mib,
+                vcpu_count: resources.vcpu_count,
+                mem_size_mib: resources.mem_mib,
             },
         )?;
 
@@ -274,6 +310,7 @@ impl FirecrackerVm {
         )?;
 
         if let Some(vsock) = vsock {
+            let path = vsock.uds_path.clone();
             vm.api_put(
                 "/vsock",
                 &VsockDevice {
@@ -281,15 +318,11 @@ impl FirecrackerVm {
                     uds_path: vsock.uds_path,
                 },
             )?;
+            vm.set_vsock_uds_path(path);
         }
 
         // Start the VM
-        vm.api_put(
-            "/actions",
-            &VmAction {
-                action_type: "InstanceStart".to_string(),
-            },
-        )?;
+        vm.api_start()?;
 
         eprintln!("Firecracker VM started");
         Ok(vm)
@@ -297,6 +330,39 @@ impl FirecrackerVm {
 
     fn api_put<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
         self.api_request("PUT", path, body)
+    }
+
+    fn api_patch<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
+        self.api_request("PATCH", path, body)
+    }
+
+    /// InstanceStart across both Firecracker builds: the patched DevPreview
+    /// build takes PUT /actions (and rejects POST outright), upstream takes
+    /// POST /actions (PUT is rejected as an invalid method). Try PUT, fall
+    /// back to POST on that specific rejection.
+    fn api_start(&self) -> Result<()> {
+        match self.api_put(
+            "/actions",
+            &VmAction {
+                action_type: "InstanceStart".to_string(),
+            },
+        ) {
+            Ok(_) => Ok(()),
+            Err(FirecrackerError::Protocol(message))
+                if message.contains("Invalid HTTP Method")
+                    || message.contains("Unsupported HTTP method") =>
+            {
+                self.api_request(
+                    "POST",
+                    "/actions",
+                    &VmAction {
+                        action_type: "InstanceStart".to_string(),
+                    },
+                )?;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn api_request<T: Serialize>(&self, method: &str, path: &str, body: &T) -> Result<String> {
@@ -334,6 +400,254 @@ impl FirecrackerVm {
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
+
+    /// Pause the VM and write a full snapshot (vmstate + guest memory file).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
+    pub fn create_snapshot(&self, vmstate_path: &str, mem_file_path: &str) -> Result<()> {
+        // v1.x control surface: pause via PATCH /vm, snapshot via PUT
+        // /snapshot/create (this build serves snapshot endpoints on PUT).
+        self.api_patch("/vm", &VmStatePatch { state: "Paused" })?;
+        self.api_put(
+            "/snapshot/create",
+            &SnapshotCreate {
+                snapshot_path: vmstate_path.to_string(),
+                mem_file_path: mem_file_path.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+impl FirecrackerVm {
+    /// Restore a child VM from a parent snapshot taken by
+    /// [`FirecrackerVm::create_snapshot`].
+    ///
+    /// Two Firecracker builds must be served with one code path:
+    /// - Upstream builds require the pre-load device re-declaration (machine
+    ///   shape matching the snapshot, rootfs drive, vsock relay with a fresh
+    ///   per-child UDS path) and reject nothing.
+    /// - The patched v1.12.x DevPreview build in `resx/` restores the
+    ///   snapshot's devices verbatim and rejects any load after configuring
+    ///   devices ("not allowed after configuring boot-specific resources").
+    ///
+    /// The upstream flow is attempted first; on that specific rejection the
+    /// child falls back to a bare load, which reuses the parent's baked rootfs
+    /// and vsock relay paths (the parent must therefore keep them alive — the
+    /// zeroboot provider stores both under the snapshot directory). The
+    /// memory backing file is shared `MAP_PRIVATE`, so a create pays no
+    /// memory copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
+    /// Returns the VM and whether the bare (patched-build) path was taken —
+    /// the caller records it so later creates skip work only the upstream
+    /// path needs (e.g. the per-sandbox rootfs staging copy).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the operation fails; the error type carries the cause.
+    pub fn restore_from_snapshot(
+        firecracker_path: &str,
+        work_dir: &str,
+        resources: VmResources,
+        rootfs_path: &str,
+        guest_cid: u32,
+        vmstate_path: &str,
+        mem_file_path: &str,
+    ) -> Result<(Self, bool)> {
+        match Self::restore_with_config(
+            firecracker_path,
+            work_dir,
+            resources,
+            rootfs_path,
+            guest_cid,
+            vmstate_path,
+            mem_file_path,
+        ) {
+            Ok(vm) => Ok((vm, false)),
+            Err(err) => {
+                if err.to_string().contains("boot-specific resources") {
+                    Ok((
+                        Self::restore_bare(
+                            firecracker_path,
+                            work_dir,
+                            vmstate_path,
+                            mem_file_path,
+                        )?,
+                        true,
+                    ))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Upstream-style restore: re-declare the machine shape and non-boot
+    /// devices, then load.
+    fn restore_with_config(
+        firecracker_path: &str,
+        work_dir: &str,
+        resources: VmResources,
+        rootfs_path: &str,
+        guest_cid: u32,
+        vmstate_path: &str,
+        mem_file_path: &str,
+    ) -> Result<Self> {
+        let vm = Self::spawn_api(firecracker_path, work_dir)?;
+        let vsock_path = format!("{work_dir}/vsock.sock");
+        // Boot-specific resources (boot-source) are baked into the snapshot
+        // and must NOT be configured before a load. The machine shape must
+        // match the snapshot exactly.
+        vm.api_put(
+            "/machine-config",
+            &MachineConfig {
+                vcpu_count: resources.vcpu_count,
+                mem_size_mib: resources.mem_mib,
+            },
+        )?;
+        vm.api_put(
+            "/drives/rootfs",
+            &Drive {
+                drive_id: "rootfs".to_string(),
+                path_on_host: rootfs_path.to_string(),
+                is_root_device: true,
+                is_read_only: false,
+            },
+        )?;
+        vm.api_put(
+            "/vsock",
+            &VsockDevice {
+                guest_cid,
+                uds_path: vsock_path,
+            },
+        )?;
+        vm.api_put(
+            "/snapshot/load",
+            &snapshot_load_body(vmstate_path, mem_file_path),
+        )?;
+        Ok(vm)
+    }
+
+    /// Patched-build fallback: load only; every device comes back exactly as
+    /// the parent snapshot baked it (including its rootfs and vsock relay
+    /// paths, which is why the parent's files must outlive this child).
+    fn restore_bare(
+        firecracker_path: &str,
+        work_dir: &str,
+        vmstate_path: &str,
+        mem_file_path: &str,
+    ) -> Result<Self> {
+        let baked = baked_vsock_uds_path(vmstate_path)?;
+        // The baked name may still be bound by a live sibling's listener.
+        // Unlinking the NAME is safe: established connections stay attached
+        // to their own (now unnamed) inode, and this child binds a fresh
+        // socket at the same path. The caller holds the snapshot-dir lock
+        // across load + pool-open, so two concurrent restores cannot race on
+        // the name.
+        let _ = std::fs::remove_file(&baked);
+        let mut vm = Self::spawn_api(firecracker_path, work_dir)?;
+        vm.api_put(
+            "/snapshot/load",
+            &snapshot_load_body(vmstate_path, mem_file_path),
+        )?;
+        vm.set_vsock_uds_path(baked);
+        Ok(vm)
+    }
+
+    fn set_vsock_uds_path(&mut self, path: String) {
+        self.vsock_uds_path = Some(path);
+    }
+
+    /// Spawn a Firecracker process and wait for its API socket.
+    fn spawn_api(firecracker_path: &str, work_dir: &str) -> Result<Self> {
+        let socket_path = format!("{}/firecracker.sock", work_dir);
+        let _ = std::fs::remove_file(&socket_path);
+        let log_path = format!("{work_dir}/firecracker.log");
+        // Both stdio hooks append to the same file: Firecracker logs to stdout
+        // and the guest serial console arrives on stderr, so a guest panic
+        // (PID-1 crash) is visible in the same file as the VMM log. Append
+        // mode keeps the two handles from clobbering each other's offsets.
+        let open_log = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|e| {
+                    FirecrackerError::Protocol(format!("create Firecracker log at {log_path}: {e}"))
+                })
+        };
+        let log = open_log()?;
+        let log_out = open_log()?;
+        let process = Command::new(firecracker_path)
+            .args(["--api-sock", &socket_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_out))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;
+        let mut process = ChildGuard::new(process);
+
+        let start = Instant::now();
+        loop {
+            if Path::new(&socket_path).exists() {
+                break;
+            }
+            // Fail in milliseconds when the binary died at spawn (bad flags,
+            // exec format, seccomp) instead of burning the whole socket
+            // deadline with a misleading message.
+            if let Some(status) = process.exited() {
+                return Err(FirecrackerError::Protocol(format!(
+                    "Firecracker exited before opening its API socket: {status} (log: {log_path})"
+                )));
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                return Err(FirecrackerError::Protocol(
+                    "Firecracker socket didn't appear".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        Ok(Self {
+            process: process.take()?,
+            socket_path,
+            vsock_uds_path: None,
+        })
+    }
+}
+
+/// Extract the vsock relay UDS path baked into a vmstate blob: the printable
+/// ASCII string ending in `vsock.sock`. The patched Firecracker restores the
+/// device verbatim, so the child must connect to this exact path.
+fn baked_vsock_uds_path(vmstate_path: &str) -> Result<String> {
+    let blob = std::fs::read(vmstate_path)
+        .map_err(|e| FirecrackerError::Protocol(format!("read vmstate for vsock path: {e}")))?;
+    let needle = b"vsock.sock";
+    let pos = blob
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .ok_or_else(|| FirecrackerError::Protocol("vmstate carries no vsock UDS path".into()))?;
+    let start = blob[..pos]
+        .iter()
+        .rposition(|&b| {
+            !(b.is_ascii_alphanumeric() || b == b'/' || b == b'.' || b == b'_' || b == b'-')
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let path = String::from_utf8_lossy(&blob[start..pos + needle.len()]).into_owned();
+    if path.starts_with('/') {
+        Ok(path)
+    } else {
+        Err(FirecrackerError::Protocol(format!(
+            "vmstate vsock path is not absolute: {path}"
+        )))
+    }
 }
 
 impl FirecrackerVm {
@@ -347,12 +661,14 @@ impl FirecrackerVm {
         self.process.id()
     }
 
+    /// Boot a VM with a vsock device so the guest runtime can be driven over
+    /// the Firecracker UDS relay.
     pub fn boot_with_runtime(
         firecracker_path: &str,
         kernel_path: &str,
         rootfs_path: &str,
         work_dir: &str,
-        mem_mib: u32,
+        resources: VmResources,
         init_path: &str,
         guest_cid: u32,
     ) -> Result<Self> {
@@ -362,7 +678,7 @@ impl FirecrackerVm {
             kernel_path,
             rootfs_path,
             work_dir,
-            mem_mib,
+            resources,
             init_path,
             Some(VsockConfig {
                 guest_cid,

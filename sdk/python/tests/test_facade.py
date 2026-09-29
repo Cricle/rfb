@@ -74,6 +74,20 @@ class FacadeMixin:
         client = RfbClient(base_url=self.controller.url)
         self.assertEqual(client.timeout_s, 10.0)
 
+    def test_non_finite_or_non_positive_timeouts_are_rejected(self):
+        # UNIFIED_API.md §2/§7: an invalid timeout is a local ValidationError,
+        # never a raw ValueError and never an unbounded poll loop.
+        for bad in (0, -1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValidationError):
+                RfbClient(base_url=self.controller.url, timeout_s=bad)
+            with self.assertRaises(ValidationError):
+                self.client.wait_snapshot("base", timeout_s=bad)
+        sandbox = self._sandbox()
+        with self.assertRaises(ValidationError):
+            sandbox.exec(["echo"], timeout_s=float("nan"))
+        with self.assertRaises(ValidationError):
+            sandbox.eval("1", timeout_s=float("inf"))
+
     def test_create_sandbox_returns_sandboxes(self):
         sandboxes = self.client.create_sandbox(
             "base", n=2, memory_limit_mib=512, per_child_netns=True, transport=self.transport
@@ -110,11 +124,25 @@ class FacadeMixin:
 
     def test_exec_with_stdin_and_timeout(self):
         sandbox = self._sandbox()
+        if self.transport != "zbrt":
+            # The NDJSON wire has no exec stdin channel: non-empty stdin
+            # fails closed (running the command without its input would be
+            # silent data loss).
+            with self.assertRaises(ValidationError):
+                sandbox.exec(["cat"], timeout_s=5.0, stdin=b"xyz")
+            return
         result = sandbox.exec(["cat"], timeout_s=5.0, stdin=b"xyz")
         self.assertEqual(result.exit_code, 0)
 
     def test_eval_output_maps_to_stdout(self):
         sandbox = self._sandbox()
+        if self.transport == "zbrt":
+            # ZBRT v1 has no eval opcode and the reference guest maps Execute
+            # verbatim onto `exec`: the facade fails closed locally instead of
+            # running a literal `eval <code>` command.
+            with self.assertRaises(ValidationError):
+                sandbox.eval("print(42)")
+            return
         result = sandbox.eval("print(42)")
         self.assertIsInstance(result, ExecResult)
         self.assertEqual(result.exit_code, 0)

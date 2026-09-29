@@ -33,9 +33,7 @@ pub fn client_from_url_env(url: &str, timeout: Duration) -> Result<ForkdClient, 
 }
 
 pub(super) fn snapshot_ready(snapshots: &[SnapshotInfo], tag: &str) -> bool {
-    snapshots
-        .iter()
-        .any(|s| s.tag == tag && s.status.eq_ignore_ascii_case("ready") && s.bootable)
+    crate::controller::snapshot_ready_in(snapshots, tag)
 }
 
 /// True when `debugfs` can stat `path` inside the given ext4 image.

@@ -1,0 +1,11 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate nested inside the rfb workspace directory: an empty
+# [workspace] keeps cargo from pulling it into the parent workspace.
+[workspace]
+
+[profile.release]
+strip = true

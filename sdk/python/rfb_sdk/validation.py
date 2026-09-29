@@ -4,6 +4,8 @@ Every check fails closed: the request is rejected with ValidationError before
 any bytes hit the wire.
 """
 
+import math
+
 from .errors import ValidationError
 
 MAX_GUEST_PATH_BYTES = 4096
@@ -11,6 +13,9 @@ MAX_GUEST_PATTERN_BYTES = 1024
 MAX_GUEST_RESULTS = 1000
 MAX_GUEST_RESULT_BYTES = 50 * 1024
 MAX_GUEST_CODE_BYTES = 1024 * 1024
+# ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded.
+MAX_ZBRT_ARGC = 255
+MAX_ZBRT_PAYLOAD_BYTES = 16 * 1024 * 1024
 
 
 def _byte_len(value: str) -> int:
@@ -71,13 +76,25 @@ def validate_eval_code(code: str) -> None:
         raise ValidationError("eval code exceeds 1 MiB")
 
 
+def validate_timeout(timeout_s, what: str = "timeout") -> None:
+    """Reject non-numeric, non-finite, or non-positive timeouts (fail closed)."""
+    if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool):
+        raise ValidationError(f"{what} must be a number of seconds")
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValidationError(f"{what} must be a finite number greater than zero")
+
+
 def validate_eval_timeout(timeout_s) -> None:
     if timeout_s is None:
         return
-    if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool):
-        raise ValidationError("eval timeout must be a number of seconds")
-    if timeout_s <= 0:
-        raise ValidationError("eval timeout must be greater than zero")
+    validate_timeout(timeout_s, "eval timeout")
+
+
+def validate_zbrt_args(args) -> None:
+    """ZBRT v1 encodes argc in one byte; reject locally instead of leaking a
+    ValueError after the connection is already open."""
+    if len(args) > MAX_ZBRT_ARGC:
+        raise ValidationError(f"argv exceeds the {MAX_ZBRT_ARGC}-argument ZBRT limit")
 
 
 _ID_CHARS = frozenset(

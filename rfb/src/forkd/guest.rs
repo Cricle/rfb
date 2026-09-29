@@ -17,6 +17,10 @@ use tokio::net::TcpStream;
 
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Extra client read budget beyond an exec's guest-side deadline, so the
+/// guest's own timeout error (not the client's) is what surfaces.
+pub(crate) const EXEC_READ_MARGIN: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 /// Errors returned by the forkd guest client.
 pub enum ForkdGuestError {
@@ -81,7 +85,19 @@ impl ForkdGuestClient {
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn request(&self, action: Value) -> Result<Vec<Value>, ForkdGuestError> {
-        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+        self.request_with_read_timeout(action, self.timeout).await
+    }
+
+    /// Like [`Self::request`] but with an explicit per-read deadline. The
+    /// response read timeout must cover the guest-side work: an exec whose
+    /// contract timeout is 60 s needs a client read budget beyond 60 s, or the
+    /// client gives up before the guest's own deadline fires.
+    async fn request_with_read_timeout(
+        &self,
+        action: Value,
+        read_timeout: Duration,
+    ) -> Result<Vec<Value>, ForkdGuestError> {
+        const MAX_RESPONSE_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
         const MAX_RESPONSE_LINES: usize = 65_536;
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
@@ -92,7 +108,7 @@ impl ForkdGuestClient {
         let mut responses = Vec::new();
         let mut collected_bytes = 0usize;
         loop {
-            let value = match read_json_line(&mut reader, self.timeout).await? {
+            let value = match read_json_line(&mut reader, read_timeout).await? {
                 Some(value) => value,
                 None => {
                     return Err(ForkdGuestError::Remote(
@@ -141,6 +157,7 @@ impl ForkdGuestClient {
         cwd: Option<&str>,
         pty: Option<bool>,
         env: Option<Value>,
+        event_deadline: Option<Duration>,
     ) -> Result<ForkdGuestStream, ForkdGuestError> {
         let tcp = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
@@ -157,10 +174,13 @@ impl ForkdGuestClient {
             action["env"] = env;
         }
         write_json(&mut writer, &action, self.timeout).await?;
+        // The per-event read budget must cover the guest's own exec deadline
+        // (mirrors the exec read budget): without it a long silent command
+        // dies client-side before the guest's deadline fires.
         Ok(ForkdGuestStream {
             reader: BufReader::new(read),
             writer,
-            timeout: self.timeout,
+            timeout: event_deadline.unwrap_or(self.timeout),
             stopped: false,
             terminal: false,
         })
@@ -267,8 +287,12 @@ impl ForkdGuestClient {
         args: Vec<String>,
         timeout_secs: u64,
     ) -> Result<Value, ForkdGuestError> {
-        self.request(
+        // Guest-side deadline + margin: the response may legitimately take the
+        // full exec timeout to arrive.
+        let read_timeout = self.timeout + Duration::from_secs(timeout_secs) + EXEC_READ_MARGIN;
+        self.request_with_read_timeout(
             serde_json::json!({"action":"exec","cwd":guest_cwd,"args":args,"timeout":timeout_secs}),
+            read_timeout,
         )
         .await?
         .pop()
@@ -318,13 +342,15 @@ impl ForkdGuestClient {
             action["cwd"] = Value::String(cwd);
         }
         if let Some(timeout) = request.timeout {
-            let seconds = timeout
-                .as_secs()
-                .saturating_add(u64::from(timeout.subsec_nanos() != 0))
-                .max(1);
+            // Same ceil-to-seconds rounding as the provider's
+            // duration_to_timeout_secs (single source).
+            let seconds = crate::forkd::duration_to_timeout_secs(timeout);
             action["timeout"] = Value::Number(seconds.into());
         }
-        self.request(action)
+        let read_timeout = request.timeout.map_or(self.timeout, |timeout| {
+            self.timeout + timeout + EXEC_READ_MARGIN
+        });
+        self.request_with_read_timeout(action, read_timeout)
             .await?
             .pop()
             .ok_or_else(|| ForkdGuestError::Remote("empty eval response".into()))

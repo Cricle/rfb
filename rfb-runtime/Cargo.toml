@@ -6,10 +6,13 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Cricle/rfb"
 description = "Runtime components for RFB sandbox services"
+keywords = ["sandbox", "firecracker", "microvm", "runtime", "vsock"]
+categories = ["virtualization", "os"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
 async-trait = "0.1"
+base64 = { version = "0.22", optional = true }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
@@ -55,7 +58,7 @@ serde_json = "1"
 default = ["core"]
 # tokio 是 codec 的硬依赖（无 feature 也要编译），故 core 不再承载它。
 core = []
-guest = ["core", "dep:anyhow", "dep:libc", "dep:serde_json", "dep:tokio-vsock"]
+guest = ["core", "dep:anyhow", "dep:base64", "dep:libc", "dep:serde_json", "dep:tokio-vsock"]
 host-vsock = ["core", "dep:serde_json", "dep:uuid"]
 forkd = ["guest"]
 firecracker = ["core", "dep:anyhow", "dep:serde_json"]
@@ -91,9 +94,6 @@ name = "runtime"
 required-features = ["guest"]
 [[test]]
 name = "runtime_service"
-required-features = ["guest"]
-[[test]]
-name = "sandbox"
 required-features = ["guest"]
 [[test]]
 name = "zeroboot_connection"

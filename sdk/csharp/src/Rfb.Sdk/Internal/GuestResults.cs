@@ -12,17 +12,20 @@ internal static class GuestResults
     {
         // Rust baseline: a response without exit_code reads as failure (-1), not success.
         var exit = WireJson.IntOr(v, "exit_code", -1);
-        var stdout = WireJson.ValueBytes(Prop(v, "out") ?? Prop(v, "stdout"));
-        var stderr = WireJson.ValueBytes(Prop(v, "err") ?? Prop(v, "stderr"));
+        // UNIFIED_API.md §4: the current keys win when both are present.
+        var stdout = WireJson.ValueBytes(Prop(v, "stdout") ?? Prop(v, "out"));
+        var stderr = WireJson.ValueBytes(Prop(v, "stderr") ?? Prop(v, "err"));
         var timedOut = WireJson.BoolOr(v, "timed_out", false);
         return new ExecResult(exit, stdout, stderr, timedOut);
     }
 
-    /// <summary>eval output maps to stdout (UNIFIED_API.md §4).</summary>
+    /// <summary>eval output maps to stdout (UNIFIED_API.md §4); the agent's
+    /// current eval key is `status` (PROTOCOL.md §2.4), `exit_code` the
+    /// legacy alias — same precedence as the Rust facade.</summary>
     public static ExecResult ParseEval(JsonElement v)
     {
-        var stdout = WireJson.ValueBytes(Prop(v, "out") ?? Prop(v, "output"));
-        var exit = WireJson.IntOr(v, "exit_code", WireJson.IntOr(v, "status", 0));
+        var stdout = WireJson.ValueBytes(Prop(v, "output") ?? Prop(v, "out"));
+        var exit = WireJson.IntOr(v, "status", WireJson.IntOr(v, "exit_code", 0));
         var timedOut = WireJson.BoolOr(v, "timed_out", false);
         return new ExecResult(exit, stdout, [], timedOut);
     }

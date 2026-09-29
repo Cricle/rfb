@@ -57,13 +57,13 @@ pub fn prepare_process(command: &mut Command, piped: bool) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
-    // SAFETY: the closure runs post-fork/pre-exec and only calls the
-    // async-signal-safe `setpgid(0, 0)` to give the child its own group.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
+    {
+        // Same contract as a `pre_exec` `setpgid(0, 0)`, but expressed through
+        // tokio's inherent `process_group` (std's `posix_spawn` fast path is
+        // preserved): a `pre_exec` hook forces fork+exec, and concurrent
+        // commands all fork the same large parent, which serializes them on
+        // the parent's `mmap_lock`.
+        command.process_group(0);
     }
 }
 
@@ -110,7 +110,13 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
         // Validate the complete request (including cwd/env and argument types)
         // even though the builtin does not spawn a process.
         validate_builtin_request(request)?;
-        return Ok(builtin_result(request, kind));
+        // The netprobe builtin resolves DNS and connects (blocking, up to 2s)
+        // — keep that off the async runtime thread. Other builtins are pure,
+        // and paying one blocking-pool dispatch for them is noise.
+        let request = request.clone();
+        return tokio::task::spawn_blocking(move || builtin_result(&request, kind))
+            .await
+            .map_err(|error| io::Error::other(error.to_string()));
     }
     let mut command = command_from(request)?;
     prepare_process(&mut command, false);

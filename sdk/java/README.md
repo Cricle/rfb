@@ -92,7 +92,7 @@ try (GuestStream s = box.stream(List.of("tail", "-f", "x"))) {
 ```
 
 两种传输下 `exec`/`eval`/`ls`/`find`/`grep`/`read`/`write`/`stream`/`ping` 的方法名与结果字段一致（eval 的 `output` 统一映射为 `ExecResult.stdout`）。
-DTO 取值统一走 getter（JavaBean 命名）：`ExecResult.getExitCode()/getStdout()/getStderr()/isTimedOut()`、`FileRead.getData()/isTruncated()/getTotalBytes()`、`StreamEvent.getKind()/getData()/getCode()`、`DirEntry.getName()/isDir()/getSize()`、`GrepMatch.getPath()/getLine()/getColumn()/getText()`；`byte[]` 访问器按值返回拷贝（构造与取值两侧均防御性复制），DTO 均实现 `equals`/`hashCode`。
+DTO 取值统一走 getter（JavaBean 命名）：`ExecResult.getExitCode()/getStdout()/getStderr()/isTimedOut()`、`FileRead.getData()/isTruncated()/getTotalBytes()`、`StreamEvent.getKind()/getData()/getCode()`、`DirEntry.getName()/isDir()/getSize()`、`GrepMatch.getPath()/getLine()/getColumn()/getText()`；控制器 DTO `SandboxInfo` 为可变 JavaBean（getter + setter，Jackson 字段绑定），`Snapshot` 为只读视图（仅 getter，Jackson 字段绑定）；字段名均与 PROTOCOL.md §1.3 一致；`byte[]` 访问器按值返回拷贝（构造与取值两侧均防御性复制），DTO 均实现 `equals`/`hashCode`。
 
 ### 3. 错误处理
 
@@ -124,7 +124,7 @@ mvn test
 | `ControllerHttpTest` | 进程内 fake HTTP：快照列表、`/info` → 旧端点回退链、错误映射（JSON error 字段 / 前 1024 字符）、Bearer 头、delete 404=成功、sandbox-id 校验、请求体字段名 |
 | `GuestNdjsonTest` | 进程内 fake TCP NDJSON：多行读到终结行、error 行抛出、exec/eval/ls/find/grep/read/write 映射、流会话 sendInput/stop/exit、响应 50KiB 上限、§2.3 校验 fail closed |
 | `ZbrtConnectionTest` | 进程内 fake ZBRT：Output 流 → 恰一个终结帧、Error 帧、幂等 Cancel（空 payload CancelAck）、HealthAck、fs 读写 round-trip、第二个 Execute / 重复 request-id 错误、读停顿超时抛 TransportError、request_id 不匹配 |
-| `ZbrtClientTest` | eval-over-ZBRT 一致性黄金向量（`sdk/shared/conformance/eval_zbrt_vectors.json`）：EVAL_ZBRT_BASIC / EVAL_ZBRT_DEFAULTS 逐字节帧 hex + 字段断言、校验失败（空 code、timeout=0）零发包 |
+| `ZbrtClientTest` | ZBRT fail-closed 契约：eval 在 ZBRT 下抛 ValidationError 且零帧上线（含本地校验失败零发包）；stream 的 pty/env/空 argv 同样零帧拒绝 |
 | `RfbClientFacadeTest` | 统一门面：create → exec → read/write → delete 全流程、connect/pingSandbox、传输名校验、connect(Sandbox) 直接附着、createSandbox transport 参数 |
 | `ValidationTest` / `DtoJsonTest` | §2.3 全部规则（UTF-8 字节长度）、§1.3 JSON 字段名与 serde(default) 默认值 |
 
@@ -133,8 +133,8 @@ mvn test
 - 四语言（rust/python/csharp/java）公共类型与方法一一对应；Rust 是基准实现，本 SDK 是镜像移植，语义差异仅限语言习惯（Java 小驼峰、同步阻塞、unchecked 异常）。
 - 公共类型集合严格限定为 UNIFIED_API.md §1 全集（上表）：曾经导出的 `CreateSandboxRequest` / `CreateOptions` / `Transport` 均为死代码或不在全集内，已删除；传输选择沿用既有惯例以字符串 `"ndjson"` / `"zbrt"` 表示（`connect` / `createSandbox` 同）。
 - `createSandbox(...)` 支持末位可选 `transport` 参数（重载提供，默认 NDJSON），决定返回的 `Sandbox` 门面使用的 guest 传输；`connect(sandbox)` 直接附着传入的 `Sandbox` 对象（保留其传输），仅 `connect(String id)` 走 listSandboxes 重解析。
-- `exec(args, cwd, timeoutS, stdin)`：`args` 不得为空、`cwd` 需为合法 guest 路径（两传输均在发送前本地校验，fail closed）；NDJSON 传输的 wire 契约没有 exec stdin 通道，非空 stdin 静默丢弃（与 Rust 基准一致；stdin 仅 ZBRT 送达）；默认 cwd 解析为 guest 根（NDJSON 发送 `/workspace`，ZBRT 省略 cwd 字段）——forkd guest 会拒绝 `"/"`。NDJSON 响应缺 `exit_code` 时回退 `-1`（与 Rust 一致）。
-- `eval`：两种传输均支持。ZBRT v1 无 eval opcode，统一约定（`sdk/shared/README.md`）编码为一轮 `Execute`：`argv=["eval", code]`、stdin 为空、`timeout_ms` = 整秒数 ×1000（未指定时为 0）；eval 的 `output` 统一映射为 `ExecResult.stdout`（NDJSON 下 stderr 恒为空、缺 status 回退 0）。一致性黄金向量见 `sdk/shared/conformance/eval_zbrt_vectors.json`（测试：`ZbrtClientTest::evalZbrtMatchesSharedVector`）。
+- `exec(args, cwd, timeoutS, stdin)`：`args` 不得为空、`cwd` 需为合法 guest 路径（两传输均在发送前本地校验，fail closed）；NDJSON 传输的 wire 契约没有 exec stdin 通道，非空 stdin 本地 fail closed（抛 `ValidationError`，零帧——静默丢弃会让命令没有输入地运行；stdin 仅 ZBRT 送达）；默认 cwd 解析为 guest 根（NDJSON 发送 `/workspace`，ZBRT 省略 cwd 字段）——forkd guest 会拒绝 `"/"`。NDJSON 响应缺 `exit_code` 时回退 `-1`（与 Rust 一致）。
+- `eval`：NDJSON 支持（`status` 优先、`exit_code` 兜底，`output`→stdout）；ZBRT v1 无 eval opcode 且参考 guest 把 Execute 原样当 exec 执行，故 ZBRT 下本地 fail closed（ValidationError，零帧上线，见 `sdk/shared/README.md §1`；测试：`ZbrtClientTest::evalOverZbrtFailsClosedWithoutSendingFrames`）。
 - `waitSnapshot` 轮询间隔 100ms；`status=failed` 立即抛 `RemoteError`；超时抛 `TransportError`（UNIFIED_API.md §7：超时属于传输类错误）。
 - ZBRT fs 帧 data JSON 按 PROTOCOL.md §3.3 恒带全部键：read 为 `{"offset":..,"max_bytes":..}`（缺省为 null）、write 为 `{"data":[..],"append":..,"mode":..}`（缺省 mode 为 null）。
 - ZBRT 传输的 exec 超时只作为随帧下发的 guest 侧 deadline；客户端读停顿超时直接抛 `TransportError`，不做客户端主动 Cancel（与 Rust 基准一致）。

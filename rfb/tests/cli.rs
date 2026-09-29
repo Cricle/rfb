@@ -264,7 +264,13 @@ fn image_build_execute_creates_ext4_and_reports_digest() {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(init_bytes);
-        format!("{:x}", hasher.finalize())
+        // Independent lowercase-hex encoder; digest 0.11 outputs no longer
+        // implement LowerHex.
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     let manifest = directory.path().join("manifest.json");
     write_manifest(
@@ -846,5 +852,126 @@ fn acceptance_require_provenance_requires_binding_inputs() {
     assert!(
         stdout.contains("snapshot-bind"),
         "stdout must name the missing binding: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// build.rfb script builds (tool-gated: cargo + musl target + e2fsprogs)
+// ---------------------------------------------------------------------------
+
+fn musl_toolchain_available() -> bool {
+    let installed = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+    let has_target = installed
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == "x86_64-unknown-linux-musl")
+        })
+        .unwrap_or(false);
+    let has_musl_gcc = Command::new("musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    has_target && has_musl_gcc
+}
+
+#[test]
+fn build_script_bakes_files_and_rust_apps_into_a_real_image() {
+    fn available(cmd: &str) -> bool {
+        // e2fsprogs tools exit non-zero for `--version` under spawned stdio,
+        // so check lookup only instead of probing a run.
+        Command::new("sh")
+            .args(["-c", &format!("command -v {cmd} >/dev/null")])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    if !available("mke2fs")
+        || !available("debugfs")
+        || !available("cargo")
+        || !musl_toolchain_available()
+    {
+        eprintln!("skipping: mke2fs/debugfs/cargo/musl toolchain unavailable");
+        return;
+    }
+
+    let project = tempfile::tempdir().expect("temporary project dir");
+    let base = project.path();
+
+    // A fake "prebuilt musl app" (bytes are only digest-verified, not ELF-
+    // parsed, so a text file keeps the test offline).
+    fs::write(base.join("hello"), b"#!/bin/sh\necho hi\n").expect("write fake app");
+    fs::create_dir_all(base.join("assets")).expect("assets dir");
+    fs::write(base.join("assets/banner.txt"), b"rfb-script-test\n").expect("write banner");
+
+    // forkd-agent mode keeps the runtime build cheap (no interpreter features);
+    // the binary target is the real workspace build.
+    fs::write(
+        base.join("build.rfb"),
+        "schema = \"rfb-build/v1\"\n\
+         mode = \"forkd-agent\"\n\
+         output = \"out/built.ext4\"\n\
+         force = true\n\
+         \n\
+         [rust]\n\
+         apps = [\"hello\"]\n\
+         \n\
+         [files]\n\
+         \"assets/banner.txt\" = \"/etc/motd\"\n",
+    )
+    .expect("write build.rfb");
+
+    // Workspace root = the parent of this crate's directory.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+
+    let output = run(&[
+        "image",
+        "build-script",
+        "--root",
+        root.to_str().unwrap(),
+        base.join("build.rfb").to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "image build-script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let built = base.join("out/built.ext4");
+    assert!(built.exists(), "script output image was not created");
+
+    // Both payloads are readable back at their guest paths with exact bytes.
+    for (guest, expected) in [
+        ("/usr/local/bin/hello", &b"#!/bin/sh\necho hi\n"[..]),
+        ("/etc/motd", &b"rfb-script-test\n"[..]),
+    ] {
+        let readback = Command::new("debugfs")
+            .args(["-R", &format!("cat {guest}")])
+            .arg(&built)
+            .output()
+            .expect("run debugfs");
+        assert!(
+            readback.status.success(),
+            "debugfs cat {guest} failed: {}",
+            String::from_utf8_lossy(&readback.stderr)
+        );
+        assert_eq!(readback.stdout, expected, "{guest} bytes mismatch");
+    }
+
+    // The sidecar artifacts were published next to the image.
+    assert!(
+        built.with_extension("ext4.sha256").exists(),
+        "sha256 sidecar"
+    );
+    assert!(
+        built.with_extension("ext4.manifest.json").exists(),
+        "manifest sidecar"
     );
 }

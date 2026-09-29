@@ -1,0 +1,18 @@
+schema = "rfb-build/v1"
+mode = "zeroboot-zbrt"
+output = "out/full-sandbox.ext4"
+force = true
+
+[interpreters]
+python = true
+lua = true
+
+[packages]
+py-site = "sites"
+lua-lib = "sites"
+
+[rust]
+apps = ["hello"]
+
+[files]
+"assets/banner.txt" = "/etc/motd"

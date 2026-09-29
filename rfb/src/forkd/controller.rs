@@ -30,6 +30,25 @@ pub struct ForkdClient {
     token: Option<String>,
 }
 
+/// Percent-encode one URL path segment (PROTOCOL.md §1.1: snapshot tags are
+/// encoded verbatim into the path). Mirrors `urllib.parse.quote(tag, safe="")`
+/// in the Python SDK: unreserved characters pass through, everything else
+/// (including `/`, `?`, `#`, space, `%`) is escaped. A literal `.`/`..` tag is
+/// still normalized away by the WHATWG URL parser, exactly as in the other
+/// SDKs.
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Metadata describing a forkd snapshot.
 pub struct SnapshotInfo {
@@ -122,6 +141,15 @@ pub struct CreateSandboxRequest<'a> {
     pub hugepages: bool,
 }
 
+/// The ready/bootable predicate, single-sourced: the client's
+/// [`ForkdClient::snapshot_ready`], [`ForkdClient::wait_for_snapshot_ready`],
+/// and the `rfb-cli` preflight all ask this one question the same way.
+pub fn snapshot_ready_in(snapshots: &[SnapshotInfo], tag: &str) -> bool {
+    snapshots
+        .iter()
+        .any(|s| s.tag == tag && s.status.eq_ignore_ascii_case("ready") && s.bootable)
+}
+
 impl ForkdClient {
     pub fn validate_sandbox_id(id: &str) -> Result<(), ForkdClientError> {
         if id.is_empty()
@@ -167,7 +195,9 @@ impl ForkdClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            token,
+            // A blank token must not produce `Authorization: Bearer `
+            // (UNIFIED_API.md §2: the header is sent only for a non-empty token).
+            token: token.filter(|value| !value.trim().is_empty()),
         })
     }
 
@@ -189,7 +219,7 @@ impl ForkdClient {
     /// Read a response body with a hard size cap: the client is loopback-only
     /// in normal use, but a broken/hostile controller must not OOM the CLI.
     async fn read_body_capped(mut response: reqwest::Response) -> Result<String, ForkdClientError> {
-        const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_BODY_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
         if let Some(length) = response.content_length() {
             if length > MAX_BODY_BYTES as u64 {
                 return Err(ForkdClientError::Decode(
@@ -239,6 +269,7 @@ impl ForkdClient {
     /// A 404 from both endpoints is treated as unsupported detail and returns
     /// `None`.
     pub async fn snapshot_info(&self, tag: &str) -> Result<Option<SnapshotInfo>, ForkdClientError> {
+        let tag = encode_path_segment(tag);
         let preferred = self
             .request(
                 self.client
@@ -265,9 +296,7 @@ impl ForkdClient {
 
     pub async fn snapshot_ready(&self, tag: &str) -> Result<bool, ForkdClientError> {
         let snapshots = self.list_snapshots().await?;
-        Ok(snapshots
-            .iter()
-            .any(|s| s.tag == tag && s.status.eq_ignore_ascii_case("ready") && s.bootable))
+        Ok(snapshot_ready_in(&snapshots, tag))
     }
 
     pub async fn wait_for_snapshot_ready(
@@ -284,7 +313,7 @@ impl ForkdClient {
                         "forkd snapshot `{tag}` is Failed"
                     )));
                 }
-                if snapshot.status.eq_ignore_ascii_case("ready") && snapshot.bootable {
+                if snapshot_ready_in(&snapshots, tag) {
                     return Ok(());
                 }
             }

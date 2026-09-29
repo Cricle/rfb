@@ -6,7 +6,7 @@ use crate::cli::error::{external, io, validation, CliError};
 use crate::cli::image_build::manifest::{
     safe_join, sha256, sha256_bytes, validate, StagingManifest,
 };
-use crate::cli::image_build::verify::{is_dynamically_linked, run_debugfs};
+use crate::cli::image_build::verify::{binary_contains, is_dynamically_linked, run_debugfs};
 use crate::cli::tool::tool_available;
 use crate::image_profiles::ImageManifestProfile;
 use serde_json::{json, Value};
@@ -160,7 +160,11 @@ pub fn build(
             &format!("cat {}", debugfs_quote(&destination)),
             true,
         )?;
-        if actual.len() as u64 != file.size || sha256_bytes(&actual) != file.sha256 {
+        // manifest::validate accepts non-lowercase hex, so compare
+        // case-insensitively here too (artifact.rs does the same).
+        if actual.len() as u64 != file.size
+            || !sha256_bytes(&actual).eq_ignore_ascii_case(&file.sha256)
+        {
             return Err(external(format!(
                 "debugfs verification failed for {}",
                 file.path
@@ -171,7 +175,7 @@ pub fn build(
     let digest = sha256(&output_path).map_err(|error| io(error.to_string()))?;
     if let Some(expected) = image.digest.as_deref() {
         let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-        if expected != digest {
+        if !digest.eq_ignore_ascii_case(expected) {
             return Err(external(format!(
                 "image digest mismatch: expected {expected}, got sha256:{digest}"
             )));
@@ -247,6 +251,21 @@ pub struct RootfsOptions {
     /// Local tree of Lua modules baked into the image at `/usr/lib/lua/5.4`
     /// (the offline `package.path` root).
     pub lua_lib_dir: Option<std::path::PathBuf>,
+    /// Extra files baked into the image verbatim (build-script payloads:
+    /// configs, assets, prebuilt app binaries). Installed and digest-verified
+    /// like every other payload.
+    pub extra_files: Vec<ExtraFile>,
+}
+
+/// One extra file a build script bakes into the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraFile {
+    /// Host source path.
+    pub source: std::path::PathBuf,
+    /// Absolute guest destination path (must start with `/`).
+    pub guest: String,
+    /// POSIX mode for the guest inode (e.g. `0o755`).
+    pub mode: u32,
 }
 
 /// Python package root baked into the image; the embedded interpreter appends
@@ -305,27 +324,48 @@ pub fn build_rootfs(
             "refusing dynamic runtime; build x86_64-unknown-linux-musl first (or set --allow-dynamic)",
         ));
     }
-    // Interpreter hardlinks/site dirs are only wired in the ZBRT image layout.
-    if mode != "zeroboot-zbrt"
-        && (options.with_python
-            || options.with_lua
-            || options.py_site_dir.is_some()
-            || options.lua_lib_dir.is_some())
+    // Interpreter hardlinks dispatch by argv[0] at guest runtime, which is
+    // mode-independent (the multi-call binary serves python3/lua under every
+    // mode), so every mode may install them. The hardlink SOURCE is the
+    // mode's own entrypoint (see install below).
+    // The hardlink install cannot make an interpreter work: if the runtime was
+    // built without the feature, /bin/python3 would dispatch to "unknown
+    // runtime mode" at guest runtime. Verify the markers before installing.
+    if (options.with_python || options.py_site_dir.is_some())
+        && !binary_contains(runtime_bin, b"RustPython")?
     {
         return Err(validation(
-            "interpreter options (--with-python/--with-lua/--py-site-dir/--lua-lib-dir) require --mode zeroboot-zbrt",
+            "--with-python/--py-site-dir require the runtime built with the `rustpython` cargo feature (image build-static --features cli,rustpython)",
+        ));
+    }
+    if (options.with_lua || options.lua_lib_dir.is_some())
+        && !binary_contains(runtime_bin, b"Lua 5.4")?
+    {
+        return Err(validation(
+            "--with-lua/--lua-lib-dir require the runtime built with the `mlua` cargo feature (image build-static --features cli,mlua)",
         ));
     }
 
-    // ZBRT images are read-mostly: only /workspace receives writes, so size
-    // from the installed content plus a bounded write headroom instead of the
-    // one-size 32 MiB floor used by rw system images.
+    // ZBRT images are tiny disposable per-sandbox copies (workspace writes
+    // land on the tmpfs), so: no journal, no reserved blocks, small floor.
+    // forkd images keep a journal (the rootfs is shared across children) but
+    // also drop the root-reserved percentage; their floor is 8 MiB because
+    // the rootfs is effectively read-only too.
     let zbrt = mode == "zeroboot-zbrt";
-    let floor_mb = if zbrt { 4 } else { 32 };
-    let headroom_bytes: u64 = 4 * 1024 * 1024;
-    let mut content_bytes = fs::metadata(runtime_bin)
+    let floor_mb = if zbrt { 2 } else { 8 };
+    // Headroom covers ext4 metadata (inode tables, bitmaps, GDT): zbrt
+    // images carry no journal, so 3 MiB suffices.
+    let headroom_bytes: u64 = if zbrt {
+        3 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let runtime_len = fs::metadata(runtime_bin)
         .map_err(|error| io(error.to_string()))?
         .len();
+    // The runtime installs ONCE in every mode: the forkd entrypoint is a
+    // hardlink to the installed binary (same inode).
+    let mut content_bytes = runtime_len;
     // /bin/sh (rfb-busybox) installs in every image mode.
     if let Some(parent) = runtime_bin.parent() {
         content_bytes += fs::metadata(parent.join("rfb-busybox"))
@@ -334,22 +374,27 @@ pub fn build_rootfs(
     }
     if zbrt {
         // The multi-call applets are installed alongside the runtime binary.
-        // Interpreter hardlinks add zero bytes; site-package trees are real
-        // content.
         if let Some(parent) = runtime_bin.parent() {
             content_bytes += fs::metadata(parent.join("rfb-mini-tools"))
                 .map(|meta| meta.len())
                 .unwrap_or(0);
         }
-        for dir in [
-            options.py_site_dir.as_deref(),
-            options.lua_lib_dir.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            content_bytes += site_tree_bytes(dir)?;
-        }
+    }
+    // Site-package trees and build-script payload files are real content in
+    // every mode (interpreters install in every mode; extra files too).
+    for dir in [
+        options.py_site_dir.as_deref(),
+        options.lua_lib_dir.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        content_bytes += site_tree_bytes(dir)?;
+    }
+    for extra in &options.extra_files {
+        content_bytes += fs::metadata(&extra.source)
+            .map_err(|error| io(error.to_string()))?
+            .len();
     }
     let size_mb = match size_mb {
         Some(mb) => mb.max(floor_mb),
@@ -370,8 +415,28 @@ pub fn build_rootfs(
     if !status.success() {
         return Err(external("truncate failed"));
     }
+    // mke2fs sizing: -m 0 drops the 5% root-reserved blocks (the guest runs
+    // as root and the workspace tmpfs is the write target anyway). ZBRT
+    // images additionally drop the journal: each image is a disposable
+    // per-sandbox copy whose writes land on the tmpfs, so crash-consistency
+    // of the rootfs does not matter (~4 MiB saved per image).
+    let mkfs_args: &[&str] = if zbrt {
+        &[
+            "-q",
+            "-t",
+            "ext4",
+            "-F",
+            "-O",
+            "^has_journal",
+            "-m",
+            "0",
+            &image,
+        ]
+    } else {
+        &["-q", "-t", "ext4", "-F", "-m", "0", &image]
+    };
     let status = Command::new("mke2fs")
-        .args(["-q", "-t", "ext4", "-F", &image])
+        .args(mkfs_args)
         .status()
         .map_err(|error| external(error.to_string()))?;
     if !status.success() {
@@ -436,12 +501,13 @@ pub fn build_rootfs(
         false,
     )?;
     if mode == "forkd-agent" {
+        // /forkd-init.sh is a HARDLINK to the installed runtime binary (same
+        // inode, zero image bytes): the multi-call dispatch keys on the
+        // argv[0] basename, which a hardlink preserves. Writing the binary a
+        // second time doubled every forkd image by the runtime size.
         run_debugfs(
             &image_path,
-            &format!(
-                "write {} {entrypoint}",
-                debugfs_quote(&runtime_bin.to_string_lossy())
-            ),
+            &format!("ln {install_path} {entrypoint}"),
             false,
         )?;
         run_debugfs(
@@ -536,13 +602,7 @@ pub fn build_rootfs(
             entry_stat.trim().replace('\n', " | ")
         )));
     }
-    let installed = run_debugfs(&image_path, &format!("cat {install_path}"), true)?;
-    let runtime_bytes = fs::read(runtime_bin).map_err(|error| io(error.to_string()))?;
-    if installed != runtime_bytes {
-        return Err(external(format!(
-            "runtime verification failed: {install_path}"
-        )));
-    }
+    crate::cli::image_build::verify_installed_file(&image_path, runtime_bin, install_path)?;
     if mode == "rfb-vsock" {
         let marker = run_debugfs(&image_path, "cat /etc/rfb-runtime/protocol-version", true)?;
         if String::from_utf8_lossy(&marker).trim() != "1" {
@@ -638,25 +698,38 @@ pub fn build_rootfs(
                 false,
             )?;
         }
-        // Interpreter multi-call hardlinks: /bin/python3 and /bin/lua point
-        // at /init, which dispatches on argv[0]. Zero extra image bytes; the
-        // interpreter itself must be compiled into the runtime binary via the
-        // `rustpython`/`mlua` cargo features.
-        if options.with_python {
-            install_hardlink(&image_path, "/init", "/bin/python3")?;
+        // `nproc` is that same multi-call binary under another name, so link
+        // it instead of paying another copy: capacity runs use it to report
+        // the CPU count the guest actually brought up.
+        let nproc = "/bin/nproc";
+        if run_debugfs(&image_path, &format!("stat {nproc}"), false).is_ok() {
+            let _ = run_debugfs(&image_path, &format!("unlink {nproc}"), false);
+            let _ = run_debugfs(&image_path, &format!("rm {nproc}"), false);
         }
-        if options.with_lua {
-            install_hardlink(&image_path, "/init", "/bin/lua")?;
-        }
-        // Offline extension packages: static files under the interpreter
-        // import roots, written and digest-verified like every other payload.
-        install_site_dir(
-            &image_path,
-            options.py_site_dir.as_deref(),
-            PY_SITE_PACKAGES,
-        )?;
-        install_site_dir(&image_path, options.lua_lib_dir.as_deref(), LUA_LIB_DIR)?;
+        run_debugfs(&image_path, &format!("ln /bin/echo {nproc}"), false)?;
     }
+    // Interpreter multi-call hardlinks: /bin/python3 and /bin/lua point
+    // at the mode's entrypoint, which dispatches on argv[0]. Zero extra
+    // image bytes; the interpreter itself must be compiled into the
+    // runtime binary via the `rustpython`/`mlua` cargo features.
+    if options.with_python {
+        install_hardlink(&image_path, entrypoint, "/bin/python3")?;
+    }
+    if options.with_lua {
+        install_hardlink(&image_path, entrypoint, "/bin/lua")?;
+    }
+    // Offline extension packages: static files under the interpreter import
+    // roots, written and digest-verified like every other payload. Every mode
+    // installs them (the interpreters that consume the roots do too).
+    install_site_dir(
+        &image_path,
+        options.py_site_dir.as_deref(),
+        PY_SITE_PACKAGES,
+    )?;
+    install_site_dir(&image_path, options.lua_lib_dir.as_deref(), LUA_LIB_DIR)?;
+    // Build-script payload files (configs, assets, prebuilt app binaries):
+    // same install + digest-verify contract as the site trees.
+    install_extra_files(&image_path, &options.extra_files)?;
     let logical_bytes = fs::metadata(&image_path)
         .map_err(|error| io(error.to_string()))?
         .len();
@@ -669,7 +742,7 @@ pub fn build_rootfs(
         .map_err(|error| io(error.error.to_string()))?;
 
     let artifact = crate::cli::image_build::ArtifactManifest::for_rootfs(
-        output, &digest, mode, entrypoint, protocol, size_mb,
+        output, &digest, mode, entrypoint, protocol,
     )?;
     artifact.validate()?;
     let artifact_manifest_path = artifact.write_sidecar(output)?;
@@ -839,10 +912,9 @@ fn install_site_dir(
     // Create the root plus every parent directory first (debugfs mkdir fails
     // on existing directories, and mke2fs only pre-creates the base layout).
     let mut directories = std::collections::BTreeSet::new();
-    // debugfs mkdir does not create parents, so every ancestor of the root
-    // (e.g. /usr, /usr/lib, /usr/lib/python3) must exist before the root can
-    // be created. Ancestors sort before the root and its children, so one
-    // lexicographically ordered pass is enough.
+    // Ancestors of the root (e.g. /usr, /usr/lib, /usr/lib/python3) come
+    // first; ancestors sort before the root and its children, so one pass of
+    // ensure_image_dirs over the sorted set is enough.
     let mut ancestor = String::new();
     for component in image_root.split('/').filter(|part| !part.is_empty()) {
         ancestor.push('/');
@@ -858,7 +930,20 @@ fn install_site_dir(
             parent = path.parent();
         }
     }
-    for directory in directories {
+    ensure_image_dirs(image_path, directories)?;
+    for (rel, source) in files {
+        install_image_file(image_path, &source, &format!("{image_root}/{rel}"), None)?;
+    }
+    Ok(())
+}
+
+/// Create every directory in `dirs` (BTreeSet-ordered: parents before
+/// children; debugfs mkdir neither creates parents nor tolerates re-creates).
+fn ensure_image_dirs(
+    image_path: &Path,
+    dirs: impl IntoIterator<Item = String>,
+) -> Result<(), CliError> {
+    for directory in dirs {
         if run_debugfs(
             image_path,
             &format!("stat {}", debugfs_quote(&directory)),
@@ -873,33 +958,117 @@ fn install_site_dir(
             )?;
         }
     }
-    for (rel, source) in files {
-        let destination = format!("{image_root}/{rel}");
+    Ok(())
+}
+
+/// Write one file into the image, clear any pre-created inode first, apply an
+/// optional mode, and digest-verify the installed bytes.
+fn install_image_file(
+    image_path: &Path,
+    source: &Path,
+    destination: &str,
+    mode: Option<u32>,
+) -> Result<(), CliError> {
+    if run_debugfs(
+        image_path,
+        &format!("stat {}", debugfs_quote(destination)),
+        false,
+    )
+    .is_ok()
+    {
+        let _ = run_debugfs(
+            image_path,
+            &format!("unlink {}", debugfs_quote(destination)),
+            false,
+        );
+        let _ = run_debugfs(
+            image_path,
+            &format!("rm {}", debugfs_quote(destination)),
+            false,
+        );
+    }
+    run_debugfs(
+        image_path,
+        &format!(
+            "write {} {}",
+            debugfs_quote(&source.to_string_lossy()),
+            debugfs_quote(destination)
+        ),
+        false,
+    )?;
+    if let Some(mode) = mode {
+        // debugfs parses the mode as octal only with a leading zero
+        // (e.g. 0100644 = S_IFREG|0644).
         run_debugfs(
             image_path,
             &format!(
-                "write {} {}",
-                debugfs_quote(&source.to_string_lossy()),
-                debugfs_quote(&destination)
+                "set_inode_field {} mode {:07o}",
+                debugfs_quote(destination),
+                mode | 0o100000
             ),
             false,
         )?;
-        let expected = fs::read(&source).map_err(|error| io(error.to_string()))?;
-        let actual = run_debugfs(
-            image_path,
-            &format!("cat {}", debugfs_quote(&destination)),
-            true,
-        )?;
-        if actual != expected {
-            return Err(external(format!(
-                "site package verification failed: {destination}"
-            )));
-        }
+    }
+    crate::cli::image_build::verify_installed_file(image_path, source, destination)
+}
+
+/// Validate one build-script file mapping. The guest path must be absolute
+/// and normalize inside the image (no `..`, no empty segments at the end).
+pub fn validate_extra_guest_path(guest: &str) -> Result<(), CliError> {
+    if !guest.starts_with('/') {
+        return Err(validation(format!(
+            "extra file guest path must be absolute: {guest:?}"
+        )));
+    }
+    if guest.len() > 4096 || guest.as_bytes().contains(&0) || guest.contains('\\') {
+        return Err(validation(format!(
+            "extra file guest path is malformed: {guest:?}"
+        )));
+    }
+    if guest.split('/').any(|segment| segment == "..") {
+        return Err(validation(format!(
+            "extra file guest path must not contain '..': {guest:?}"
+        )));
+    }
+    if guest.len() > 1 && guest.ends_with('/') {
+        return Err(validation(format!(
+            "extra file guest path must name a file, not a directory: {guest:?}"
+        )));
     }
     Ok(())
 }
 
-fn debugfs_quote(value: &str) -> String {
+/// Bake build-script payload files into the image: create every parent
+/// directory, write the file, set its mode, and digest-verify the bytes.
+fn install_extra_files(image_path: &Path, files: &[ExtraFile]) -> Result<(), CliError> {
+    // Every ancestor of every destination (sorted so parents precede children).
+    let mut directories = std::collections::BTreeSet::new();
+    for extra in files {
+        validate_extra_guest_path(&extra.guest)?;
+        if !extra.source.is_file() {
+            return Err(validation(format!(
+                "extra file source is not a readable file: {}",
+                extra.source.display()
+            )));
+        }
+        let guest = Path::new(&extra.guest);
+        let mut parent = guest.parent();
+        while let Some(path) = parent {
+            let text = path.to_string_lossy();
+            if !text.is_empty() && text != "/" {
+                directories.insert(text.into_owned());
+            }
+            parent = path.parent();
+        }
+    }
+    ensure_image_dirs(image_path, directories)?;
+    for extra in files {
+        install_image_file(image_path, &extra.source, &extra.guest, Some(extra.mode))?;
+    }
+    Ok(())
+}
+
+pub(super) fn debugfs_quote(value: &str) -> String {
     if value
         .chars()
         .all(|character| !character.is_whitespace() && character != '"')

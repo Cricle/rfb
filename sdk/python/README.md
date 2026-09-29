@@ -83,7 +83,7 @@ python -m unittest discover -s tests -v
 
 - **同步阻塞 I/O**：全部方法为同步调用，无异步变体（与 Rust 基准的 tokio 异步不同，属语言习惯差异）。
 - **ZBRT 传输下的 `send_input`**：ZBRT v1 只在 Execute 帧内携带 stdin，没有向已提交请求追加 stdin 的 wire 消息，因此 `GuestStream.send_input` 在 ZBRT 传输下抛 `RemoteError`（`pty` / `env` 参数同样仅 NDJSON 支持）。
-- **ZBRT 传输下的 `eval`**：ZBRT v1 没有独立 eval 原语，SDK 将 `eval(code)` 内部映射为一轮 Execute 帧：`argv=["eval", code]`（argc=2）、stdin 为空、`timeout_s=None` → `timeout_ms=0`（否则整秒×1000，u32 上限封顶）。该约定与 Rust 基线及 `../shared/conformance/eval_zbrt_vectors.json` 黄金向量一致（`tests/test_zbrt.py` 覆盖）。
+- **ZBRT 传输下的 `eval`**：ZBRT v1 没有 eval 原语，且参考 guest 把 Execute 原样当 `exec` 执行（旧 argv 约定会把 `eval: not found` 当成功返回）。SDK 侧 eval 在 ZBRT 下**本地 fail closed**（ValidationError，零帧上线，见 `../shared/README.md §1`；`tests/test_zbrt.py` 覆盖）。
 - **`find` / `grep` 的 `pattern` 参数**为仅关键字参数（`sandbox.find(pattern="x")`），因为规范中 `path` 带默认值且排在 `pattern` 之前。
 - Windows 下运行测试时，fake 服务器线程可能因客户端带未读数据关闭连接而打印连接重置信息，属正常清理路径，不影响结果。
 - 帧超长（> 16 MiB payload）、行超长（> 1 MiB）等一律 fail closed，不做任何截断降级。

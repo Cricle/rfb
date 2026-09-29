@@ -10,15 +10,16 @@ RFB 统一 SDK 的 C# 实现（多目标 `netstandard2.1` + `net8.0`；ns2.1 侧
   - `Internal/ForkdGuestNdjson.cs` — forkd guest TCP NDJSON（动作 ping/exec/eval/ls/find/grep/read/write/stream；逐行读到终结行；1 MiB 行上限；`error` 行 → `RemoteException`；§2.3 全部规则发送前本地校验 fail closed）。
   - `Internal/ZbrtFrameCodec.cs` + `Internal/ZbrtTcpClient.cs` — ZBRT v1 二进制帧（28 字节头、strict payload codec 拒绝截断与尾部多余字节、legacy Cancel、会话语义：Execute → 0..n Output → 恰好一个 Exit/Error、幂等 Cancel → 空 payload CancelAck、Health → HealthAck、Fs opcode 1-5、未知 kind → Error(code=1)、每请求新 128-bit request_id）。
 - **传输**：`CreateSandbox(..., transport: "ndjson"|"zbrt")`、`ListSandboxes(transport: ...)`、`Connect(..., transport: ...)`；两种传输下 `Sandbox` 方法名与返回形状完全一致。
-- **测试**：PROTOCOL.md §4 的 8 个黄金向量编码+解码双向命中；`sdk/shared/conformance/eval_zbrt_vectors.json` 的 eval-over-ZBRT 黄金向量（编码方向 + 本地校验拒绝 0 帧）；strict-decode 拒绝用例（坏 magic、错版本、非零 flags、未知 kind、截断、尾部多余字节、超长 payload）；fake HTTP / fake NDJSON TCP / fake ZBRT 帧服务器；两条传输的 facade 形状一致性。
+- **测试**：PROTOCOL.md §4 的 8 个黄金向量编码+解码双向命中；ZBRT fail-closed 契约（eval 在 ZBRT 下抛 ValidationException 且零帧上线，含本地校验失败零发包）；strict-decode 拒绝用例（坏 magic、错版本、非零 flags、未知 kind、截断、尾部多余字节、超长 payload）；fake HTTP / fake NDJSON TCP / fake ZBRT 帧服务器；两条传输的 facade 形状一致性。
 
 ## 构建 / 安装
 
-.NET 8 SDK，无需额外还原第三方包：
+.NET 8 SDK，无需额外还原第三方包（`.slnx` 解决方案格式在 .NET 8 SDK 下无法解析，
+请直接指向工程文件）：
 
 ```bash
 cd sdk/csharp
-dotnet build Rfb.Sdk.slnx
+dotnet build src/Rfb.Sdk/Rfb.Sdk.csproj
 ```
 
 ## 统一 API 快速上手
@@ -75,16 +76,16 @@ var result = await sandbox.Exec(new[] { "echo", "hello" });
 
 ```bash
 cd sdk/csharp
-dotnet test Rfb.Sdk.slnx
+dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj
 ```
 
 测试全部使用进程内 fake 服务器（fake controller HTTP、fake guest NDJSON、fake ZBRT 帧服务，见 `tests/Rfb.Sdk.Tests/Fakes.cs`），无外部依赖，快速执行。
 
 ## 已知限制
 
-- **NDJSON 传输下 `Exec` 不支持 stdin**：forkd guest 协议不携带 stdin 通道，传入非空 `stdin` 会被静默丢弃（ZBRT 传输的 Execute 帧内可携带 stdin）。
+- **NDJSON 传输下 `Exec` 不支持 stdin**：forkd guest 协议不携带 stdin 通道，传入非空 `stdin` 会本地 fail closed（抛 `ValidationException`，零帧——静默丢弃会让命令没有输入地运行；ZBRT 传输的 Execute 帧内可携带 stdin）。
 - **ZBRT 传输下的 `SendInput`**：ZBRT v1 只在 Execute 帧内携带 stdin，没有向已提交请求追加 stdin 的 wire 消息，因此 `GuestStream.SendInput` 在 ZBRT 传输下抛 `RemoteException`（`pty` / `env` 参数同样仅 NDJSON 支持；ZBRT 下传非空 `env` 或 `pty: true` 均抛 `ValidationException`，fail closed）。
-- **ZBRT 传输下的 `Eval`**：ZBRT v1 没有独立 eval 原语，SDK 将 `eval(code)` 内部映射为 Execute 帧（`argv=["eval", code]`，见 `../shared/README.md` 四语言契约与 `../shared/conformance/eval_zbrt_vectors.json` 黄金向量）；这是 SDK 内部决策，wire 格式本身严格遵循 PROTOCOL.md。
+- **ZBRT 传输下的 `Eval`**：ZBRT v1 没有独立 eval 原语，ZBRT v1 无 eval opcode 且参考 guest 把 Execute 原样当 exec 执行，因此 SDK 侧 eval 在 ZBRT 下本地 fail closed（ValidationError，零帧上线，见 ../shared/README.md §1）；这是 SDK 内部决策，wire 格式本身严格遵循 PROTOCOL.md。
 - **`Find` / `Grep` 的参数顺序**：与 Rust/Python 基线统一为 path 在前（`sandbox.Find(path: ".", pattern: "*.cs")`），`path` 默认 `"."`；另提供单参数便捷重载 `Find("*.cs")` / `Grep("rfb")`（等价于 `path="."`）。
 - **超时校验**：`Exec` / `Eval` 的 `timeoutS` 与客户端构造超时必须为有限且 > 0 的秒数，否则抛 `ValidationException`（fail closed）；ZBRT deadline 按秒向上取整 ×1000，与 NDJSON `TimeoutSecs` 一致。
 - 帧超长（> 16 MiB payload）、行超长（> 1 MiB）等一律 fail closed（strict codec 拒绝），不做任何截断降级。

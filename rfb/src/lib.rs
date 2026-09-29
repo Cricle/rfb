@@ -12,8 +12,8 @@ pub mod cli;
 
 pub use core::{
     BackendKind, BoxFuture, Capability, ContractError, ExecResult, ExecSpec, ImageManifest,
-    ManifestError, PixelFormat, ProviderError, Resources, Sandbox, SandboxError, SandboxProvider,
-    SandboxSpec, TransportKind,
+    ManifestError, ProviderError, Resources, Sandbox, SandboxError, SandboxProvider, SandboxSpec,
+    TransportKind,
 };
 
 /// Compatibility namespace for consumers migrating from the former rfb-core crate.
@@ -31,12 +31,16 @@ pub use image_profiles::{
 #[cfg(any(feature = "forkd", feature = "zeroboot"))]
 pub mod backend;
 
+/// Distributed sandbox cluster spanning multiple forkd controller nodes.
+#[cfg(feature = "forkd")]
+pub mod cluster;
+
 #[cfg(feature = "forkd")]
 #[path = "forkd/controller.rs"]
 mod controller;
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 #[path = "zeroboot/firecracker.rs"]
-mod firecracker;
+pub mod firecracker;
 #[cfg(feature = "forkd")]
 pub mod forkd;
 #[cfg(feature = "forkd")]

@@ -140,7 +140,8 @@ read：`{"offset":…,"max_bytes":…}`；write：`{"data":[…],"append":…,"m
 
 每次请求新连接 + 新 16 字节 request_id；回复的 request_id 必须匹配，否则 Decode。Output 帧严格
 先于恰好一个终结帧（Exit 或 Error）；host 无自发超时取消（读停顿按传输超时抛 Transport）。eval
-无专用 opcode：按 `sdk/shared/README.md` 编码为 `argv=["eval", code]`、空 stdin 的 Execute。
+无专用 opcode，且参考 guest 把 Execute 原样当 `exec` 执行——SDK 侧 `eval` 在 ZBRT 下
+**本地 fail closed**（ValidationError，零帧上线），见 `sdk/shared/README.md §1`。
 stdin 只在 Execute payload 里——已提交的 turn 无法再注入输入（send_input 抛 Remote）。stop：
 Cancel（reason=`"stop"`，target=本请求 id）→ 等空 CancelAck，期间到达的 Output 先缓冲、Exit
 则视作已终结。
@@ -150,7 +151,6 @@ Cancel（reason=`"stop"`，target=本请求 id）→ 等空 CancelAck，期间�
 8 个 ZBRT 向量：HELLO、HELLOACK、EXECUTE、OUTPUT、EXIT、CANCEL、CANCEL_LEGACY、ERROR，
 request_id 统一 `000102030405060708090a0b0c0d0e0f`；每个 SDK 测试必须**编码与解码双向**逐字节
 命中（Python `tests/test_zbrt_codec.py`、Java `ZbrtFrameCodecTest`、C# `GoldenVectorTests`）。
-eval-over-ZBRT 另有共享向量 `sdk/shared/conformance/eval_zbrt_vectors.json`。
 
 ## 5. RFB1（framed vsock，runtime 协议；非 SDK 传输）
 

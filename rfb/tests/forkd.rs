@@ -242,14 +242,14 @@ async fn provider_requires_configured_snapshot_tag() {
 async fn provider_rejects_unsupported_capability() {
     let client = client("http://127.0.0.1:8889".into());
     let mut spec = SandboxSpec::default();
-    spec.capabilities.push(Capability::ReadFramebuffer);
+    spec.capabilities.push(Capability::Eval);
     let error = match SandboxProvider::create(&client, spec).await {
         Ok(_) => panic!(),
         Err(e) => e,
     };
     assert!(matches!(
         error,
-        rfb::ProviderError::UnsupportedCapability(Capability::ReadFramebuffer)
+        rfb::ProviderError::UnsupportedCapability(Capability::Eval)
     ));
 }
 

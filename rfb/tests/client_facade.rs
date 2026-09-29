@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rfb::client::{
-    CreateOptions, DirEntry, GuestTransport, RfbClient, RfbError, Sandbox, StreamEventKind,
+    CreateOptions, DirEntry, GuestSandbox, GuestTransport, RfbClient, RfbError, StreamEventKind,
 };
 use rfb::protocol::{
     Error as ZbrtErrorFrame, Exit as ZbrtExit, Frame, Fs, Health, Kind, Output as ZbrtOutput,
@@ -130,7 +130,7 @@ fn sandbox_list_json(guest_addr: &str) -> String {
 }
 
 /// Controller + sandbox facade pointed at `guest_addr` on the given transport.
-async fn connect_fake(guest_addr: &str, transport: GuestTransport) -> (RfbClient, Sandbox) {
+async fn connect_fake(guest_addr: &str, transport: GuestTransport) -> (RfbClient, GuestSandbox) {
     let addr = guest_addr.to_owned();
     let controller = spawn_controller(move |req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/v1/sandboxes") => (200, sandbox_list_json(&addr)),
@@ -812,10 +812,12 @@ async fn facade_zbrt_identical_shapes() {
     assert_eq!(exec.exit_code, 0);
     assert_eq!(exec.stdout, b"hi");
     assert!(exec.stderr.is_empty());
-    // eval output maps to stdout (Execute turn with the `eval` op convention).
-    let eval = sandbox.eval("1+1", None, None).await.unwrap();
-    assert_eq!(eval.exit_code, 0);
-    assert_eq!(eval.stdout, b"hi");
+    // eval has no ZBRT opcode: it fails closed locally (see
+    // eval_zbrt_fails_closed_without_sending_frames).
+    assert!(matches!(
+        sandbox.eval("1+1", None, None).await,
+        Err(RfbError::Validation(_))
+    ));
     assert_eq!(sandbox.ls(".").await.unwrap(), expected_entries());
     assert_eq!(sandbox.find(".", "*").await.unwrap(), vec!["a.txt"]);
     let matches = sandbox.grep(".", "hi").await.unwrap();
@@ -899,88 +901,12 @@ async fn zbrt_stream_output_exit_and_cancel() {
     stream.stop().await.unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Shared eval-over-ZBRT conformance vectors
-// (sdk/shared/conformance/eval_zbrt_vectors.json)
-// ---------------------------------------------------------------------------
-
-const EVAL_GOLDEN_RID: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-
-fn hex_to_bytes(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
-        .collect()
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Re-encode a received frame with its request id normalized to the shared
-/// vector's golden id, so wire bytes compare byte-for-byte regardless of the
-/// client's random per-request UUID.
-fn normalized_frame_hex(frame: &Frame) -> String {
-    let mut bytes = Vec::new();
-    frame.encode(&mut bytes).expect("re-encode frame");
-    bytes[8..24].copy_from_slice(&EVAL_GOLDEN_RID);
-    bytes_to_hex(&bytes)
-}
-
 #[tokio::test]
-async fn eval_zbrt_matches_shared_vector() {
-    // EVAL_ZBRT_BASIC: eval("1+1", cwd="/workspace", timeout_s=5) →
-    // Execute(argv=["eval","1+1"], cwd, stdin empty, timeout_ms=5000).
-    let sent = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured = sent.clone();
-    let server = spawn_zbrt(move |frame| {
-        let hex = normalized_frame_hex(&frame);
-        captured.lock().unwrap().push(hex);
-        let rid = frame.request_id;
-        match frame.kind {
-            Kind::Execute => vec![zout(rid, 0, &hex_to_bytes("32")), zexit(rid, 0)],
-            _ => vec![zerror(rid, 1, "unexpected kind")],
-        }
-    });
-    let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
-    let result = sandbox
-        .eval("1+1", Some("/workspace"), Some(5.0))
-        .await
-        .unwrap();
-    assert_eq!(
-        sent.lock().unwrap().as_slice(),
-        ["5a42525401030000000102030405060708090a0b0c0d0e0f0000002702000000046576616c00000003312b31010000000a2f776f726b73706163650000000000001388"],
-        "EVAL_ZBRT_BASIC wire bytes"
-    );
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, hex_to_bytes("32"));
-    assert!(result.stderr.is_empty());
-    assert!(!result.timed_out);
-
-    // EVAL_ZBRT_DEFAULTS: eval("print(40+2)") — cwd flag 0, timeout_ms 0.
-    let sent = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured = sent.clone();
-    let server = spawn_zbrt(move |frame| {
-        let hex = normalized_frame_hex(&frame);
-        captured.lock().unwrap().push(hex);
-        let rid = frame.request_id;
-        match frame.kind {
-            Kind::Execute => vec![zout(rid, 0, &hex_to_bytes("3432")), zexit(rid, 0)],
-            _ => vec![zerror(rid, 1, "unexpected kind")],
-        }
-    });
-    let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
-    let result = sandbox.eval("print(40+2)", None, None).await.unwrap();
-    assert_eq!(
-        sent.lock().unwrap().as_slice(),
-        ["5a42525401030000000102030405060708090a0b0c0d0e0f0000002102000000046576616c0000000b7072696e742834302b3229000000000000000000"],
-        "EVAL_ZBRT_DEFAULTS wire bytes"
-    );
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, hex_to_bytes("3432"));
-
-    // EVAL_ZBRT_VALIDATION_REJECTED + EVAL_ZBRT_TIMEOUT_ZERO_REJECTED:
-    // both fail closed locally with zero frames on the wire.
+async fn eval_zbrt_fails_closed_without_sending_frames() {
+    // ZBRT v1 has no eval opcode and the reference guest maps Execute verbatim
+    // onto `exec`: the old "facade convention" (argv=["eval", code]) surfaced
+    // the guest's `eval: not found` exit code as a successful result. The
+    // facade now rejects eval over ZBRT locally, with zero frames on the wire.
     let received = Arc::new(AtomicUsize::new(0));
     let counter = received.clone();
     let server = spawn_zbrt(move |frame| {
@@ -988,6 +914,17 @@ async fn eval_zbrt_matches_shared_vector() {
         vec![zexit(frame.request_id, 0)]
     });
     let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
+    assert!(matches!(
+        sandbox.eval("1+1", Some("/workspace"), Some(5.0)).await,
+        Err(RfbError::Validation(_))
+    ));
+    assert!(matches!(
+        sandbox.eval("print(40+2)", None, None).await,
+        Err(RfbError::Validation(_))
+    ));
+
+    // Validation still runs first: malformed code and a zero timeout are
+    // rejected with the same error class, also without touching the wire.
     assert!(matches!(
         sandbox.eval("   ", None, None).await,
         Err(RfbError::Validation(_))

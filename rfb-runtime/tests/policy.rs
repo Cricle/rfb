@@ -143,3 +143,38 @@ fn policy_fields_are_publically_inspectable() {
     assert_eq!(p.workspace_root, PathBuf::from("/vm/workspace"));
     assert_eq!(p.read_only_host_roots, vec![PathBuf::from("/host/sources")]);
 }
+
+#[cfg(unix)]
+#[test]
+fn workspace_path_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+    let base = std::env::temp_dir().join(format!("rfb-policy-symlink-{}", std::process::id()));
+    let workspace = base.join("workspace");
+    let secret = base.join("secret");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&secret).unwrap();
+    std::fs::write(secret.join("key"), b"leaked").unwrap();
+    // Guest created a symlink inside the workspace pointing outside.
+    symlink(&secret, workspace.join("link")).unwrap();
+    // Also a symlinked FILE inside the workspace.
+    symlink(secret.join("key"), workspace.join("key-link")).unwrap();
+
+    let p = PathPolicy::new(&workspace, Vec::new());
+    // Reading through the directory symlink must fail closed.
+    assert!(matches!(
+        p.workspace_path("link/key"),
+        Err(PolicyError::Escape)
+    ));
+    // Reading through the file symlink must fail closed too.
+    assert!(matches!(
+        p.workspace_path("key-link"),
+        Err(PolicyError::Escape)
+    ));
+    // A plain existing file inside the workspace still resolves.
+    std::fs::write(workspace.join("ok.txt"), b"fine").unwrap();
+    assert!(p.workspace_path("ok.txt").is_ok());
+    // A not-yet-existing file under an existing directory still resolves
+    // (writes must keep working).
+    assert!(p.workspace_path("sub/new.txt").is_ok());
+    let _ = std::fs::remove_dir_all(&base);
+}
