@@ -1,4 +1,4 @@
-# RFB Python SDK packaging. PyPI package name is `rfb-sdk` (the bare `rfb`
+﻿# RFB Python SDK packaging. PyPI package name is `rfb-sdk` (the bare `rfb`
 # name on PyPI is occupied by an unrelated project). Version is kept in sync
 # with the workspace release tag (v0.0.1 -> 0.0.1).
 [build-system]
@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rfb-sdk"
-version = "0.0.1"
+version = "0.0.2"
 description = "RFB unified SDK (Python): RfbClient facade over forkd controller, forkd guest and ZBRT v1"
 readme = "README.md"
 requires-python = ">=3.9"

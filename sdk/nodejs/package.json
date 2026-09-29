@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "rfb-sdk",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "RFB Node.js/TypeScript SDK: unified RfbClient facade over the forkd controller (HTTP/JSON) and the forkd guest (TCP NDJSON + ZBRT v1 binary frames) — mirror port of the Rust reference implementation",
   "type": "module",
   "main": "dist/client.js",

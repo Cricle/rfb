@@ -3,11 +3,11 @@
 # 2022 crate. The lib target keeps the name `rfb` so all `use rfb::` code and
 # the `rfb-cli` binary are unchanged.
 name = "rfb-sdk"
-version = "0.0.1"
-edition = "2021"
-rust-version = "1.93"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/Cricle/rfb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "RFB sandbox contracts and integrations"
 keywords = ["sandbox", "firecracker", "microvm", "vsock", "zeroboot"]
 categories = ["development-tools", "virtualization"]
@@ -39,7 +39,7 @@ clap = { version = "4.5", features = ["derive", "env"], optional = true }
 sha2 = { version = "0.11", optional = true }
 toml = { version = "0.9", optional = true, default-features = false, features = ["parse", "serde"] }
 uuid = { version = "1", features = ["v4"], optional = true }
-rfb-runtime = { path = "../rfb-runtime", version = "0.0.1", optional = true, default-features = false, features = ["core"] }
+rfb-runtime = { workspace = true, optional = true }
 # Only the zeroboot provider (and, through it, the cli feature) uses
 # tempfile; keep it out of lean builds.
 tempfile = { version = "3", optional = true }
