@@ -23,7 +23,7 @@
     <dependency>
       <groupId>io.github.cricle</groupId>
       <artifactId>rfb-sdk</artifactId>
-      <version>0.0.1</version>
+      <version>0.0.3</version>
     </dependency>
   </dependencies>
 

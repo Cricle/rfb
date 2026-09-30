@@ -13,6 +13,14 @@ public sealed class RfbClient : IDisposable
     private readonly ForkdControllerHttp _controller;
     private readonly TimeSpan _timeout;
 
+    /// <summary>Guest transport: NDJSON over the agent's TCP port.</summary>
+    public const string TransportNdjson = "ndjson";
+    /// <summary>Guest transport: ZBRT v1 frames.</summary>
+    public const string TransportZbrt = "zbrt";
+
+    /// <summary>Client timeout in seconds (mirrors the other SDKs).</summary>
+    public double TimeoutS => _timeout.TotalSeconds;
+
     /// <summary>
     /// <paramref name="baseUrl"/> defaults to env FORKD_URL (http://127.0.0.1:8889);
     /// <paramref name="token"/> defaults to env FORKD_TOKEN (non-empty only).

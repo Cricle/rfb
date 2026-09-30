@@ -38,7 +38,9 @@ public final class Sandbox {
         this.timeout = Duration.ofMillis((long) (client.getTimeoutS() * 1000));
     }
 
-    static Sandbox attach(RfbClient client, SandboxInfo info, String transport) {
+    /** Attach a sandbox at a KNOWN guest address with an explicit transport —
+     * the entry point for direct ZBRT bridges (no controller involved). */
+    public static Sandbox attach(RfbClient client, SandboxInfo info, String transport) {
         return new Sandbox(client, info, transport);
     }
 

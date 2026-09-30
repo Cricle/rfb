@@ -14,6 +14,19 @@ public sealed class Sandbox
     private readonly Lazy<ForkdGuestNdjson> _ndjson;
     private readonly Lazy<ZbrtTcpClient> _zbrt;
 
+    /// <summary>Attach a sandbox at a KNOWN guest address with an explicit
+    /// transport — the entry point for direct ZBRT bridges (no controller
+    /// involved). Mirrors the java SDK's <c>Sandbox.attach</c>.</summary>
+    public static Sandbox Attach(RfbClient client, SandboxInfo info, string transport)
+    {
+        if (transport != RfbClient.TransportNdjson && transport != RfbClient.TransportZbrt)
+        {
+            throw new ValidationException($"invalid transport: {transport}");
+        }
+        return new Sandbox(client, info, transport,
+            TimeSpan.FromSeconds(client.TimeoutS));
+    }
+
     internal Sandbox(RfbClient client, SandboxInfo info, string transport, TimeSpan timeout)
     {
         if (transport is not ("ndjson" or "zbrt"))

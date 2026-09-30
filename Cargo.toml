@@ -3,7 +3,7 @@ members = ["rfb", "rfb-rig", "rfb-runtime", "ben"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
@@ -14,8 +14,8 @@ repository = "https://github.com/Cricle/rfb"
 # crate, inherited by every member through `<dep>.workspace = true`. Members
 # only declare their own deltas (optional, extra features).
 [workspace.dependencies]
-rfb-runtime = { path = "rfb-runtime", version = "0.0.2", default-features = false, features = ["core"] }
-rfb = { package = "rfb-sdk", path = "rfb", version = "0.0.2" }
+rfb-runtime = { path = "rfb-runtime", version = "0.0.3", default-features = false, features = ["core"] }
+rfb = { package = "rfb-sdk", path = "rfb", version = "0.0.3" }
 
 [profile.dev]
 opt-level = 0

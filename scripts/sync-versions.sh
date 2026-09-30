@@ -71,10 +71,21 @@ sub("sdk/java/pom.xml", r"<version>[^<]*</version>",
     f"<version>{version}</version>", 1)
 sub("sdk/java/tests/pom.xml", r"<version>[^<]*</version>",
     f"<version>{version}</version>", 2)
+# 示例 pom（quickstart 对发布包的引用版本）。
+sub("sdk/examples/java/pom.xml", r"<version>[^<]*</version>",
+    f"<version>{version}</version>", 2)
 for csproj in ("sdk/csharp/src/Rfb.Sdk/Rfb.Sdk.csproj",
                "sdk/csharp/Rfb.Cli/Rfb.Cli.csproj"):
     sub(csproj, r"<Version>[^<]*</Version>",
         f"<Version>{version}</Version>")
+# workspace manifest：crate 版本单一来源（rfb/tests/release_contract.rs 锚点）。
+sub("Cargo.toml", r'(\[workspace\.package\]\nversion = ")[^"]*(")',
+    rf'\g<1>{version}\g<2>')
+# [workspace.dependencies] 的 crate 间版本要求（path + version 双钉）。
+sub("Cargo.toml", r'(rfb-runtime = \{ path = "rfb-runtime", version = ")[^"]*(")',
+    rf'\g<1>{version}\g<2>')
+sub("Cargo.toml", r'(rfb = \{ package = "rfb-sdk", path = "rfb", version = ")[^"]*(")',
+    rf'\g<1>{version}\g<2>')
 sub("sdk/examples/rust/Cargo.toml",
     r'rfb-sdk", version = "[^"]*"',
     f'rfb-sdk", version = "{version}"')

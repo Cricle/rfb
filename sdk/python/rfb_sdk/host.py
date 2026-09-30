@@ -507,15 +507,20 @@ class ForkdHost:
         if not any(getattr(item, "tag", None) == self.tag
                    for item in client.list_snapshots()):
             # The official forkd binary boots, pauses, stores and registers
-            # the snapshot; the rootfs is copied per tag so the asset stays
-            # pristine. --boot-wait-secs bounds the origin boot.
-            private_rootfs = os.path.join(self.run_dir,
-                                          f"{self.tag}-rootfs.ext4")
+            # the snapshot. The rootfs is copied per tag INTO THE SNAPSHOT
+            # DATA DIR (the Rust reference's copy_rootfs_private: the copy is
+            # part of the snapshot's persistent state — a run-dir copy would
+            # leave the snapshot pointing at a deleted file) so the asset
+            # stays pristine and the snapshot survives run-dir wipes.
+            # --boot-wait-secs bounds the origin boot.
+            private_rootfs = os.path.join(self.snapshot_root, self.tag,
+                                          "rootfs.ext4")
             if not os.path.exists(private_rootfs):
                 import shutil
 
+                os.makedirs(os.path.dirname(private_rootfs), exist_ok=True)
                 shutil.copy(self.rootfs, private_rootfs)
-            subprocess.run(
+            proc = subprocess.run(
                 [self.forkd_bin, "snapshot",
                  "--tag", self.tag,
                  "--kernel", self.kernel,
@@ -523,7 +528,15 @@ class ForkdHost:
                  "--tap", self.tap,
                  "--boot-wait-secs", "30",
                  "--daemon-url", self.url],
-                env=self._env(), check=True)
+                env=self._env(), capture_output=True, text=True)
+            # The forkd binary narrates its own boot/snapshot/registration;
+            # surface it so a "failed" status is never a mystery.
+            if proc.stdout:
+                print(proc.stdout.rstrip())
+            if proc.stderr:
+                print(proc.stderr.rstrip())
+            if proc.returncode != 0:
+                raise RfbError(f"forkd snapshot failed rc={proc.returncode}")
         client.wait_snapshot(self.tag)
 
     def down(self) -> None:
