@@ -1,18 +1,22 @@
 /**
  * Quickstart for the published `rfb-sdk` package (npm) — both transports,
  * one flow (the UNIFIED_API contract: identical shapes on either backend).
+ * The flow body is shared data: this file interprets
+ * sdk/shared/conformance/example-flow.json, the same file every other
+ * language's quickstart reads.
  *
  * Prerequisites:
  *   * forkd (default): a running controller (FORKD_URL / FORKD_TOKEN, default
  *     http://127.0.0.1:8889) with a ready snapshot, e.g. created with
  *     `rfb-cli forkd snapshot-create --tag rfb --tap forkd-tap0`;
  *   * zeroboot: a running ZBRT bridge (RFB_ZBRT_TCP, default
- *     127.0.0.1:15000) — start one with rfbsample's `app.py --up` or
+ *     127.0.0.1:15000) — start one with python/repl.py `--up` or
  *     `rfb-cli zeroboot up`.
  *
  * Install: `npm install rfb-sdk`
  * Run:     `node quickstart.mjs [--backend zeroboot] [rfb]`
  */
+import { readFileSync } from 'node:fs';
 import { RfbClient, RfbError, Sandbox, TRANSPORT_ZBRT } from 'rfb-sdk';
 
 const [backend, tag] = (() => {
@@ -23,17 +27,29 @@ const [backend, tag] = (() => {
   return [backend, args[0] ?? 'rfb'];
 })();
 
-/** The SAME calls on either backend — shapes never change. */
+/** The SAME calls on either backend — the scenario is shared data. */
 async function flow(sandbox) {
-  console.log('ping:', await sandbox.ping());
-  const result = await sandbox.exec(['echo', 'hello'], { cwd: '/workspace' });
-  console.log(`exec: exit=${result.exitCode} stdout=${result.stdoutText.trim()}`);
-  const written = await sandbox.write('notes.txt', 'hello from rfb-sdk');
-  console.log('written:', written, 'bytes');
-  const file = await sandbox.read('notes.txt');
-  console.log('read back', file.data.length, 'bytes');
-  const entries = await sandbox.ls('/workspace');
-  console.log('ls:', entries.map((entry) => entry.name));
+  const spec = JSON.parse(readFileSync(
+    new URL('../../shared/conformance/example-flow.json', import.meta.url),
+    'utf8'));
+  for (const op of spec.ops) {
+    if (op.op === 'ping') {
+      console.log('ping:', await sandbox.ping());
+    } else if (op.op === 'exec') {
+      const r = await sandbox.exec(op.argv, { cwd: op.cwd ?? '/workspace' });
+      console.log(`exec: exit=${r.exitCode} stdout=${r.stdoutText.trim()}`);
+    } else if (op.op === 'write') {
+      console.log('written:', await sandbox.write(op.path, op.text), 'bytes');
+    } else if (op.op === 'read') {
+      const f = await sandbox.read(op.path);
+      console.log('read back', f.data.length, 'bytes');
+    } else if (op.op === 'ls') {
+      const entries = await sandbox.ls(op.path);
+      console.log('ls:', entries.map((entry) => entry.name));
+    } else {
+      throw new Error(`unknown op ${op.op}`);
+    }
+  }
 }
 
 try {
@@ -70,3 +86,6 @@ try {
   }
   throw error;
 }
+// The controller's keep-alive socket holds the event loop open after the
+// flow — exit explicitly on success.
+process.exit(0);

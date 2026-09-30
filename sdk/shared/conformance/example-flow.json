@@ -1,0 +1,10 @@
+{
+  "comment": "The quickstart flow shared by ALL five SDK examples (sdk/examples/*) — UNIFIED_API.md §9's scenario as data. Each example interprets this file; the scenario lives here, the drift lives nowhere. cwd defaults to /workspace.",
+  "ops": [
+    { "op": "ping" },
+    { "op": "exec", "argv": ["echo", "hello"], "cwd": "/workspace" },
+    { "op": "write", "path": "notes.txt", "text": "hello from rfb-sdk" },
+    { "op": "read", "path": "notes.txt" },
+    { "op": "ls", "path": "/workspace" }
+  ]
+}

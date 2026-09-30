@@ -1,26 +1,58 @@
+//! Quickstart for the published `rfb-sdk` crate (crates.io) — both
+//! transports, one flow (the UNIFIED_API contract: identical shapes on
+//! either backend). The flow body is shared data: this file embeds
+//! sdk/shared/conformance/example-flow.json at compile time (`include_str!`),
+//! the same file every other language's quickstart reads.
+//!
+//! Prerequisites:
+//!   * forkd (default): a running controller (FORKD_URL / FORKD_TOKEN, default
+//!     http://127.0.0.1:8889) with a ready snapshot, e.g. created with
+//!     `rfb-cli forkd snapshot-create --tag rfb --tap forkd-tap0`;
+//!   * zeroboot: a running ZBRT bridge (RFB_ZBRT_TCP, default
+//!     127.0.0.1:15000) — start one with python/repl.py `--up` or
+//!     `rfb-cli zeroboot up`.
+//!
+//! Run: `cargo run -- [--backend zeroboot] [rfb]`
+
 use rfb::client::{GuestSandbox, GuestTransport, RfbClient, RfbError, SandboxInfo};
 
-/// The SAME calls on either transport — shapes never change.
+/// The SAME calls on either transport — the scenario is shared data.
 async fn flow(sandbox: &GuestSandbox) -> Result<(), RfbError> {
-    println!("ping: {}", sandbox.ping().await?);
-
-    let result = sandbox
-        .exec(&["echo", "hello"], "/workspace", 60.0, b"")
-        .await?;
-    println!(
-        "exec: exit={} stdout={}",
-        result.exit_code,
-        result.stdout_text().trim_end()
-    );
-
-    sandbox
-        .write("notes.txt", b"hello from rfb-sdk", false, None)
-        .await?;
-    let file = sandbox.read("notes.txt", None, None).await?;
-    println!("read back {} bytes", file.data.len());
-
-    for entry in sandbox.ls("/workspace").await? {
-        println!("  {}{}", entry.name, if entry.is_dir { "/" } else { "" });
+    let spec: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../shared/conformance/example-flow.json"
+    ))
+    .expect("shared conformance/example-flow.json");
+    for op in spec["ops"].as_array().expect("ops") {
+        match op["op"].as_str().expect("op") {
+            "ping" => println!("ping: {}", sandbox.ping().await?),
+            "exec" => {
+                let argv: Vec<&str> = op["argv"].as_array().expect("argv")
+                    .iter().map(|a| a.as_str().expect("str")).collect();
+                let cwd = op["cwd"].as_str().unwrap_or("/workspace");
+                let result = sandbox.exec(&argv, cwd, 60.0, b"").await?;
+                println!(
+                    "exec: exit={} stdout={}",
+                    result.exit_code, result.stdout_text().trim_end()
+                );
+            }
+            "write" => {
+                let path = op["path"].as_str().expect("path");
+                let text = op["text"].as_str().expect("text").as_bytes();
+                let written = sandbox.write(path, text, false, None).await?;
+                println!("written: {written} bytes");
+            }
+            "read" => {
+                let file = sandbox
+                    .read(op["path"].as_str().expect("path"), None, None)
+                    .await?;
+                println!("read back {} bytes", file.data.len());
+            }
+            "ls" => {
+                let entries = sandbox.ls(op["path"].as_str().expect("path")).await?;
+                println!("ls: {:?}", entries.into_iter().map(|e| e.name).collect::<Vec<_>>());
+            }
+            other => panic!("unknown op {other}"),
+        }
     }
     Ok(())
 }
@@ -42,8 +74,7 @@ async fn main() -> Result<(), RfbError> {
     if backend == "zeroboot" {
         // Direct attach: the bridge speaks ZBRT at the guest agent; no
         // controller, so nothing to create or delete — the bridge's runner
-        // owns the VM lifecycle. (Start a bridge with rfbsample's
-        // `app.py --up` or `rfb-cli zeroboot up`.)
+        // owns the VM lifecycle.
         let tcp = std::env::var("RFB_ZBRT_TCP")
             .unwrap_or_else(|_| "127.0.0.1:15000".to_owned());
         let info = SandboxInfo {

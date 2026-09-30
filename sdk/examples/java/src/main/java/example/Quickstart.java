@@ -1,5 +1,7 @@
 package example;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.rfb.sdk.DirEntry;
 import io.rfb.sdk.ExecResult;
 import io.rfb.sdk.RfbClient;
@@ -7,10 +9,18 @@ import io.rfb.sdk.Sandbox;
 import io.rfb.sdk.SandboxInfo;
 import io.rfb.sdk.Snapshot;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Quickstart for the published io.github.cricle:rfb-sdk artifact (Maven
  * Central) — both transports, one flow (the UNIFIED_API contract: identical
- * shapes on either backend).
+ * shapes on either backend). The flow body is shared data: this file
+ * interprets sdk/shared/conformance/example-flow.json, the same file every
+ * other language's quickstart reads.
  *
  * Prerequisites:
  *   forkd (default): a running controller (FORKD_URL, default
@@ -22,7 +32,7 @@ import io.rfb.sdk.Snapshot;
  *        -Dexec.mainClass=example.Quickstart -Dexec.args="--backend zeroboot"
  */
 public final class Quickstart {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         String backend = "forkd";
         String tag = "rfb";
         for (int i = 0; i < args.length; i++) {
@@ -66,23 +76,55 @@ public final class Quickstart {
         }
     }
 
-    /** The SAME calls on either backend — shapes never change. */
-    private static void flow(Sandbox sandbox) {
-        System.out.println("ping: " + sandbox.ping());
-
-        ExecResult result = sandbox.exec(
-                java.util.Arrays.asList("echo", "hello"), "/workspace", 60.0);
-        System.out.println("exec: exit=" + result.getExitCode()
-                + " stdout=" + result.stdoutText().trim());
-
-        int written = sandbox.write("notes.txt", "hello from rfb-sdk".getBytes());
-        System.out.println("written: " + written + " bytes");
-
-        System.out.println("read back " + sandbox.read("notes.txt").getData().length
-                + " bytes");
-
-        for (DirEntry entry : sandbox.ls("/workspace")) {
-            System.out.println("  " + entry.getName() + (entry.isDir() ? "/" : ""));
+    /** The SAME calls on either backend — the scenario is shared data. */
+    private static void flow(Sandbox sandbox) throws Exception {
+        JsonNode ops = new ObjectMapper()
+                .readTree(Files.readAllBytes(findSpec())).get("ops");
+        for (JsonNode op : ops) {
+            String kind = op.get("op").asText();
+            if (kind.equals("ping")) {
+                System.out.println("ping: " + sandbox.ping());
+            } else if (kind.equals("exec")) {
+                List<String> argv = new ArrayList<>();
+                op.get("argv").forEach(a -> argv.add(a.asText()));
+                String cwd = op.hasNonNull("cwd") ? op.get("cwd").asText()
+                        : "/workspace";
+                ExecResult result = sandbox.exec(argv, cwd, 60.0);
+                System.out.println("exec: exit=" + result.getExitCode()
+                        + " stdout=" + result.stdoutText().trim());
+            } else if (kind.equals("write")) {
+                System.out.println("written: " + sandbox.write(
+                        op.get("path").asText(),
+                        op.get("text").asText().getBytes()) + " bytes");
+            } else if (kind.equals("read")) {
+                System.out.println("read back "
+                        + sandbox.read(op.get("path").asText()).getData().length
+                        + " bytes");
+            } else if (kind.equals("ls")) {
+                List<String> names = new ArrayList<>();
+                for (DirEntry entry : sandbox.ls(op.get("path").asText())) {
+                    names.add(entry.getName());
+                }
+                System.out.println("ls: " + names);
+            } else {
+                throw new IllegalStateException("unknown op " + kind);
+            }
         }
+    }
+
+    /** Locate the shared spec: search upward from the working directory. */
+    private static Path findSpec() throws Exception {
+        for (Path dir = Paths.get("").toAbsolutePath();
+                dir != null; dir = dir.getParent()) {
+            for (String rel : new String[] {"shared/conformance/example-flow.json",
+                    "sdk/shared/conformance/example-flow.json"}) {
+                Path candidate = dir.resolve(rel);
+                if (Files.exists(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+        throw new IllegalStateException("example-flow.json not found above "
+                + Paths.get("").toAbsolutePath());
     }
 }

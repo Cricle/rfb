@@ -1,12 +1,15 @@
 """Quickstart for the published `rfb-sdk` package (PyPI) — both transports,
 one flow (the UNIFIED_API contract: identical shapes on either backend).
+The flow body is shared data: flow_common.py interprets
+sdk/shared/conformance/example-flow.json, the same file every other
+language's quickstart reads.
 
 Prerequisites:
   * forkd (default): a running controller (FORKD_URL / FORKD_TOKEN, default
     http://127.0.0.1:8889) with a ready snapshot, e.g.
     `rfb-cli forkd snapshot-create --tag rfb --tap forkd-tap0`;
   * zeroboot: a running ZBRT bridge (RFB_ZBRT_TCP, default
-    127.0.0.1:15000) — start one with rfbsample's `app.py --up` or
+    127.0.0.1:15000) — start one with `python repl.py --up` or
     `rfb-cli zeroboot up`.
 
 Install: `pip install rfb-sdk`
@@ -19,17 +22,7 @@ import sys
 
 from rfb_sdk import RfbClient, RfbError, Sandbox, SandboxInfo
 
-
-def flow(sandbox: Sandbox) -> None:
-    """The SAME calls on either backend — shapes never change."""
-    print("ping:", sandbox.ping())
-    result = sandbox.exec(["echo", "hello"], cwd="/workspace")
-    print("exec: exit=%d stdout=%s" % (result.exit_code, result.stdout_text.strip()))
-    written = sandbox.write("notes.txt", b"hello from rfb-sdk")
-    print("written:", written, "bytes")
-    file = sandbox.read("notes.txt")
-    print("read back", len(file.data), "bytes")
-    print("ls:", [entry.name for entry in sandbox.ls("/workspace")])
+from flow_common import run as flow
 
 
 def forkd_flow(tag: str) -> None:

@@ -1,15 +1,13 @@
 # rfb-sdk Node.js quickstart
 
-Uses the **published** `rfb-sdk` package from npm (no path/workspace references).
+Uses the **published** `rfb-sdk` package from npm (no path/workspace
+references). Run matrix, backends and the shared flow spec:
+see [../README.md](../README.md).
 
 ```bash
 npm install rfb-sdk
-node quickstart.mjs rfb     # tag of a ready+bootable snapshot
+node quickstart.mjs [--backend forkd|zeroboot] rfb
 ```
 
-Prerequisites: a running forkd controller (`FORKD_URL`, default
-`http://127.0.0.1:8889`) and a snapshot created with
-`rfb-cli forkd snapshot-create --tag rfb --tap forkd-tap0`.
-
-The example walks the unified scenario: wait for the snapshot, create one
-sandbox, ping, exec, write/read a file, list the workspace, delete.
+The flow body is interpreted from `sdk/shared/conformance/example-flow.json`
+— the same data file every other language's quickstart reads.

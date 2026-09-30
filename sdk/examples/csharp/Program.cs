@@ -1,5 +1,8 @@
 // Quickstart for the published Rfb.Sdk package (NuGet) — both transports,
 // one flow (the UNIFIED_API contract: identical shapes on either backend).
+// The flow body is shared data: this file interprets
+// sdk/shared/conformance/example-flow.json, the same file every other
+// language's quickstart reads.
 //
 // Prerequisites:
 //   forkd (default): a running controller (FORKD_URL, default
@@ -11,6 +14,8 @@
 //
 // Run: dotnet run -- [--backend zeroboot] [rfb]
 
+using System.Text;
+using System.Text.Json;
 using Rfb.Sdk;
 
 var backend = "forkd";
@@ -62,19 +67,62 @@ else
 
 async Task Flow(Sandbox sandbox)
 {
-    Console.WriteLine($"ping: {await sandbox.Ping()}");
-
-    var result = await sandbox.Exec(["echo", "hello"], "/workspace");
-    Console.WriteLine($"exec: exit={result.ExitCode} stdout={result.StdoutText.TrimEnd()}");
-
-    var written = await sandbox.Write("notes.txt", "hello from rfb-sdk"u8.ToArray());
-    Console.WriteLine($"written: {written} bytes");
-
-    var file = await sandbox.Read("notes.txt");
-    Console.WriteLine($"read back {file.Data.Length} bytes");
-
-    foreach (var entry in await sandbox.Ls("/workspace"))
+    var spec = JsonDocument.Parse(File.ReadAllText(FindSpec())).RootElement;
+    foreach (var op in spec.GetProperty("ops").EnumerateArray())
     {
-        Console.WriteLine($"  {entry.Name}{(entry.IsDir ? "/" : "")}");
+        switch (op.GetProperty("op").GetString())
+        {
+            case "ping":
+                Console.WriteLine($"ping: {await sandbox.Ping()}");
+                break;
+            case "exec":
+            {
+                var argv = op.GetProperty("argv").EnumerateArray()
+                    .Select(a => a.GetString()!).ToArray();
+                var cwd = op.TryGetProperty("cwd", out var c) ? c.GetString()! : "/workspace";
+                var result = await sandbox.Exec(argv, cwd);
+                Console.WriteLine($"exec: exit={result.ExitCode} stdout={result.StdoutText.TrimEnd()}");
+                break;
+            }
+            case "write":
+            {
+                var written = await sandbox.Write(
+                    op.GetProperty("path").GetString()!,
+                    Encoding.UTF8.GetBytes(op.GetProperty("text").GetString()!));
+                Console.WriteLine($"written: {written} bytes");
+                break;
+            }
+            case "read":
+            {
+                var file = await sandbox.Read(op.GetProperty("path").GetString()!);
+                Console.WriteLine($"read back {file.Data.Length} bytes");
+                break;
+            }
+            case "ls":
+            {
+                var names = (await sandbox.Ls(op.GetProperty("path").GetString()!))
+                    .Select(e => e.Name).ToList();
+                Console.WriteLine($"ls: [{string.Join(", ", names)}]");
+                break;
+            }
+            default:
+                throw new InvalidOperationException($"unknown op {op.GetProperty("op").GetString()}");
+        }
     }
+}
+
+// Locate the shared spec: search upward from the working directory.
+static string FindSpec()
+{
+    for (var dir = new DirectoryInfo(Environment.CurrentDirectory); dir != null; dir = dir.Parent)
+    {
+        foreach (var rel in new[] { "shared/conformance/example-flow.json",
+                     "sdk/shared/conformance/example-flow.json" })
+        {
+            var p = Path.Combine(dir.FullName, rel);
+            if (File.Exists(p)) return p;
+        }
+    }
+    throw new FileNotFoundException("example-flow.json not found above "
+        + Environment.CurrentDirectory);
 }

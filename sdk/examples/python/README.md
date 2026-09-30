@@ -1,15 +1,23 @@
 # rfb-sdk Python quickstart
 
-Uses the **published** `rfb-sdk` package from PyPI (no path/workspace references).
+Uses the **published** `rfb-sdk` package from PyPI (no path/workspace
+references). Run matrix, backends and the shared flow spec:
+see [../README.md](../README.md).
 
 ```bash
 pip install rfb-sdk
-python quickstart.py rfb     # tag of a ready+bootable snapshot
+python quickstart.py [--backend forkd|zeroboot] rfb
 ```
 
-Prerequisites: a running forkd controller (`FORKD_URL`, default
-`http://127.0.0.1:8889`) and a snapshot created with
-`rfb-cli forkd snapshot-create --tag rfb --tap forkd-tap0`.
+Python-only extras in this directory:
 
-The example walks the unified scenario: wait for the snapshot, create one
-sandbox, ping, exec, write/read a file, list the workspace, delete.
+- `flow_common.py` — the shared scenario interpreter: it consumes
+  `sdk/shared/conformance/example-flow.json`, the same data file every other
+  language's quickstart reads, and is reused by both quickstarts below;
+- `host_quickstart.py` — boots the backend itself via `rfb_sdk.host`
+  (KVM + root, no controller/TAP/CLI): `sudo python3 host_quickstart.py`;
+- `repl.py` — the interactive sandbox demo (dual backend,
+  self-bootstrapping): `sudo python3 repl.py --up`; assets come from
+  `bash setup-demo-assets.sh` (not in git);
+- `test_repl.py` — unit tests for the demo and the shared interpreter
+  (no VM needed).
