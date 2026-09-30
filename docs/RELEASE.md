@@ -8,7 +8,7 @@
 | 工作流 | 触发 | 内容 |
 |---|---|---|
 | `ci.yml` | 全部 PR + **所有分支推送（含 main）**（+手动） | Rust 门禁（fmt/clippy/test/doc，`--all-features`，clippy/test/doc 均带 `--locked`；含边界检查、feature 矩阵）+ SDK 全量验证（debian:12 容器内 Python / C# / Java / Node.js 四套件 build+tests） |
-| `e2e.yml` | push main（+手动） | KVM 真机 E2E：构建 rfb-cli 与 forkd-agent rootfs → 起真实 forkd-controller → 建快照 → 跑全部 `#[ignore]` 真机测试（串行） |
+| `ci.yml` 的 `e2e` job | push main（+手动；PR 不跑） | KVM 真机 E2E（原独立 `e2e.yml`，2026-09-30 合并进 ci.yml——同一 checkout/缓存/并发取消）：构建 rfb-cli 与 forkd-agent rootfs → 起真实 forkd-controller → 建快照 → 跑全部 `#[ignore]` 真机测试（串行） |
 | `release.yml` | push `v*.*.*` tag | 五渠道发布 + GitHub Release（见下） |
 
 所有 workflow 的失败现场都通过 `::error::`/`::warning::` 注解带出
@@ -16,7 +16,7 @@
 
 ### 1.1 门禁变化（2026-09 本轮）
 
-- **main 推送同时跑 `ci.yml` 与 `e2e.yml`**（原约定 main 推送只跑 e2e.yml）：
+- **main 推送跑 `ci.yml` 全部 job（含真机 e2e）**：
   Rust 门禁不再只在 PR/非 main 分支上执行。
 - **`--locked` 全覆盖**：ci.yml 的 clippy/test/doc 与 msrv check、release.sh 的
   clippy/test/doc 门禁都带 `--locked`（fmt 除外），锁定 Cargo.lock 逐字节一致。
@@ -35,7 +35,7 @@
 - **NuGet push 不再把 API key 放进 argv**：改为生成临时 NuGet.Config（0600，
   凭据写 `%NUGET_KEY%` 占位由 NuGet 从环境变量展开，密钥不落盘），经
   `--configfile` 传入，run 结束（含失败路径）删除。
-- **内核 pin**：e2e.yml 下载的 `vmlinux-5.10.225` 下载后即用固化的 sha256
+- **内核 pin**：e2e（ci.yml）下载的 `vmlinux-5.10.225` 下载后即用固化的 sha256
   校验（`23b3047df7dada3500d06c8012cc030b921da01e213735f7717d2166cfcf5f06`）。
 - **边界脚本增强**：`scripts/check-boundary.sh` 新增依赖方向断言
   （rfb-sdk ↛ rfb-rig/rfb-ben、rfb-runtime ↛ rfb-sdk/rfb-rig、rfb-rig →

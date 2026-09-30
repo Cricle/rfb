@@ -1,7 +1,7 @@
 # RFB
 
 [![Release](https://github.com/Cricle/rfb/actions/workflows/release.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/release.yml)
-[![Real-VM E2E](https://github.com/Cricle/rfb/actions/workflows/e2e.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/e2e.yml)
+[![Real-VM E2E](https://github.com/Cricle/rfb/actions/workflows/ci.yml/badge.svg)](https://github.com/Cricle/rfb/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/rfb-sdk)](https://crates.io/crates/rfb-sdk)
 [![PyPI](https://img.shields.io/pypi/v/rfb-sdk)](https://pypi.org/project/rfb-sdk/)
 [![NuGet](https://img.shields.io/nuget/v/Rfb.Sdk)](https://www.nuget.org/packages/Rfb.Sdk/)
