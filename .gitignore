@@ -507,6 +507,7 @@ sdk/csharp/Rfb.Cli/tools/
 resx/snapshots/
 # the standalone quickstart crate has its own workspace root
 sdk/examples/rust/target/
-
-# the standalone java quickstart builds into its own target/
+# example build/demo artifacts (local only)
+sdk/examples/python/assets/
+sdk/examples/csharp/local-nuget/
 sdk/examples/java/target/
