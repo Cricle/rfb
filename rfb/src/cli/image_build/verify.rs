@@ -183,13 +183,16 @@ pub fn build_static_runtime(
         if std::env::var_os(format!("CARGO_TARGET_{upper}_LINKER")).is_none() {
             cmd.env(format!("CARGO_TARGET_{upper}_LINKER"), "musl-gcc");
         }
-        // crt-static 是 musl target 的默认，但不再依赖默认值：rust:1-bookworm
-        // 容器（2026-09-30 CI）里同一条命令产出过带 INTERP 的动态二进制、
-        // 被下方静态门拒收。已有 RUSTFLAGS 追加而非覆盖。
+        // 静态不再依赖工具链默认值（rust:1-bookworm 容器，2026-09-30 CI：
+        // crt-static 默认应为 on，musl 产物却带 INTERP 被静态门拒收；本地与
+        // VM runner 同命令皆静态）。双保险：+crt-static（rustc 走自包含
+        // crt/静态语义）+ `-static` 传给链接器（musl-gcc 的 spec 按它选
+        // rcrt1.o/libc.a；即便误用 glibc cc 也会被强制静态——真静态链接
+        // 失败会大声报错，而不是悄悄产出动态二进制）。已有 RUSTFLAGS 追加。
         let existing = std::env::var("RUSTFLAGS").unwrap_or_default();
         cmd.env(
             "RUSTFLAGS",
-            format!("{existing} -C target-feature=+crt-static").trim(),
+            format!("{existing} -C target-feature=+crt-static -C link-arg=-static").trim(),
         );
     }
     let status = cmd
