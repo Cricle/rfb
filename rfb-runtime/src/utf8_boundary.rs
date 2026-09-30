@@ -11,14 +11,15 @@
 //! bytes still degrade to lossy replacements instead of stalling the stream.
 
 /// Maximum bytes a single UTF-8 sequence can occupy.
-const MAX_SEQUENCE: usize = 4;
+#[doc(hidden)]
+pub const MAX_SEQUENCE: usize = 4;
 
 /// Boundary-aware incremental decoder for one output stream.
 #[derive(Debug, Default)]
 pub struct Utf8ChunkDecoder {
     /// Withheld tail of the previous chunk: a (possibly) incomplete multi-byte
     /// sequence. Always shorter than [`MAX_SEQUENCE`].
-    pending: Vec<u8>,
+    pub pending: Vec<u8>,
 }
 
 impl Utf8ChunkDecoder {
@@ -83,63 +84,4 @@ fn utf8_safe_split(bytes: &[u8]) -> usize {
     // Only continuation bytes in the inspected window (or none at all): the
     // tail is not a valid sequence start, so emit everything.
     bytes.len()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn feed(decoder: &mut Utf8ChunkDecoder, chunks: &[&[u8]]) -> String {
-        chunks
-            .iter()
-            .map(|chunk| decoder.decode(chunk))
-            .collect::<String>()
-            + &decoder.flush()
-    }
-
-    #[test]
-    fn multibyte_split_across_chunks_is_not_corrupted() {
-        // "你" = E4 BD A0, "😀" = F0 9F 98 80 — split every which way.
-        for cut in 1.."你😀".len() {
-            let whole = "你😀".as_bytes();
-            let mut decoder = Utf8ChunkDecoder::new();
-            assert_eq!(feed(&mut decoder, &[&whole[..cut], &whole[cut..]]), "你😀");
-        }
-    }
-
-    #[test]
-    fn ascii_stream_is_unchanged() {
-        let mut decoder = Utf8ChunkDecoder::new();
-        assert_eq!(
-            feed(&mut decoder, &[b"hel", b"lo ", b"world"]),
-            "hello world"
-        );
-    }
-
-    #[test]
-    fn invalid_bytes_still_degrade_to_lossy() {
-        let mut decoder = Utf8ChunkDecoder::new();
-        // Lone continuation byte: cannot start a sequence, must not buffer.
-        assert_eq!(feed(&mut decoder, &[&[0x80], &[0x41]]), "\u{FFFD}A");
-        // Overlong lead byte (0xC0/0xC1): rejected, not withheld.
-        let mut decoder = Utf8ChunkDecoder::new();
-        assert_eq!(feed(&mut decoder, &[&[0xC1, 0x80]]), "\u{FFFD}\u{FFFD}");
-    }
-
-    #[test]
-    fn truncated_sequence_at_eof_flushes_lossily() {
-        let mut decoder = Utf8ChunkDecoder::new();
-        assert_eq!(decoder.decode(&[0xE4, 0xBD]), "");
-        assert_eq!(decoder.flush(), "\u{FFFD}");
-    }
-
-    #[test]
-    fn withheld_tail_never_exceeds_three_bytes() {
-        // A flood of lone continuation bytes must not accumulate.
-        let mut decoder = Utf8ChunkDecoder::new();
-        for _ in 0..1000 {
-            decoder.decode(&[0x80]);
-        }
-        assert!(decoder.pending.len() < MAX_SEQUENCE);
-    }
 }

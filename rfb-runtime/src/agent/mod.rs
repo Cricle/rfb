@@ -8,6 +8,14 @@ mod stream;
 mod transport;
 
 use process_exec::execute;
+
+/// Test-support visibility for the exec-deadline contract test
+/// (`tests/exec_deadline.rs`); hidden from docs, not part of the API.
+/// The agent_contract test crate path-includes this module and uses
+/// neither name — hence the allow.
+#[doc(hidden)]
+#[allow(unused_imports)]
+pub use process_exec::{effective_exec_timeout, DEFAULT_EXEC_TIMEOUT};
 use search::structured;
 use serde_json::{json, Value};
 use std::io;

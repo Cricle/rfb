@@ -94,9 +94,13 @@ pub async fn workload(
                     "read mismatch",
                 )?;
 
+                // find 语义是 glob 全名匹配（PROTOCOL.md §2.5a）：无通配符的
+                // 模式是精确名匹配——写 `*.csv` 才命中刚写入的 orders-*.csv
+                //（`.csv` 字面量只匹配名为 ".csv" 的文件，曾让真机 E2E 的
+                // workload 门整体失败）。
                 let find = guest_call(
                     &address,
-                    json!({"action": "find", "path": "/workspace", "pattern": ".csv", "max_results": 100}),
+                    json!({"action": "find", "path": "/workspace", "pattern": "*.csv", "max_results": 100}),
                     false,
                 )
                 .await;

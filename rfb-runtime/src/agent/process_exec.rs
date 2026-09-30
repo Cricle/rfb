@@ -82,14 +82,14 @@ const MAX_EXEC_STREAM_BYTES: usize = 128 * 1024;
 /// base timeout, SDKs 10–60 s): an abandoned command is reaped around the
 /// moment its client would have given up anyway. Clients that need longer
 /// pass an explicit `timeout`, which always wins.
-const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve the effective exec deadline for one request: an explicit `timeout`
 /// always wins; a request without one (or with a non-numeric one, which the
 /// historical contract ignored) gets [`DEFAULT_EXEC_TIMEOUT`] instead of
 /// waiting forever. An explicit 0 keeps its existing contract — expires
 /// immediately and is reported as `timed_out`.
-fn effective_exec_timeout(request: &Value) -> Duration {
+pub fn effective_exec_timeout(request: &Value) -> Duration {
     request
         .get("timeout")
         .and_then(Value::as_u64)
@@ -232,51 +232,4 @@ pub async fn terminate_id(pid: Option<u32>) {
 pub async fn terminate(child: &mut Child) {
     terminate_id(child.id()).await;
     let _ = child.kill().await;
-}
-
-#[cfg(test)]
-mod exec_deadline_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn missing_timeout_gets_the_default_deadline() {
-        let request = json!({"action":"exec","args":["/bin/true"],"cwd":"."});
-        assert_eq!(
-            effective_exec_timeout(&request),
-            DEFAULT_EXEC_TIMEOUT,
-            "a request without `timeout` must never wait forever"
-        );
-    }
-
-    #[test]
-    fn explicit_timeout_wins_over_the_default() {
-        let request = json!({"action":"exec","args":["/bin/sleep","5"],"timeout":2});
-        assert_eq!(effective_exec_timeout(&request), Duration::from_secs(2));
-    }
-
-    #[test]
-    fn explicit_zero_keeps_immediate_expiry_contract() {
-        let request = json!({"action":"exec","args":["/bin/true"],"timeout":0});
-        assert_eq!(effective_exec_timeout(&request), Duration::ZERO);
-    }
-
-    #[test]
-    fn non_numeric_timeout_falls_back_to_the_default() {
-        // A non-numeric `timeout` was historically ignored (wait forever);
-        // ignoring it now must fall back to the default deadline, not remove
-        // the bound.
-        let request = json!({"action":"exec","args":["/bin/true"],"timeout":"soon"});
-        assert_eq!(effective_exec_timeout(&request), DEFAULT_EXEC_TIMEOUT);
-    }
-
-    #[test]
-    fn default_deadline_is_client_patience_scale() {
-        // The default exists so an abandoned exec is reaped around the moment
-        // its client's read timeout would have fired (host clients read with a
-        // 10 s base timeout, SDKs 10-60 s). It must stay on that scale — not
-        // the executor's 1800 s max runtime, and not an unbounded wait.
-        assert!(DEFAULT_EXEC_TIMEOUT >= Duration::from_secs(10));
-        assert!(DEFAULT_EXEC_TIMEOUT <= Duration::from_secs(60));
-    }
 }

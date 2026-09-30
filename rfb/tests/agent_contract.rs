@@ -1,19 +1,27 @@
+//! Agent-token contract tests: the REAL Rust guest client
+//! (`rfb::forkd_guest::ForkdGuestClient`) drives the in-process agent
+//! (sources included via `#[path]`). Lives in `rfb/tests/` because the
+//! client side is the SDK crate — a dev-dependency in the other direction
+//! would violate the runtime-must-not-depend-on-sdk boundary
+//! (scripts/check-boundary.sh).
+#![cfg(feature = "forkd")]
+
 #[allow(dead_code)]
-#[path = "../src/agent/mod.rs"]
+#[path = "../../rfb-runtime/src/agent/mod.rs"]
 mod agent;
 // agent/builtin.rs re-exports `crate::builtin`; include the same source under
 // the same path so that import resolves inside this test crate too.
 #[allow(dead_code)]
-#[path = "../src/builtin.rs"]
+#[path = "../../rfb-runtime/src/builtin.rs"]
 mod builtin;
 // agent/search.rs resolves find patterns via `crate::glob`; include the same
 // source under the same path so that import resolves inside this test crate.
 #[allow(dead_code)]
-#[path = "../src/glob.rs"]
+#[path = "../../rfb-runtime/src/glob.rs"]
 mod glob;
 // agent/stream.rs decodes live output chunks via `crate::utf8_boundary`.
 #[allow(dead_code)]
-#[path = "../src/utf8_boundary.rs"]
+#[path = "../../rfb-runtime/src/utf8_boundary.rs"]
 mod utf8_boundary;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -73,8 +81,10 @@ async fn request(stream: &mut TcpStream, value: Value) -> Value {
 
 #[test]
 fn forkd_agent_entrypoint_is_explicit_and_vsock_remains_default() {
-    let main =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")).unwrap();
+    let main = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../rfb-runtime/src/main.rs"),
+    )
+    .unwrap();
     assert!(main.contains("Some(\"forkd-agent\")"));
     assert!(main.contains("forkd-init.sh"));
     assert!(main.contains("RFB_RUNTIME_MODE"));

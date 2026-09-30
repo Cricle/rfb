@@ -175,17 +175,18 @@ const ORPHAN_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(18
 /// place: the next peek would return the same young zombie forever, with no
 /// way to advance past it to older ones.
 #[cfg(target_os = "linux")]
-struct OrphanReaper {
+#[doc(hidden)]
+pub struct OrphanReaper {
     /// Parent pid whose zombie children are reaped (1 in production).
     parent: i32,
     /// First-seen time per zombie pid, so grace is measured from the first
     /// observation rather than trusting /proc ordering.
-    seen: std::collections::HashMap<i32, std::time::Instant>,
+    pub seen: std::collections::HashMap<i32, std::time::Instant>,
 }
 
 #[cfg(target_os = "linux")]
 impl OrphanReaper {
-    fn new(parent: i32) -> Self {
+    pub fn new(parent: i32) -> Self {
         Self {
             parent,
             seen: std::collections::HashMap::new(),
@@ -193,7 +194,7 @@ impl OrphanReaper {
     }
 
     /// One scan cycle: reap zombies older than `grace`, return their pids.
-    fn scan(&mut self, grace: std::time::Duration) -> Vec<i32> {
+    pub fn scan(&mut self, grace: std::time::Duration) -> Vec<i32> {
         let zombies = zombie_children_of(self.parent);
         let mut reaped = Vec::new();
         for pid in zombies.iter().copied() {
@@ -252,7 +253,8 @@ fn spawn_orphan_reaper() {
 /// line starts after the LAST `)`: the comm field may contain spaces and
 /// parentheses, and the fields that follow are state then ppid (proc(5)).
 #[cfg(target_os = "linux")]
-fn zombie_children_of(parent: i32) -> Vec<i32> {
+#[doc(hidden)]
+pub fn zombie_children_of(parent: i32) -> Vec<i32> {
     let mut zombies = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return zombies;
@@ -288,105 +290,4 @@ fn zombie_children_of(parent: i32) -> Vec<i32> {
 #[cfg(not(target_os = "linux"))]
 pub fn init_pid1_with_console(_attach_console: bool) -> std::io::Result<()> {
     Ok(())
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod orphan_reaper_tests {
-    use super::*;
-    use std::time::Duration;
-
-    /// The reaper scans every zombie of the whole test process, so parallel
-    /// test threads would reap each other's fixtures. Serialize the tests
-    /// instead (cargo runs tests in parallel by default).
-    static REAPER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        // A panicking predecessor poisons the lock; the tests are equivalent,
-        // so carry on regardless.
-        REAPER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// Spawn a child that exits immediately and drop the handle without
-    /// waiting: std's `Child` does not reap on drop, so it becomes a zombie
-    /// of this test process. The reaper's parent is a parameter (1 in
-    /// production) precisely so tests can point it at their own process.
-    fn spawn_unreaped_child() -> i32 {
-        let child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn /bin/true");
-        let pid = child.id() as i32;
-        drop(child);
-        pid
-    }
-
-    /// Block until the child shows up as a zombie (spawning and exiting race
-    /// the first scan otherwise).
-    fn wait_until_zombie(pid: i32) {
-        let parent = std::process::id() as i32;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if zombie_children_of(parent).contains(&pid) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("pid {pid} never became a zombie");
-    }
-
-    /// Clean up a zombie the test decided not to let the reaper reap.
-    fn wait_child(pid: i32) {
-        // SAFETY: direct waitpid on the test's own child pid.
-        unsafe {
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
-    }
-
-    #[test]
-    fn young_zombies_are_never_stolen_from_their_waiter() {
-        let _guard = lock();
-        let pid = spawn_unreaped_child();
-        wait_until_zombie(pid);
-        let mut reaper = OrphanReaper::new(std::process::id() as i32);
-        // Repeated scans with a grace the zombie has not reached must age it
-        // without reaping: its legitimate waiter (executor `try_wait`) may
-        // still be coming.
-        assert!(reaper.scan(Duration::from_secs(3600)).is_empty());
-        assert!(reaper.scan(Duration::from_secs(3600)).is_empty());
-        wait_child(pid);
-    }
-
-    #[test]
-    fn aged_orphans_are_reaped_exactly_once() {
-        let _guard = lock();
-        let pid = spawn_unreaped_child();
-        wait_until_zombie(pid);
-        let mut reaper = OrphanReaper::new(std::process::id() as i32);
-        // First sight only starts the aging (never reaps on the same scan).
-        assert!(reaper.scan(Duration::ZERO).is_empty());
-        assert_eq!(
-            reaper.scan(Duration::ZERO),
-            vec![pid],
-            "an orphan past its grace must be reaped and reported"
-        );
-        // Reaped for good: no double report, no stale bookkeeping.
-        assert!(reaper.scan(Duration::ZERO).is_empty());
-    }
-
-    #[test]
-    fn zombies_reaped_by_their_owner_are_forgotten() {
-        let _guard = lock();
-        let pid = spawn_unreaped_child();
-        wait_until_zombie(pid);
-        let mut reaper = OrphanReaper::new(std::process::id() as i32);
-        assert!(reaper.scan(Duration::from_secs(3600)).is_empty());
-        // The legitimate owner reaps it out from under the reaper.
-        wait_child(pid);
-        // The reaper must drop the stale entry instead of aging a pid that no
-        // longer is a zombie (a later scan reports nothing and the map
-        // shrinks back).
-        assert!(reaper.scan(Duration::ZERO).is_empty());
-        assert!(reaper.seen.is_empty());
-    }
 }

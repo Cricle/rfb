@@ -53,8 +53,16 @@ name = "rfb-cli"
 path = "src/bin/rfb-cli.rs"
 required-features = ["cli"]
 
+# glob.rs (and other shared sources) are path-included into the
+# agent_contract test crate; their `cfg(feature = "guest")` gates evaluate
+# against THIS package's feature set, which has no `guest` value.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("guest"))'] }
+
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time"] }
+# agent_contract includes rfb-runtime agent sources: they need
+# process/sync/io-std beyond the plain client-test set.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time", "process", "sync", "io-std"] }
 futures-lite = "2"
 tempfile = "3"
 libc = "0.2"

@@ -46,7 +46,9 @@ pub fn glob_matches(pattern: &str, text: &str) -> bool {
 /// `skip_symlinks` is the workspace executor's cycle guard; the agent walk
 /// matches symlink names like any other entry and does not follow them
 /// (`file_type().is_dir()` is false for symlinks).
-#[cfg(feature = "guest")] // both callers (agent search, workspace executor) need guest
+// agent search lives behind forkd (which implies guest in this crate); the
+// moved agent_contract test crate only has rfb's forkd, hence the `any`.
+#[cfg(any(feature = "guest", feature = "forkd"))]
 pub(crate) fn bounded_name_walk(
     root: &std::path::Path,
     dir: &std::path::Path,

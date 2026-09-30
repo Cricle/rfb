@@ -2493,7 +2493,6 @@ dependencies = [
  "libc",
  "mlua",
  "postcard",
- "rfb-sdk",
  "rustpython-pylib",
  "rustpython-stdlib",
  "rustpython-vm",

@@ -34,11 +34,13 @@ const ACCEPT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_mill
 /// failures means the listener is broken in a way retrying cannot fix, and an
 /// unbounded retry loop would instead spin (and flood stderr) forever.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const ACCEPT_FAILURE_LIMIT: u32 = 100;
+#[doc(hidden)]
+pub const ACCEPT_FAILURE_LIMIT: u32 = 100;
 
 /// What the accept loop does with one failed accept.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-enum AcceptFailure {
+#[doc(hidden)]
+pub enum AcceptFailure {
     /// Transient (probe reset, interrupted syscall, ...): back off and retry.
     Retry,
     /// Unrecoverable: give up and surface the error to the caller.
@@ -54,7 +56,8 @@ enum AcceptFailure {
 /// listener that fails unboundedly would otherwise spin (and flood stderr)
 /// forever while the pid-1 guest looks alive but accepts nothing.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn accept_failure_action(error: &io::Error, consecutive_failures: u32) -> AcceptFailure {
+#[doc(hidden)]
+pub fn accept_failure_action(error: &io::Error, consecutive_failures: u32) -> AcceptFailure {
     if matches!(
         error.kind(),
         io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
@@ -136,57 +139,4 @@ pub async fn run(_limits: RuntimeLimits) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "zeroboot guest requires Linux vsock support",
     ))
-}
-
-#[cfg(test)]
-mod accept_failure_tests {
-    use super::*;
-
-    fn error(kind: io::ErrorKind) -> io::Error {
-        io::Error::new(kind, "probe")
-    }
-
-    #[test]
-    fn transient_accept_errors_retry_with_backoff() {
-        for kind in [
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::Other,
-        ] {
-            assert!(
-                matches!(accept_failure_action(&error(kind), 1), AcceptFailure::Retry),
-                "{kind:?} must be retried"
-            );
-        }
-    }
-
-    #[test]
-    fn config_class_accept_errors_give_up_immediately() {
-        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::Unsupported] {
-            assert!(
-                matches!(
-                    accept_failure_action(&error(kind), 0),
-                    AcceptFailure::GiveUp
-                ),
-                "{kind:?} is never recoverable by retrying"
-            );
-        }
-    }
-
-    #[test]
-    fn persistent_failure_streak_gives_up_at_the_limit() {
-        // Just under the limit the loop still retries...
-        assert!(matches!(
-            accept_failure_action(&error(io::ErrorKind::Other), ACCEPT_FAILURE_LIMIT - 1),
-            AcceptFailure::Retry
-        ));
-        // ...and exactly at the limit it gives up (no off-by-one: the count
-        // includes the failure being classified).
-        assert!(matches!(
-            accept_failure_action(&error(io::ErrorKind::Other), ACCEPT_FAILURE_LIMIT),
-            AcceptFailure::GiveUp
-        ));
-    }
 }
