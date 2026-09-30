@@ -5,6 +5,12 @@ wait_snapshot → create → ping → exec → write/read/ls → delete（forkd�
 且都支持 `--backend forkd|zeroboot` 自由切换（zeroboot = 直连已运行的
 ZBRT 桥，`RFB_ZBRT_TCP`，默认 `127.0.0.1:15000`——桥的拉起见下）。
 
+**场景是数据，不是代码**：flow 体抽在
+[`../shared/conformance/example-flow.json`](../shared/conformance/example-flow.json)
+一份里，五个 quickstart 都是它的解释器（rust 用 `include_str!` 编译期内嵌，
+java 用 SDK 传递依赖的 jackson，python 把解释器共享给两个 quickstart）——
+场景改动只改一处，五语言不可能漂移。
+
 | 语言 | 示例 | 前置 | 运行 |
 |---|---|---|---|
 | Python | `python/quickstart.py` | pip install rfb-sdk；forkd 栈或 ZBRT 桥 | `python3 quickstart.py --backend forkd sample` |
