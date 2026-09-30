@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rfb-sdk"
-version = "0.0.2"
+version = "0.0.3"
 description = "RFB unified SDK (Python): RfbClient facade over forkd controller, forkd guest and ZBRT v1"
 readme = "README.md"
 requires-python = ">=3.9"
