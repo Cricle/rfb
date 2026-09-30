@@ -42,6 +42,10 @@ jobs:
       # 冷启动全特性编译（rustpython/mlua）约 8-12 分钟；rust-cache 复用
       # registry 与 target，key 跟随 Cargo.lock。容器内 HOME/CARGO_HOME 固定
       # （/root、/usr/local/cargo），action 自动识别。
+      # 容器 root uid 与仓库属主不一致时 git 拒绝工作树（dubious
+      # ownership）——任何在测试里 shell 出去调 git 的用例都会炸。
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       # all-features 会启用 rustpython（libffi-sys）等系统链接依赖；容器是
       # 纯 root，无需 sudo。官方镜像带 clippy/rustfmt 组件，这里幂等补一次

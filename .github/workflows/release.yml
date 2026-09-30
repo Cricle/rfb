@@ -58,6 +58,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      # 容器 job 里步骤以 root 跑；checkout 产生的仓库属主与执行 uid 不一致
+      # 时 git 全线拒绝（dubious ownership）——release.sh 的
+      # `git describe --tags --exact-match` 被 2>/dev/null 吞成空 tag，
+      # 发布门误报"需要精确 tag"。VM runner 上 uid 一致所以从未暴露。
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Validate tag matches workspace and all SDK manifest versions
         env:
