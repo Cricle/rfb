@@ -506,7 +506,11 @@ export class Sandbox {
   }
 }
 
-const FS_ACTIONS: readonly string[] = ['ls', 'find', 'grep', 'read', 'write'];
+// The fs op codes are 1-based (ZBRT FS_OP_*: 1=ls 2=find 3=grep 4=read
+// 5=write) — slot 0 stays unused or every NDJSON fs request lands on the
+// WRONG action (ls silently became find, whose missing pattern is
+// rejected by the agent as 'pattern must be a string').
+const FS_ACTIONS: readonly (string | null)[] = [null, 'ls', 'find', 'grep', 'read', 'write'];
 
 /** NDJSON interactive stream: started → stdout/stderr → exit (PROTOCOL.md §2.5). */
 class NdjsonGuestStream implements GuestStream {

@@ -4,12 +4,14 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
+    <!-- examples run on whatever the machine has (9/10 roll forward) -->
+    <RollForward>LatestMajor</RollForward>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Rfb.Sdk" Version="0.0.1" />
+    <PackageReference Include="Rfb.Sdk" Version="0.0.2" />
   </ItemGroup>
 
 </Project>

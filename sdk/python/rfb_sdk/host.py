@@ -501,7 +501,11 @@ class ForkdHost:
                 client.delete_sandbox(getattr(stale, "id", stale))
             except Exception:
                 pass
-        if client.snapshot(self.tag) is None:
+        # Existence check goes through the LIST endpoint (the Rust reference's
+        # snapshot_ready semantics): the per-tag detail route is optional and
+        # older controllers 405 it.
+        if not any(getattr(item, "tag", None) == self.tag
+                   for item in client.list_snapshots()):
             # The official forkd binary boots, pauses, stores and registers
             # the snapshot; the rootfs is copied per tag so the asset stays
             # pristine. --boot-wait-secs bounds the origin boot.

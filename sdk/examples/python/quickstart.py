@@ -27,7 +27,18 @@ def main() -> int:
 
     sandbox = client.create_sandbox(tag)[0]
     print(f"sandbox {sandbox.id} created")
+    try:
+        # Everything between create and delete is guarded: a mid-flow failure
+        # must not leak a live sandbox (it jams the shared TAP for the next
+        # create).
+        _sandbox_flow(sandbox, tag)
+    finally:
+        sandbox.delete()
+        print("sandbox deleted")
+    return 0
 
+
+def _sandbox_flow(sandbox, tag: str) -> None:
     print("ping:", sandbox.ping())
 
     result = sandbox.exec(["echo", "hello"], cwd="/workspace")
@@ -40,10 +51,6 @@ def main() -> int:
     print("read back", len(file.data), "bytes")
 
     print("ls:", [entry.name for entry in sandbox.ls("/workspace")])
-
-    sandbox.delete()
-    print("sandbox deleted")
-    return 0
 
 
 if __name__ == "__main__":

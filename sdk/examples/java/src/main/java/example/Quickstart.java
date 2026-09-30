@@ -23,11 +23,20 @@ public final class Quickstart {
 
         // Block until the snapshot reports status=ready and bootable=true.
         Snapshot snapshot = client.waitSnapshot(tag);
-        System.out.println("snapshot " + snapshot.tag + " is ready");
+        System.out.println("snapshot " + snapshot.getTag() + " is ready");
 
         Sandbox sandbox = client.createSandbox(tag).get(0);
         System.out.println("sandbox " + sandbox.id() + " created");
+        try {
+            // Guarded: a mid-flow failure must not leak a live sandbox.
+            flow(sandbox);
+        } finally {
+            sandbox.delete();
+            System.out.println("sandbox deleted");
+        }
+    }
 
+    private static void flow(Sandbox sandbox) {
         System.out.println("ping: " + sandbox.ping());
 
         ExecResultPrinter.print(sandbox.exec(
@@ -36,14 +45,11 @@ public final class Quickstart {
         int written = sandbox.write("notes.txt", "hello from rfb-sdk".getBytes());
         System.out.println("written: " + written + " bytes");
 
-        System.out.println("read back " + sandbox.read("notes.txt").data.length + " bytes");
+        System.out.println("read back " + sandbox.read("notes.txt").getData().length + " bytes");
 
         for (io.rfb.sdk.DirEntry entry : sandbox.ls("/workspace")) {
-            System.out.println("  " + entry.name + (entry.isDir ? "/" : ""));
+            System.out.println("  " + entry.getName() + (entry.isDir() ? "/" : ""));
         }
-
-        sandbox.delete();
-        System.out.println("sandbox deleted");
     }
 
     /** Tiny printer so the example stays dependency-free. */
@@ -52,7 +58,7 @@ public final class Quickstart {
         }
 
         static void print(io.rfb.sdk.ExecResult result) {
-            System.out.println("exec: exit=" + result.exitCode
+            System.out.println("exec: exit=" + result.getExitCode()
                     + " stdout=" + result.stdoutText().trim());
         }
     }
