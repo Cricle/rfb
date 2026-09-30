@@ -46,9 +46,13 @@ public final class ControllerHttp {
         this.timeout = timeout;
     }
 
+    /**
+     * {@code FORKD_URL} value, or the default when the variable is unset OR
+     * blank (UNIFIED_API.md §8: unset and whitespace-only both fall back).
+     */
     public static String envUrl() {
         String url = System.getenv("FORKD_URL");
-        return url == null || url.isEmpty() ? DEFAULT_URL : url;
+        return url == null || url.trim().isEmpty() ? DEFAULT_URL : url;
     }
 
     /** Non-blank {@code FORKD_TOKEN} value, else null. */

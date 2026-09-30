@@ -38,16 +38,32 @@ public final class Sandbox {
         this.timeout = Duration.ofMillis((long) (client.getTimeoutS() * 1000));
     }
 
-    /** Attach a sandbox at a KNOWN guest address with an explicit transport —
-     * the entry point for direct ZBRT bridges (no controller involved). */
+    /**
+     * Attach a sandbox at a KNOWN guest address with an explicit transport —
+     * the entry point for direct ZBRT bridges (no controller involved).
+     *
+     * @param client    owning client (supplies the guest timeout)
+     * @param info      controller sandbox metadata carrying the guest address
+     * @param transport {@code "ndjson"} or {@code "zbrt"}
+     * @return a facade over the sandbox's guest
+     */
     public static Sandbox attach(RfbClient client, SandboxInfo info, String transport) {
         return new Sandbox(client, info, transport);
     }
 
+    /**
+     * Resolve a sandbox by id against the live pool and attach with the given
+     * transport.
+     *
+     * @throws ValidationError unknown transport or malformed sandbox id
+     * @throws RemoteError     no live sandbox with that id ("sandbox not found")
+     */
     static Sandbox connectById(RfbClient client, String sandboxId, String transport) {
         if (!RfbClient.TRANSPORT_NDJSON.equals(transport) && !RfbClient.TRANSPORT_ZBRT.equals(transport)) {
             throw new ValidationError("transport must be \"ndjson\" or \"zbrt\"");
         }
+        // Fail closed before any HTTP traffic: the id travels in a URL path.
+        Validation.sandboxId(sandboxId);
         for (SandboxInfo info : client.controller().listSandboxes()) {
             if (info.getId().equals(sandboxId)) {
                 return new Sandbox(client, info, transport);
@@ -58,22 +74,27 @@ public final class Sandbox {
 
     // ---- properties ------------------------------------------------------
 
+    /** @return the controller-assigned sandbox id. */
     public String id() {
         return info.getId();
     }
 
+    /** @return the tag of the snapshot this sandbox was created from. */
     public String snapshotTag() {
         return info.getSnapshotTag();
     }
 
+    /** @return host:port of the guest agent. */
     public String guestAddr() {
         return info.getGuestAddr();
     }
 
+    /** @return creation time in Unix seconds, or {@code null} when unknown. */
     public Long createdAtUnix() {
         return info.getCreatedAtUnix();
     }
 
+    /** @return the controller sandbox metadata backing this facade. */
     public SandboxInfo info() {
         return info;
     }
@@ -85,37 +106,85 @@ public final class Sandbox {
 
     // ---- health ----------------------------------------------------------
 
-    /** Guest liveness: true when healthy. */
+    /**
+     * Guest liveness probe. NDJSON: healthy only when the reply's {@code pong}
+     * field is present and JSON-true (the {@code healthy} field does not
+     * count; unknown reply keys are ignored). ZBRT: the HealthAck's
+     * {@code healthy} flag (UNIFIED_API.md §4).
+     *
+     * @return {@code true} only when the agent reports healthy
+     * @throws TransportError connection/read failure or timeout
+     * @throws RemoteError    the guest replied with an {@code error} line/frame
+     */
     public boolean ping() {
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
             try (ZbrtConnection conn = openZbrt()) {
                 return conn.health().healthy();
             }
         }
+        // Rust baseline (ndjson::ping_healthy): healthy only when the pong
+        // flag is present and literally JSON-true.
         JsonNode pong = ndjsonRequest(Json.object().put("action", "ping")).get("pong");
-        return pong != null && pong.asBoolean(false);
+        return pong != null && pong.isBoolean() && pong.booleanValue();
     }
 
     // ---- exec / eval -----------------------------------------------------
 
+    /**
+     * Execute one command with the defaults: cwd {@code /workspace}, 60s
+     * timeout, no stdin.
+     *
+     * @param args command argv; must be non-empty
+     * @return the exec result
+     * @throws ValidationError empty argv (fail closed)
+     */
     public ExecResult exec(List<String> args) {
         return exec(args, null);
     }
 
+    /**
+     * Execute one command with a custom cwd (60s timeout, no stdin).
+     *
+     * @param args command argv; must be non-empty
+     * @param cwd  guest working directory ({@code /workspace} when null)
+     * @return the exec result
+     * @throws ValidationError empty argv or invalid cwd
+     */
     public ExecResult exec(List<String> args, String cwd) {
         return exec(args, cwd, 60.0);
     }
 
+    /**
+     * Execute one command with a custom cwd and deadline (no stdin).
+     *
+     * @param args     command argv; must be non-empty
+     * @param cwd      guest working directory ({@code /workspace} when null)
+     * @param timeoutS per-request deadline in seconds ({@code > 0})
+     * @return the exec result
+     * @throws ValidationError empty argv, invalid cwd, or bad timeout
+     */
     public ExecResult exec(List<String> args, String cwd, double timeoutS) {
         return exec(args, cwd, timeoutS, null);
     }
 
     /**
-     * Execute one command. {@code cwd} null resolves to the guest root
-     * ({@code /workspace} over NDJSON; no cwd field over ZBRT). {@code stdin}
-     * is delivered over the ZBRT transport; the NDJSON wire contract has no
-     * exec stdin channel, so non-empty stdin fails closed there (running the
-     * command without its input would be silent data loss).
+     * Execute one command and wait for its completion. {@code cwd} null
+     * resolves to {@code /workspace} on both transports (UNIFIED_API.md §8 —
+     * the agent rejects {@code /} as cwd). {@code stdin} is delivered over the
+     * ZBRT transport only; the NDJSON wire contract has no exec stdin channel,
+     * so non-empty stdin fails closed there (running the command without its
+     * input would be silent data loss).
+     *
+     * @param args     command argv; must be non-empty
+     * @param cwd      guest working directory ({@code /workspace} when null)
+     * @param timeoutS per-request deadline in seconds ({@code > 0})
+     * @param stdin    bytes fed to the command's stdin (ZBRT only; ignored-empty elsewhere)
+     * @return the aggregated exec result
+     * @throws ValidationError empty argv, bad cwd/timeout, non-empty stdin over
+     *                         NDJSON, or (ZBRT) argv over 255 entries / stdin
+     *                         over 16 MiB — all before any frame is sent
+     * @throws RemoteError     the guest reported an error or exceeded the 16 MiB turn cap
+     * @throws TransportError  connect/read/write failure or timeout
      */
     public ExecResult exec(List<String> args, String cwd, double timeoutS, byte[] stdin) {
         if (args == null || args.isEmpty()) {
@@ -127,14 +196,25 @@ public final class Sandbox {
         if (!(timeoutS > 0) || Double.isNaN(timeoutS) || Double.isInfinite(timeoutS)) {
             throw new ValidationError("exec timeout must be a positive, finite number of seconds");
         }
+        // §8: the four-language default cwd is /workspace (the agent rejects /).
+        String effectiveCwd = cwd != null ? cwd : "/workspace";
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
-            // The ZBRT deadline travels as whole seconds (ceil), not
-            // truncated milliseconds; beyond the u32 wire range it clamps to
-            // the maximum (mirrors the Rust baseline's u32::MAX saturation).
+            // Fail closed BEFORE any connection: ZBRT encodes argc in a single
+            // byte and payloads are u32-bounded, so an oversized argv/stdin is
+            // a local ValidationError with zero frames (UNIFIED_API.md §4/§9.8).
+            Validation.zbrtArgs(args);
+            Validation.payloadSize(stdin == null ? 0 : stdin.length,
+                    Validation.MAX_ZBRT_PAYLOAD_BYTES);
+            // The ZBRT deadline travels as whole seconds (ceil) times 1000,
+            // not truncated milliseconds; beyond the u32 wire range it clamps
+            // to the maximum (mirrors the Rust baseline's u32::MAX saturation).
             long timeoutMs = Math.min(
                     (long) Math.ceil(timeoutS) * 1000, 0xFFFFFFFFL);
-            try (ZbrtConnection conn = openZbrt()) {
-                ZbrtConnection.Exec exec = conn.execute(args, cwd, stdin, timeoutMs);
+            // The guest needs the full deadline to surface its own timeout
+            // error: widen the socket budget like the NDJSON exec path
+            // (client timeout + deadline + 5 s margin).
+            try (ZbrtConnection conn = openZbrt(execReadBudget(timeoutS))) {
+                ZbrtConnection.Exec exec = conn.execute(args, effectiveCwd, stdin, timeoutMs);
                 return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
             }
         }
@@ -146,7 +226,7 @@ public final class Sandbox {
         }
         ObjectNode action = Json.object()
                 .put("action", "exec")
-                .put("cwd", cwd != null ? cwd : "/workspace")
+                .put("cwd", effectiveCwd)
                 .put("timeout", timeoutSeconds(timeoutS));
         com.fasterxml.jackson.databind.node.ArrayNode argv = action.withArray("args");
         for (String arg : args) {
@@ -161,20 +241,44 @@ public final class Sandbox {
                 v.path("timed_out").asBoolean(false));
     }
 
+    /**
+     * Evaluate a code snippet with the defaults (no cwd override, no deadline).
+     *
+     * @param code snippet to evaluate; non-blank, at most 1 MiB of UTF-8
+     * @return the eval result (output mapped to stdout, stderr always empty)
+     * @throws ValidationError blank/oversized code, or eval over ZBRT (fail closed)
+     */
     public ExecResult eval(String code) {
         return eval(code, null);
     }
 
+    /**
+     * Evaluate a code snippet with an optional cwd override (no deadline).
+     *
+     * @param code snippet to evaluate; non-blank, at most 1 MiB of UTF-8
+     * @param cwd  guest working directory ({@code null} = agent default)
+     * @return the eval result (output mapped to stdout, stderr always empty)
+     * @throws ValidationError blank/oversized code, invalid cwd, or eval over ZBRT
+     */
     public ExecResult eval(String code, String cwd) {
         return eval(code, cwd, null);
     }
 
     /**
      * Evaluate a code snippet in the guest. Eval output maps to
-     * {@link ExecResult#stdout}. NDJSON carries {@code {"action":"eval"}};
+     * {@link ExecResult#getStdout()}; stderr is always empty and the exit code
+     * comes from the agent's {@code status} (legacy {@code exit_code} accepted,
+     * missing/non-integer → 0). NDJSON carries {@code {"action":"eval"}};
      * over ZBRT the call fails closed with {@link ValidationError} (ZBRT v1
      * has no eval opcode and the reference guest would run a literal
      * {@code eval <code>} command) — see {@code sdk/shared/README.md §1}.
+     *
+     * @param code     snippet to evaluate; non-blank, at most 1 MiB of UTF-8
+     * @param cwd      guest working directory ({@code null} = agent default)
+     * @param timeoutS optional deadline in seconds ({@code > 0} when present)
+     * @return the eval result
+     * @throws ValidationError blank/oversized code, invalid cwd, bad timeout,
+     *                         or eval over ZBRT — all before any frame is sent
      */
     public ExecResult eval(String code, String cwd, Double timeoutS) {
         Validation.evalCode(code);
@@ -212,11 +316,25 @@ public final class Sandbox {
 
     // ---- filesystem ------------------------------------------------------
 
-    /** List directory entries (default path "."). */
+    /**
+     * List directory entries at the guest's default path ({@code "."}).
+     *
+     * @return the entries under the path (at most 1000)
+     * @throws ValidationError invalid path
+     * @throws DecodeError     the reply carried no {@code entries} array
+     */
     public List<DirEntry> ls() {
         return ls(".");
     }
 
+    /**
+     * List directory entries under {@code path}.
+     *
+     * @param path guest fs path (relative or {@code /workspace}-prefixed)
+     * @return the entries under the path (at most 1000)
+     * @throws ValidationError invalid path
+     * @throws DecodeError     the reply carried no {@code entries} array
+     */
     public List<DirEntry> ls(String path) {
         Validation.fsPath(path);
         JsonNode node = toolOrFs(1, path, Json.object().put("max_results", Validation.MAX_GUEST_RESULTS));
@@ -234,11 +352,27 @@ public final class Sandbox {
         return entries;
     }
 
-    /** Find files by name pattern (default path "."). */
+    /**
+     * Find files by name pattern at the guest's default path ({@code "."}).
+     *
+     * @param pattern glob pattern (non-empty, at most 1024 bytes)
+     * @return matching guest paths (at most 1000)
+     * @throws ValidationError invalid path or pattern
+     * @throws DecodeError     the reply carried no string {@code matches} array
+     */
     public List<String> find(String pattern) {
         return find(".", pattern);
     }
 
+    /**
+     * Find files by name pattern under {@code path}.
+     *
+     * @param path    guest fs path (relative or {@code /workspace}-prefixed)
+     * @param pattern glob pattern (non-empty, at most 1024 bytes)
+     * @return matching guest paths (at most 1000)
+     * @throws ValidationError invalid path or pattern
+     * @throws DecodeError     the reply carried no string {@code matches} array
+     */
     public List<String> find(String path, String pattern) {
         Validation.fsPath(path);
         Validation.pattern(pattern);
@@ -251,16 +385,35 @@ public final class Sandbox {
         }
         List<String> matches = new ArrayList<>();
         for (JsonNode match : matchesNode) {
+            if (!match.isTextual()) {
+                throw new DecodeError("find matches must be strings");
+            }
             matches.add(match.asText());
         }
         return matches;
     }
 
-    /** Grep file contents (default path "."). */
+    /**
+     * Grep file contents at the guest's default path ({@code "."}).
+     *
+     * @param pattern regex/glob pattern (non-empty, at most 1024 bytes)
+     * @return the matches (at most 1000, 50 KiB of match text)
+     * @throws ValidationError invalid path or pattern
+     * @throws DecodeError     the reply carried no {@code matches} array
+     */
     public List<GrepMatch> grep(String pattern) {
         return grep(".", pattern);
     }
 
+    /**
+     * Grep file contents under {@code path}.
+     *
+     * @param path    guest fs path (relative or {@code /workspace}-prefixed)
+     * @param pattern regex/glob pattern (non-empty, at most 1024 bytes)
+     * @return the matches (at most 1000, 50 KiB of match text)
+     * @throws ValidationError invalid path or pattern
+     * @throws DecodeError     the reply carried no {@code matches} array
+     */
     public List<GrepMatch> grep(String path, String pattern) {
         Validation.fsPath(path);
         Validation.pattern(pattern);
@@ -283,11 +436,27 @@ public final class Sandbox {
         return matches;
     }
 
-    /** Read a guest file (backend byte cap applies). */
+    /**
+     * Read a whole guest file (backend byte cap applies).
+     *
+     * @param path guest file path (no NUL/backslash/{@code ..}, non-host path)
+     * @return the file bytes plus truncation info
+     * @throws ValidationError invalid path
+     */
     public FileRead read(String path) {
         return read(path, null, null);
     }
 
+    /**
+     * Read a guest file with optional offset and byte cap.
+     *
+     * @param path     guest file path (no NUL/backslash/{@code ..}, non-host path)
+     * @param offset   byte offset to start at ({@code null} = start of file)
+     * @param maxBytes cap on returned bytes, 1..51200 ({@code null} = backend default)
+     * @return the file bytes plus truncation info
+     *         ({@link FileRead#getTotalBytes()} reports the file size)
+     * @throws ValidationError invalid path or out-of-range {@code maxBytes}
+     */
     public FileRead read(String path, Long offset, Integer maxBytes) {
         Validation.filePath(path);
         if (maxBytes != null) {
@@ -318,12 +487,30 @@ public final class Sandbox {
                 node.hasNonNull("total_bytes") ? node.get("total_bytes").asLong() : null);
     }
 
-    /** Write (replace) a guest file; returns bytes_written. */
+    /**
+     * Write (replace) a guest file.
+     *
+     * @param path guest file path (no NUL/backslash/{@code ..}, non-host path)
+     * @param data bytes to write (at most 51200)
+     * @return the number of bytes written
+     * @throws ValidationError invalid path or oversized payload
+     * @throws DecodeError     the reply carried no {@code bytes_written}
+     */
     public int write(String path, byte[] data) {
         return write(path, data, false, null);
     }
 
-    /** Write or append to a guest file; returns bytes_written. */
+    /**
+     * Write or append to a guest file.
+     *
+     * @param path   guest file path (no NUL/backslash/{@code ..}, non-host path)
+     * @param data   bytes to write (at most 51200)
+     * @param append append instead of truncating the file
+     * @param mode   file mode bits ({@code null} = agent default)
+     * @return the number of bytes written
+     * @throws ValidationError invalid path or oversized payload
+     * @throws DecodeError     the reply carried no {@code bytes_written}
+     */
     public int write(String path, byte[] data, boolean append, Integer mode) {
         Validation.filePath(path);
         byte[] bytes = data == null ? new byte[0] : data;
@@ -360,15 +547,31 @@ public final class Sandbox {
 
     // ---- stream ----------------------------------------------------------
 
+    /**
+     * Open an interactive stream with no cwd, pty or env overrides.
+     *
+     * @param args command argv; must be non-empty
+     * @return the interactive stream handle
+     * @throws ValidationError empty argv or invalid cwd
+     */
     public GuestStream stream(List<String> args) {
         return stream(args, null, null, null);
     }
 
     /**
-     * Open an interactive stream. {@code cwd} is an opaque guest path. Empty
-     * argv is rejected, and over ZBRT {@code pty}/{@code env} fail closed with
-     * {@link ValidationError} before any frame is sent (ZBRT v1 has neither
-     * channel) — mirroring the Rust/C#/Python baselines.
+     * Open an interactive stream (UNIFIED_API.md §5). {@code cwd} is an
+     * optional guest path. Empty argv is rejected on both transports, and over
+     * ZBRT {@code pty}/{@code env} fail closed with {@link ValidationError}
+     * before any frame is sent (ZBRT v1 has neither channel) — mirroring the
+     * Rust/C#/Python baselines.
+     *
+     * @param args command argv; must be non-empty
+     * @param cwd  guest working directory (null = agent default)
+     * @param pty  allocate a pseudo-terminal (NDJSON only; {@code true} rejected over ZBRT)
+     * @param env  extra environment variables (NDJSON only; non-empty rejected over ZBRT)
+     * @return the interactive stream handle
+     * @throws ValidationError empty argv, bad cwd, or a ZBRT-unsupported option / argv size
+     * @throws TransportError  connection failure
      */
     public GuestStream stream(List<String> args, String cwd, Boolean pty, Map<String, String> env) {
         if (args == null || args.isEmpty()) {
@@ -378,12 +581,16 @@ public final class Sandbox {
             Validation.filePath(cwd);
         }
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
+            // Rust baseline (client/facade.rs GuestOps::stream, ZBRT arm):
+            // pty / env / oversized argv are fail-closed rejected before any
+            // frame is sent (and before the connection is even opened).
             if (Boolean.TRUE.equals(pty)) {
                 throw new ValidationError("pty is not supported over the ZBRT transport");
             }
             if (env != null && !env.isEmpty()) {
                 throw new ValidationError("env is not supported over the ZBRT transport");
             }
+            Validation.zbrtArgs(args);
             ZbrtConnection conn = openZbrt();
             try {
                 return GuestStream.overZbrt(conn, conn.openStreamSession(args, cwd, new byte[0], 0));
@@ -414,7 +621,13 @@ public final class Sandbox {
 
     // ---- lifecycle -------------------------------------------------------
 
-    /** Delete this sandbox; both 2xx and 404 are success. */
+    /**
+     * Delete this sandbox via the controller; both 2xx and 404 are success
+     * (UNIFIED_API.md §3/§4).
+     *
+     * @throws HttpStatusError non-2xx, non-404 controller status
+     * @throws TransportError  connection/read failure or request timeout
+     */
     public void delete() {
         client.deleteSandbox(info.getId());
     }
@@ -464,7 +677,12 @@ public final class Sandbox {
     }
 
     private ZbrtConnection openZbrt() {
-        return new ZbrtConnection(guestAddress, timeout);
+        return openZbrt(timeout);
+    }
+
+    /** Open a ZBRT connection with an explicit socket budget. */
+    private ZbrtConnection openZbrt(Duration socketTimeout) {
+        return new ZbrtConnection(guestAddress, socketTimeout);
     }
 
     private JsonNode ndjsonRequest(ObjectNode action) {

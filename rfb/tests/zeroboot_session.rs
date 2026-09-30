@@ -7,7 +7,9 @@
 //! handshake) and exercises the session's Hello / Execute / Output / Exit /
 //! Health / Cancel / Fs frame exchange plus the sandbox routing surface.
 
-use rfb::guest::{CancelRequest, FindRequest, GrepRequest, LsRequest, ReadRequest, WriteRequest};
+use rfb::guest::{
+    CancelRequest, FindRequest, GrepRequest, GuestStream, LsRequest, ReadRequest, WriteRequest,
+};
 use rfb::protocol::{
     Error as ProtocolError, Execute, Exit, Frame, Health, Hello, HelloAck, Kind, Output,
 };
@@ -406,6 +408,93 @@ async fn exec_maps_guest_error_frame() {
             assert_eq!(message, "spawn failed");
         }
         other => panic!("expected Remote error, got {other:?}"),
+    }
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_fails_closed_when_the_demux_drops_output_frames() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let server_task = tokio::spawn(async move {
+        let hello = read_frame(&mut server).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["stream".into()]),
+            ),
+        )
+        .await;
+        let exec = read_frame(&mut server).await;
+        assert_eq!(exec.kind, Kind::Execute);
+        // Flood more Output frames than the demux channel can hold
+        // (FRAME_CHANNEL_CAPACITY = 256) while the consumer below is
+        // deliberately not reading: the reader drops the overflow, and the
+        // terminal must surface that loss instead of ending the stream
+        // cleanly with a truncated transcript and a misleading exit 0.
+        for _ in 0..1000 {
+            write_frame(
+                &mut server,
+                &reply(
+                    exec.request_id,
+                    Kind::Output,
+                    Output {
+                        stream: 0,
+                        data: vec![b'a'; 16],
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            )
+            .await;
+        }
+        write_frame(
+            &mut server,
+            &reply(
+                exec.request_id,
+                Kind::Exit,
+                Exit {
+                    code: 0,
+                    signal: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        )
+        .await;
+    });
+
+    let session = std::sync::Arc::new(
+        ZeroBootSession::from_stream(client, Duration::from_secs(5))
+            .await
+            .unwrap(),
+    );
+    let mut stream = session
+        .stream(exec_request(&["flood"], 30_000))
+        .await
+        .unwrap();
+    // Give the demultiplexer time to fill its bounded channel and drop the
+    // overflow before this consumer starts draining.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let dropped_error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                panic!("stream ended cleanly despite dropped output frames");
+            }
+            Err(error) => break error,
+        }
+    };
+    match dropped_error {
+        SandboxError::Execution(message) => {
+            assert!(
+                message.contains("dropped") && message.contains("demux overflow"),
+                "error must report the lost guest output: {message}"
+            );
+        }
+        other => panic!("expected Execution error, got {other:?}"),
     }
     server_task.await.unwrap();
 }

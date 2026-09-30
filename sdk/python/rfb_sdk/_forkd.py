@@ -6,6 +6,7 @@ public API.
 
 import http.client
 import json
+import threading
 import urllib.parse
 
 from .errors import DecodeError, HttpStatusError, TransportError, ValidationError
@@ -53,6 +54,10 @@ class _ForkdController:
             http.client.HTTPSConnection if self._use_tls else http.client.HTTPConnection
         )
         self._conn = None
+        # UNIFIED_API §2: one client = serialized requests (safe concurrent,
+        # never parallel) — the pooled keep-alive connection must not have
+        # two threads inside request()/getresponse() at once.
+        self._lock = threading.Lock()
 
     def _connect(self):
         try:
@@ -61,6 +66,10 @@ class _ForkdController:
             raise TransportError(f"forkd request failed: {e}") from e
 
     def _request(self, method: str, path: str, body=None) -> tuple:
+        with self._lock:
+            return self._request_locked(method, path, body)
+
+    def _request_locked(self, method: str, path: str, body=None) -> tuple:
         conn = self._conn
         reused = conn is not None
         if conn is None:
@@ -87,7 +96,11 @@ class _ForkdController:
                 # once on a fresh connection, then fail. Non-idempotent
                 # requests (POST) are NOT replayed - the peer may have
                 # processed them before closing (e.g. an extra sandbox).
-                return self._request(method, path, body)
+                # _request_locked, NOT _request: the lock is already held and
+                # threading.Lock is not reentrant (a self-deadlock hung the
+                # whole suite when a fake server's keep-alive socket went
+                # stale).
+                return self._request_locked(method, path, body)
             raise TransportError(f"forkd request failed: {e}") from e
 
     def _json_request(self, method: str, path: str, body=None):

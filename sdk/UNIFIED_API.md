@@ -51,7 +51,7 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 | 方法 | 签名要点 | 行为要点 |
 |---|---|---|
 | `ping()` | → `bool` | NDJSON：仅 `pong==true` 算健康（`healthy` 字段不作数；应答另含附加键 `protocol_version`=1，客户端忽略未知键）；ZBRT：HealthAck 的 `healthy` |
-| `exec(args, cwd="/", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；ZBRT 的 `argc` 是单字节，`>255` 本地 Validation（零帧，连 TCP 都不建）；单 turn stdout+stderr 聚合 `>16 MiB` → Remote；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
+| `exec(args, cwd="/workspace", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；ZBRT 的 `argc` 是单字节，`>255` 本地 Validation（零帧，连 TCP 都不建）；单 turn stdout+stderr 聚合 `>16 MiB` → Remote；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
 | `eval(code, cwd=None, timeout_s=None)` | code 去空白非空、≤ 1 MiB；timeout > 0 | 输出映射 `stdout`（`output`，旧 `out` 等价），`stderr` 恒空，exit 取 `status`（旧 `exit_code` 等价，缺省 0）；**ZBRT 下本地 fail closed**（ValidationError，零帧上线：v1 无 eval opcode，见 `sdk/shared/README.md §1`） |
 | `ls(path=".")` / `find(path, pattern)` / `grep(path, pattern)` | fs 路径 + pattern 校验 | `max_results=1000`（grep 另 `max_bytes=51200`）；find 返回 `[str]`，grep 返回 `[GrepMatch]` |
 | `read(path, offset=None, max_bytes=None)` | `max_bytes` 必须 `1..=51200` | → `FileRead{data, truncated, total_bytes}` |
@@ -130,11 +130,35 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 | `FORKD_URL` | 四语言 `RfbClient` 缺省构造；`rfb-cli forkd *` | controller 地址（默认 `http://127.0.0.1:8889`；未设或空白都回退默认） |
 | `FORKD_TOKEN` | 四语言 `RfbClient` 缺省构造 | controller Bearer token（非空才发头） |
 | `FORKD_AGENT_TOKEN` | forkd agent（guest 侧，启用连接认证）；Python/Node.js/Java SDK guest 客户端（配置后每连接先发 auth 首帧）；Rust/C# 客户端尚未接入 | guest NDJSON 连接认证；非空 = 强制首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
+| `RFB_ZBRT_TCP` | 五语言 quickstart 的 `--backend zeroboot`；rfbsample | 已运行 ZBRT 桥的 TCP 地址（默认 `127.0.0.1:15000`） |
+| `RFB_DEMO_ASSETS` | `examples/python/host_quickstart.py` | 宿主侧演示的制品目录（firecracker/vmlinux/zeroboot-zbrt.ext4） |
 | `FORKD_KERNEL` / `FORKD_ROOTFS` / `FORKD_BIN` | `rfb-cli forkd snapshot-*` | 快照创建的内核 / rootfs / 官方 forkd 二进制路径覆盖 |
 | `RFB_RUNTIME_BIN` | 部署流水线（约定注入点，仓库内代码不读） | 预编译静态 rfb-runtime 二进制路径 |
 | `RFB_AGENT_WORKSPACE` | rfb-runtime agent | guest 工作区根覆盖（默认 `/workspace`，供宿主侧契约测试用） |
 
 工具链变量的逐条说明见 [`BACKEND_SETUP.md §5`](BACKEND_SETUP.md)。
+
+## 10b. 宿主侧编排（rfb_sdk.host — 目前 Python 独有）
+
+Python SDK 额外携带**宿主侧编排**（`rfb_sdk/host.py`，纯标准库）——把"后端"
+本身跑起来的能力，不经 rfb-cli。其余语言 SDK 保持纯客户端（rust 的对应物是
+`rfb-cli`）；此条列入分歧清单 §11。
+
+- **`ZerobootHost`**：直驱 Firecracker（UDS 管理 API，逐步有界等待，
+  `PR_SET_PDEATHSIG` 防孤儿）+ vsock 中继 UDS→TCP 桥（`CONNECT <port>\n` /
+  `OK ...\n` 前导协议，与 Rust 侧 `vsock_relay.rs` 单源对齐）；
+  `sandbox()` 返回与 forkd 完全同形状的 `Sandbox` 门面（transport="zbrt"）。
+- **`ForkdHost`**：直拉 forkd-controller、`ip(8)` 幂等收敛 TAP、官方 forkd
+  二进制建快照、共享 TAP 的残留沙箱收敛；`client()` 返回 `RfbClient`。
+- **统一生命周期**：`alive() / up()（幂等：健康复用、残留按 run 目录 scoped
+  清理）/ down() / client()/sandbox()`。
+- **清理纪律**：SIGTERM 优先（父进程自己收尸），SIGKILL 只对幸存者——
+  SIGKILL 的孤儿 VM 会变不可收尸僵尸，控制器的共享 TAP 门把僵尸也算活
+  沙箱；ForkdHost 进程为 `PR_SET_CHILD_SUBREAPER` + waitpid 收尸线程；
+  `forkd snapshot` 留下的 parent VM（live-fork 模板）在返回前主动退役并等
+  进程表排空。
+- **`restore_asset(assets_dir, name, target)`**：制品目录解析（`.gz` 自动
+  解包、chmod 755、已存在的目标不覆盖）。
 
 ## 11. 已知的有意分歧（documented divergences）
 

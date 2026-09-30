@@ -236,6 +236,35 @@ describe('Sandbox over ZBRT (fake guest)', () => {
     assert.deepEqual(rec.executes[0]?.stdin, Buffer.from('abc'));
   });
 
+  it('rejects argc > 255 with ValidationError before any connection (§9.8)', { timeout: 10_000 }, async () => {
+    const { port, rec } = await startGuest(() => {
+      // Fail closed: no frame, not even the Hello handshake, may arrive.
+      assert.fail('guest must never be contacted for an invalid argv');
+    });
+    await assert.rejects(
+      () => sandboxOn(port).exec(Array.from({ length: 256 }, (_, i) => `a${i}`)),
+      (error: Error) => error.constructor.name === 'ValidationError',
+    );
+    await assert.rejects(
+      () => sandboxOn(port).stream(Array.from({ length: 256 }, (_, i) => `a${i}`)),
+      (error: Error) => error.constructor.name === 'ValidationError',
+    );
+    assert.equal(rec.hellos.length, 0);
+    assert.equal(rec.executes.length, 0);
+  });
+
+  it('rejects oversized exec stdin before any connection (§9.8)', { timeout: 10_000 }, async () => {
+    const { port, rec } = await startGuest(() => {
+      assert.fail('guest must never be contacted for an oversized stdin');
+    });
+    await assert.rejects(
+      () => sandboxOn(port).exec(['cat'], { stdin: Buffer.alloc(16 * 1024 * 1024 + 1) }),
+      (error: Error) => error.constructor.name === 'ValidationError',
+    );
+    assert.equal(rec.hellos.length, 0);
+    assert.equal(rec.executes.length, 0);
+  });
+
   it('ls over ZBRT sends op 1 and decodes entries', { timeout: 10_000 }, async () => {
     const { port, rec } = await startGuest((frame, socket) => {
       if (frame.kind === KIND_FS) {

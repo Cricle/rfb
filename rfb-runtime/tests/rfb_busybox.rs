@@ -200,3 +200,68 @@ fn unknown_applet_reports_127() {
     let out = run_applet("definitely-not-an-applet", &[]);
     assert_eq!(out.status.code(), Some(127));
 }
+
+#[test]
+fn digit_inside_a_word_is_not_an_io_number() {
+    // `echo a2>b` must print `a2` into file `b` (POSIX: a digit is an
+    // IO_NUMBER only at the token's very start). The old parser broke the
+    // word at `2` and misparsed it as an fd-2 redirection (`echo a 2> b`).
+    let dir = temp_path("io-number-mid-word");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("b");
+    let _ = sh(&format!("cd {} && echo a2>b", dir.display()));
+    let content = std::fs::read_to_string(&target).expect("redirect target b must exist");
+    assert_eq!(content, "a2\n");
+
+    // The token-start IO_NUMBER form keeps working: `2>` redirects stderr.
+    let err_file = dir.join("err.log");
+    let out = sh(&format!(
+        "cd {} && echo ok 2>{}",
+        dir.display(),
+        err_file.display()
+    ));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    let err = std::fs::read_to_string(&err_file).unwrap_or_default();
+    assert!(err.is_empty(), "stderr redirect must create an empty file");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pipeline_stage_spawn_failure_reaps_started_stages() {
+    // `sleep 97 | <unknown>` reports 127 immediately and must NOT leave the
+    // already-spawned first stage running after the pipeline exits.
+    let out = sh("sleep 97 | rfb-busybox-no-such-command-e2e");
+    assert_eq!(out.status.code(), Some(127));
+
+    // Give the kernel a beat to finish the reap, then scan /proc for any
+    // surviving `sleep 97` the failed pipeline might have leaked.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut leaked = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(error) => panic!("cannot scan /proc on this platform: {error}"),
+    };
+    for entry in entries.flatten() {
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let mut args = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty());
+        // argv[0] is the resolved program path (`/usr/bin/sleep`), argv[1]
+        // the operand: match the trailing basename, not the whole path.
+        let is_leaked_sleep = matches!(
+            (args.next(), args.next()),
+            (Some(program), Some(operand))
+                if program.ends_with(b"sleep") && operand == b"97"
+        );
+        if is_leaked_sleep {
+            leaked.push(entry.path());
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "pipeline spawn failure must kill and reap started stages; leaked: {leaked:?}"
+    );
+}

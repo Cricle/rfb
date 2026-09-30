@@ -805,10 +805,14 @@ const FRAME_CHANNEL_CAPACITY: usize = 256;
 
 /// Per-request byte budget for the demux path: the frame-count channel bound
 /// alone caps a request's queued bytes only if frames are small, so a
-/// firehose guest is capped here instead. Must stay above
+/// firehose guest is capped here instead. Sized above
 /// [`MAX_EXEC_OUTPUT_BYTES`] (the consumer's own cap) so a legitimate
-/// oversized-output command always receives enough frames to trip its own
-/// limit before the reader starts dropping.
+/// oversized-output command trips its own limit without ALSO exhausting the
+/// byte budget — but that headroom only holds while the consumer keeps up.
+/// Under host backpressure (a stalled or slow consumer) the channel fills and
+/// frames ARE dropped; the request's terminal frame then fails closed on the
+/// lost output (see [`terminal_frame`]) instead of returning a cleanly
+/// truncated result.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const DEMUX_REQUEST_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
@@ -1091,8 +1095,16 @@ fn spawn_reader(
         // Cumulative admitted Output bytes per request id. Bounds host memory
         // per request to `DEMUX_REQUEST_BYTE_BUDGET` regardless of frame
         // count; entries are retired when the request's terminal frame is
-        // routed.
+        // routed (also on the no-in-flight path, so an abandoned request
+        // never leaks its entry).
         let mut admitted: HashMap<[u8; 16], u64> = HashMap::new();
+        // Guest output bytes DROPPED per request id (byte-budget overflow or
+        // full-channel overflow). A request that lost frames can no longer
+        // produce a trustworthy result, so its terminal frame is replaced by
+        // a synthetic Error ([`terminal_frame`]) instead of letting exec
+        // return a silently truncated result with a misleading exit code;
+        // entries retire together with the terminal.
+        let mut dropped: HashMap<[u8; 16], u64> = HashMap::new();
         loop {
             // Canonical single-implementation frame decoder shared with the
             // guest (`rfb::protocol` re-exports rfb-runtime's zeroboot
@@ -1106,7 +1118,11 @@ fn spawn_reader(
             let Some(sender) = sender else {
                 // Late or unknown frames (e.g. racing a completed request) are
                 // dropped by design — but they are also the classic symptom of
-                // a routing bug, so leave a trace.
+                // a routing bug, so leave a trace. The request is gone either
+                // way: retire its budget/drop entries so an abandoned request
+                // cannot leak them.
+                let _ = admitted.remove(&frame.request_id);
+                let _ = dropped.remove(&frame.request_id);
                 eprintln!(
                     "rfb zeroboot: dropped frame kind={:?} id={} (no in-flight request)",
                     frame.kind,
@@ -1120,10 +1136,12 @@ fn spawn_reader(
                 // they are delivered even against a full channel.
                 Kind::Exit | Kind::Result | Kind::Error => {
                     let _ = admitted.remove(&frame.request_id);
+                    let kind = frame.kind;
+                    let frame = terminal_frame(&frame, &mut dropped);
                     if !deliver_terminal(&sender, &frame).await {
                         eprintln!(
                             "rfb zeroboot: dropped terminal frame kind={:?} id={} (channel never drained)",
-                            frame.kind,
+                            kind,
                             rid_hex(&frame.request_id)
                         );
                     }
@@ -1142,6 +1160,9 @@ fn spawn_reader(
                                 "rfb zeroboot: request over the demux byte budget, dropped {budget_dropped} frame(s) so far"
                             );
                         }
+                        // Budget overflow is lost guest output for this
+                        // request: record it so the terminal fails closed.
+                        *dropped.entry(frame.request_id).or_insert(0) += frame_bytes;
                         continue;
                     }
                     *admitted_bytes += frame_bytes;
@@ -1154,12 +1175,22 @@ fn spawn_reader(
             // grow host memory without bound. Overflow is dropped, with
             // a rate-limited trace (first drop, then every 1024th) so a
             // firehose guest cannot flood stderr either.
-            if sender.try_send(frame).is_err() {
+            if let Err(error) = sender.try_send(frame) {
                 overflowed += 1;
                 if overflowed == 1 || overflowed.is_multiple_of(1024) {
                     eprintln!(
                         "rfb zeroboot: request channel full, dropped {overflowed} frame(s) so far"
                     );
+                }
+                // An Output frame that never reached the consumer is lost
+                // guest data under host backpressure: record it so the
+                // terminal frame fails closed instead of returning a cleanly
+                // truncated result.
+                if let mpsc::error::TrySendError::Full(frame) = error {
+                    if frame.kind == Kind::Output {
+                        *dropped.entry(frame.request_id).or_insert(0) +=
+                            (HEADER_LEN + frame.payload.len()) as u64;
+                    }
                 }
             }
         }
@@ -1193,6 +1224,34 @@ async fn deliver_terminal(sender: &mpsc::Sender<Frame>, frame: &Frame) -> bool {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
         }
+    }
+}
+
+/// Terminal delivery for one request: when the demultiplexer dropped any of
+/// the request's Output frames (byte-budget or full-channel overflow), the
+/// clean terminal is replaced by a synthetic `Error` frame carrying the
+/// dropped byte count, so exec/stream fail closed on the lost output instead
+/// of surfacing a silently truncated result with a misleading exit code. A
+/// request without drops gets its own terminal verbatim, and a guest `Error`
+/// terminal is delivered unchanged (the command already failed).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn terminal_frame(terminal: &Frame, dropped: &mut HashMap<[u8; 16], u64>) -> Frame {
+    let dropped_bytes = dropped.remove(&terminal.request_id).unwrap_or(0);
+    if dropped_bytes == 0 || terminal.kind == Kind::Error {
+        return terminal.clone();
+    }
+    Frame {
+        kind: Kind::Error,
+        flags: 0,
+        request_id: terminal.request_id,
+        payload: ProtocolError {
+            code: 1,
+            message: format!(
+                "host dropped {dropped_bytes} byte(s) of guest output (demux overflow); the result is incomplete"
+            ),
+        }
+        .encode()
+        .unwrap_or_default(),
     }
 }
 

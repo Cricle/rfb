@@ -22,8 +22,21 @@ export interface SnapshotSummary {
   tag?: string;
   status?: string;
   bootable?: boolean;
+  dir?: string;
+  created_at_unix?: number | null;
+  branched_from?: string | null;
+  pause_ms?: number | null;
+  diff_ms?: number | null;
+  diff_physical_bytes?: number | null;
+  diff_logical_bytes?: number | null;
+  warning?: string | null;
+  digest?: string | null;
+  provenance?: unknown;
   [key: string]: unknown;
 }
+
+/** Snapshot DTO (§1): alias of {@link SnapshotSummary}; missing fields default (serde defaults). */
+export type Snapshot = SnapshotSummary;
 
 export interface CreateSandboxOptions {
   n?: number;
@@ -41,8 +54,9 @@ export interface CreateSandboxOptions {
 }
 
 function envUrl(): string {
+  // §2/§8/§10: FORKD_URL falls back to the default when unset OR blank.
   const url = process.env.FORKD_URL;
-  return url === undefined || url.length === 0 ? DEFAULT_URL : url;
+  return url === undefined || url.trim().length === 0 ? DEFAULT_URL : url;
 }
 
 function envToken(): string | null {
@@ -61,7 +75,14 @@ export class RfbClient {
   public readonly timeoutS: number;
 
   /**
-   * Defaults resolve from FORKD_URL / FORKD_TOKEN and 10 seconds.
+   * Create an RFB SDK client (§2). Defaults resolve from env: `FORKD_URL`
+   * (unset or blank → `http://127.0.0.1:8889`), `FORKD_TOKEN` (sent as
+   * `Authorization: Bearer` only when non-empty) and a 10 s per-request
+   * timeout covering connect + read. The timeout is validated fail-closed.
+   *
+   * @param options Optional overrides: `baseUrl`, `token`, `timeoutS`.
+   * @throws {ValidationError} `timeoutS` is not a positive finite number, or
+   *   `baseUrl` is not an http(s) URL with a host.
    */
   constructor(options: RfbClientOptions = {}) {
     const baseUrl = options.baseUrl ?? envUrl();
@@ -139,21 +160,43 @@ export class RfbClient {
     }
   }
 
-  /** GET /v1/snapshots. */
+  /**
+   * All snapshots as reported by the controller (§3: `GET /v1/snapshots`).
+   *
+   * @returns Every snapshot (missing DTO fields follow serde defaults).
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx controller answer.
+   * @throws {DecodeError} Malformed 2xx body.
+   */
   async listSnapshots(): Promise<SnapshotSummary[]> {
     return this.#parseJson<SnapshotSummary[]>(this.#expectOk(await this.#send('GET', '/v1/snapshots')));
   }
 
-  /** GET /v1/sandboxes — the live sandbox registry, as attachable handles. */
+  /**
+   * The live sandbox registry, as attachable handles (§3).
+   *
+   * @returns One {@link Sandbox} per live sandbox (NDJSON transport).
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx controller answer.
+   * @throws {DecodeError} Malformed 2xx body.
+   */
   async listSandboxes(): Promise<Sandbox[]> {
     const infos = this.#parseJson<SandboxInfo[]>(this.#expectOk(await this.#send('GET', '/v1/sandboxes')));
     return infos.map((info) => new Sandbox(info, this, TRANSPORT_NDJSON, this.timeoutS * 1000));
   }
 
   /**
-   * Snapshot detail: /info → legacy endpoint; both 404 → null. The tag is
-   * validated non-empty only and percent-encoded verbatim into the path
-   * (PROTOCOL.md §1.1), so tags like "base.v2" / "snap:1" stay legal.
+   * Snapshot detail: `/info` endpoint → legacy endpoint; both 404 → `null`
+   * (§3). The tag is validated non-empty only and percent-encoded verbatim
+   * into the path (PROTOCOL.md §1.1), so tags like "base.v2" / "snap:1" stay
+   * legal.
+   *
+   * @param tag Snapshot tag to look up.
+   * @returns The snapshot, or `null` when unknown (double 404).
+   * @throws {ValidationError} Empty tag.
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx (other than the 404 fallbacks).
+   * @throws {DecodeError} Malformed 2xx body.
    */
   async snapshot(tag: string): Promise<SnapshotSummary | null> {
     validation.snapshotTag(tag);
@@ -167,7 +210,20 @@ export class RfbClient {
     return this.#parseJson<SnapshotSummary>(this.#expectOk(legacy));
   }
 
-  /** Poll every 100 ms until status=ready and bootable=true; failed → RemoteError. */
+  /**
+   * Poll every 100 ms until the snapshot is ready and bootable (§3): a
+   * `failed` status raises {@link RemoteError} immediately; exceeding the
+   * budget raises {@link TransportError} (timeouts are transport-class).
+   *
+   * @param tag Snapshot tag to wait for.
+   * @param timeoutS Wait budget in seconds (default 60).
+   * @returns The ready, bootable snapshot.
+   * @throws {ValidationError} Empty tag or non-positive/NaN timeout.
+   * @throws {RemoteError} The snapshot reports `failed`.
+   * @throws {TransportError} The budget elapsed, or a poll request failed.
+   * @throws {HttpStatusError} Non-2xx controller answer while polling.
+   * @throws {DecodeError} Malformed 2xx body while polling.
+   */
   async waitSnapshot(tag: string, timeoutS: number = DEFAULT_WAIT_TIMEOUT_S): Promise<SnapshotSummary> {
     validation.snapshotTag(tag);
     validation.timeoutS(timeoutS);
@@ -191,8 +247,19 @@ export class RfbClient {
   }
 
   /**
-   * Create sandboxes from a snapshot. Transports: "ndjson" (default) and
-   * "zbrt" — both are fully implemented; anything else raises ValidationError.
+   * Create sandboxes from a snapshot (§3). Transports: `"ndjson"` (default)
+   * and `"zbrt"` — both are fully implemented; anything else raises
+   * {@link ValidationError}.
+   *
+   * @param tag Snapshot tag to branch from.
+   * @param options Optional knobs: `n` (default 1), `transport`
+   *   (default `"ndjson"`), `perChildNetns`, `memoryLimitMib`, `prewarm`,
+   *   `liveFork`, `hugepages` (all default false/null).
+   * @returns One handle per created sandbox, over the chosen transport.
+   * @throws {ValidationError} Unknown tag/transport.
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx controller answer.
+   * @throws {DecodeError} Malformed 2xx body.
    */
   async createSandbox(tag: string, options: CreateSandboxOptions = {}): Promise<Sandbox[]> {
     const {
@@ -205,9 +272,7 @@ export class RfbClient {
       hugepages = false,
     } = options;
     validation.snapshotTag(tag);
-    if (transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT) {
-      throw new ValidationError(`invalid transport: ${transport}`);
-    }
+    validation.transport(transport);
     const result = await this.#send('POST', '/v1/sandboxes', {
       snapshot_tag: tag,
       n,
@@ -222,46 +287,89 @@ export class RfbClient {
   }
 
   /**
-   * Attach to a sandbox by id (resolved via the controller's sandbox list),
-   * or pass an existing `Sandbox` to reuse it as-is — its transport is
-   * preserved (attaching an existing handle never resets it).
+   * Attach to a sandbox (§3).
+   *
+   * @param target A sandbox id, resolved through the controller's sandbox
+   *   list (a miss raises {@link RemoteError}); or an existing {@link Sandbox}
+   *   handle, attached as-is.
+   * @param transport Optional explicit transport (`"ndjson"` | `"zbrt"`).
+   *   Passing a `Sandbox` plus an explicit transport overrides its transport
+   *   (the rest of the handle is reused); by id it selects the transport
+   *   directly (default `"ndjson"`). Invalid values raise
+   *   {@link ValidationError} before any network traffic.
+   * @returns A `Sandbox` handle over the chosen transport.
+   * @throws {ValidationError} Invalid transport or sandbox id.
+   * @throws {RemoteError} The id is not in the controller's live list.
+   * @throws {TransportError} The controller request failed or timed out.
+   * @throws {HttpStatusError} The controller answered non-2xx.
    */
-  async connect(target: string | Sandbox): Promise<Sandbox> {
+  async connect(target: string | Sandbox, transport?: string | null): Promise<Sandbox> {
     if (target instanceof Sandbox) {
-      return target;
+      // §3: a Sandbox attaches as-is; only an explicitly passed transport
+      // overrides it (mirrors the Rust ConnectTarget for &Sandbox).
+      if (transport === undefined || transport === null) {
+        return target;
+      }
+      validation.transport(transport);
+      return new Sandbox(target.info, this, transport, this.timeoutS * 1000);
     }
+    if (transport === undefined || transport === null) {
+      transport = TRANSPORT_NDJSON;
+    }
+    validation.transport(transport);
     const sandboxId = target;
     validation.sandboxId(sandboxId);
     const result = await this.#send('GET', '/v1/sandboxes');
     const list = this.#parseJson<SandboxInfo[]>(this.#expectOk(result));
     const info = Array.isArray(list) ? list.find((s) => s.id === sandboxId) : undefined;
     if (!info) {
-      throw new RemoteError('sandbox not found');
+      throw new RemoteError(`sandbox not found: ${sandboxId}`);
     }
-    return new Sandbox(info, this, TRANSPORT_NDJSON, this.timeoutS * 1000);
+    return new Sandbox(info, this, transport, this.timeoutS * 1000);
   }
 
-  /** Attach to a sandbox with an explicit transport ("ndjson" | "zbrt"). */
+  /**
+   * Attach to a sandbox with an explicit transport ("ndjson" | "zbrt").
+   *
+   * @param sandboxId Sandbox id to resolve.
+   * @param transport Optional transport override; `null`/`undefined` keeps
+   *   the `"ndjson"` default.
+   * @returns A `Sandbox` handle over the chosen transport.
+   * @throws {ValidationError} Invalid transport or sandbox id, before any
+   *   network traffic.
+   * @throws {RemoteError} The id is not in the controller's live list.
+   * @throws {TransportError} The controller request failed or timed out.
+   * @throws {HttpStatusError} The controller answered non-2xx.
+   */
   async connectWithTransport(sandboxId: string, transport?: string | null): Promise<Sandbox> {
-    // Fail closed before any network traffic (§7): validate the transport
-    // name first, then resolve the sandbox.
-    if (transport !== undefined && transport !== null) {
-      if (transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT) {
-        throw new ValidationError(`invalid transport: ${transport}`);
-      }
-      const sandbox = await this.connect(sandboxId);
-      return new Sandbox(sandbox.info, this, transport, this.timeoutS * 1000);
-    }
-    return this.connect(sandboxId);
+    return this.connect(sandboxId, transport);
   }
 
+  /**
+   * Controller-level ping for a sandbox id (§3: the ping value passes
+   * through unchanged).
+   *
+   * @param sandboxId Sandbox id to ping.
+   * @returns The controller's ping response body as parsed JSON.
+   * @throws {ValidationError} Malformed sandbox id.
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx controller answer.
+   * @throws {DecodeError} Malformed 2xx body.
+   */
   async pingSandbox(sandboxId: string): Promise<Record<string, unknown>> {
     validation.sandboxId(sandboxId);
     const result = await this.#send('POST', `/v1/sandboxes/${sandboxId}/ping`);
     return this.#parseJson<Record<string, unknown>>(this.#expectOk(result));
   }
 
-  /** Delete a sandbox; both 2xx and 404 are success. */
+  /**
+   * Delete a sandbox (§3: both 2xx and 404 are success).
+   *
+   * @param sandboxId Sandbox id to delete.
+   * @throws {ValidationError} Malformed sandbox id.
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx, non-404 controller answer.
+   */
   async deleteSandbox(sandboxId: string): Promise<void> {
     validation.sandboxId(sandboxId);
     const result = await this.#send('DELETE', `/v1/sandboxes/${sandboxId}`);

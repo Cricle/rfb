@@ -150,3 +150,38 @@ async fn malformed_controller_response_is_unavailable() {
 
 #[allow(dead_code)]
 async fn _assert_tcp_type(_: TcpStream) {}
+
+#[test]
+fn forkd_stream_event_key_precedence_matches_the_ndjson_contract() {
+    use rfb::forkd::forkd_stream_event;
+    use rfb::guest::StreamEvent;
+
+    // UNIFIED_API.md §11: a signal-killed turn ends with `{"exit_code":null}`;
+    // the KEY being present terminates the stream and maps to Exit(None) — it
+    // used to be skipped here as an unrecognized line.
+    assert_eq!(
+        forkd_stream_event(serde_json::json!({"exit_code": null})).unwrap(),
+        StreamEvent::Exit { code: None }
+    );
+    assert_eq!(
+        forkd_stream_event(serde_json::json!({"exit_code": 3})).unwrap(),
+        StreamEvent::Exit { code: Some(3) }
+    );
+    // Terminal key presence wins over every other key on the same line
+    // (same precedence as `crate::client::ndjson::stream_event`).
+    assert_eq!(
+        forkd_stream_event(serde_json::json!({"exit_code": 0, "stdout": "late"})).unwrap(),
+        StreamEvent::Exit { code: Some(0) }
+    );
+    // Output keys take precedence over the started markers.
+    assert_eq!(
+        forkd_stream_event(serde_json::json!({"stdout": "hi", "event": "started"})).unwrap(),
+        StreamEvent::Stdout {
+            data: b"hi".to_vec()
+        }
+    );
+    assert_eq!(
+        forkd_stream_event(serde_json::json!({"event": "started"})).unwrap(),
+        StreamEvent::Started
+    );
+}

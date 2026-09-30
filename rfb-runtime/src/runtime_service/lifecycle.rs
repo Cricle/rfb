@@ -83,6 +83,7 @@ impl RuntimeService {
             active_sessions: HashMap::new(),
             cancelled_sessions: HashMap::new(),
             cancelled_order: std::collections::VecDeque::new(),
+            evicted_cancelled: std::collections::VecDeque::new(),
             shutdown: false,
             limits,
             executor: Some(executor),

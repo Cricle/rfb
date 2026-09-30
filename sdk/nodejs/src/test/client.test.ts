@@ -14,6 +14,15 @@ describe('RfbClient construction', () => {
     const client = new RfbClient();
     assert.equal(client.baseUrl, 'http://127.0.0.1:8889');
   });
+  it('blank FORKD_URL falls back to the default (§2: unset or blank)', () => {
+    process.env.FORKD_URL = '   ';
+    try {
+      const client = new RfbClient();
+      assert.equal(client.baseUrl, 'http://127.0.0.1:8889');
+    } finally {
+      delete process.env.FORKD_URL;
+    }
+  });
   it('rejects ftp scheme', () => {
     assert.throws(() => new RfbClient({ baseUrl: 'ftp://x' }), Error);
   });
@@ -25,12 +34,24 @@ describe('RfbClient construction', () => {
 
 describe('Sandbox construction', () => {
   it('stores info and transport', () => {
-    const info = { id: 'sb-1', snapshot_tag: 'snap-1', guest_addr: '127.0.0.1:19998' };
+    const info = { id: 'sb-1', snapshot_tag: 'snap-1', guest_addr: '127.0.0.1:19998', created_at_unix: 123 };
     const sandbox = new Sandbox(info, {} as never, 'ndjson');
     assert.equal(sandbox.id, 'sb-1');
     assert.equal(sandbox.snapshotTag, 'snap-1');
     assert.equal(sandbox.guestAddr, '127.0.0.1:19998');
     assert.equal(sandbox.transport, 'ndjson');
+    assert.equal(sandbox.createdAtUnix, 123);
+    assert.equal(new Sandbox({ id: 'sb-2' }, {} as never, 'ndjson').createdAtUnix, null);
+  });
+  it('connect(sandbox, transport) overrides the handle transport (§3)', async () => {
+    const client = new RfbClient();
+    const handle = new Sandbox({ id: 'sb-1' }, {} as never, 'ndjson');
+    assert.equal((await client.connect(handle)).transport, 'ndjson');
+    assert.equal((await client.connect(handle, 'zbrt')).transport, 'zbrt');
+    await assert.rejects(
+      () => client.connect(handle, 'grpc'),
+      (e: Error) => e.constructor.name === 'ValidationError',
+    );
   });
   it('zbrt stream rejects pty before connecting', async () => {
     const info = { id: 'sb-1', guest_addr: '127.0.0.1:1' };

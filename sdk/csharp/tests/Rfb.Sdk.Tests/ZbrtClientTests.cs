@@ -206,7 +206,7 @@ public class EvalZbrtVectorTests
         }
     }
 
-    private static async Task<(Sandbox Sandbox, FakeHttpServer Controller)> NewSandboxOverZbrtAsync(
+    internal static async Task<(Sandbox Sandbox, FakeHttpServer Controller)> NewSandboxOverZbrtAsync(
         FakeZbrtServer guest)
     {
         var body = """{"id":"sb-1","snapshot_tag":"base","guest_addr":"__ADDR__","has_branched":false,"branch_count":0}"""
@@ -215,5 +215,66 @@ public class EvalZbrtVectorTests
         var client = new RfbClient(controller.Url, token: null);
         var sandboxes = await client.CreateSandbox("base", transport: "zbrt");
         return (sandboxes[0], controller);
+    }
+}
+
+/// <summary>
+/// ZBRT fail-closed contract for exec/stream: argc is a single header byte and
+/// payloads are u32-bounded, so both limits are validated locally — zero frames,
+/// no TCP connection (UNIFIED_API.md §4, PROTOCOL.md §3.2).
+/// </summary>
+public class ZbrtFailClosedTests
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+
+    [Fact]
+    public async Task Exec_And_Stream_ArgcOver255_FailClosedWithoutConnecting()
+    {
+        using var guest = new FakeZbrtServer();
+        var (sandbox, controller) = await EvalZbrtVectorTests.NewSandboxOverZbrtAsync(guest);
+        using (controller)
+        {
+            var argv = Enumerable.Range(0, 256).Select(i => $"a{i}").ToArray();
+            await Assert.ThrowsAsync<ValidationException>(() => sandbox.Exec(argv));
+            await Assert.ThrowsAsync<ValidationException>(() => sandbox.Stream(argv));
+            Assert.Equal(0, guest.AcceptCount); // fail closed — nothing reached the wire
+        }
+    }
+
+    [Fact]
+    public async Task Exec_StdinOver16MiB_FailsClosedWithoutConnecting()
+    {
+        using var guest = new FakeZbrtServer();
+        var (sandbox, controller) = await EvalZbrtVectorTests.NewSandboxOverZbrtAsync(guest);
+        using (controller)
+        {
+            await Assert.ThrowsAsync<ValidationException>(
+                () => sandbox.Exec(new[] { "cat" }, stdin: new byte[16 * 1024 * 1024 + 1]));
+            Assert.Equal(0, guest.AcceptCount);
+        }
+    }
+
+    [Fact]
+    public async Task Stream_Stop_BuffersStragglerOutput()
+    {
+        // Output frames arriving between Cancel and CancelAck are buffered and
+        // delivered by the following NextEvent calls (never dropped).
+        using var server = new FakeZbrtServer { EmitOutputBeforeCancelAck = true };
+        using var client = new ZbrtTcpClient(server.Address, Timeout);
+        await client.ConnectAsync();
+        var session = await client.StreamAsync(new[] { "cat" }, null);
+
+        var first = await session.NextEventAsync();
+        Assert.Equal(StreamEventKind.Stdout, first!.Kind);
+        Assert.Equal("hi\n"u8.ToArray(), first.Data);
+
+        await session.StopAsync();
+        var buffered = await session.NextEventAsync();
+        Assert.Equal(StreamEventKind.Stdout, buffered!.Kind);
+        Assert.Equal("late\n"u8.ToArray(), buffered.Data);
+
+        var exit = await session.NextEventAsync();
+        Assert.Equal(StreamEventKind.Exit, exit!.Kind);
+        Assert.Null(await session.NextEventAsync());
     }
 }

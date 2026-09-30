@@ -619,6 +619,10 @@ internal sealed class FakeZbrtServer : IDisposable
     /// <summary>Reason string of the last received Cancel frame (null = no reason flag).</summary>
     public string? LastCancelReason { get; private set; }
 
+    /// <summary>When true, Cancel is answered with one Output frame BEFORE the CancelAck
+    /// (exercises the stream stop-path straggler-output buffering).</summary>
+    public bool EmitOutputBeforeCancelAck { get; set; }
+
     /// <summary>Last Fs frame op + JSON args (PROTOCOL.md §3.3 null-key conformance).</summary>
     public byte LastFsOp { get; private set; }
     public string? LastFsJson { get; private set; }
@@ -747,6 +751,11 @@ internal sealed class FakeZbrtServer : IDisposable
                     {
                         var cancel = ZbrtFrameCodec.DecodeCancel(frame.Payload);
                         LastCancelReason = cancel.Reason;
+                        if (EmitOutputBeforeCancelAck)
+                        {
+                            await WriteAsync(stream, Output(frame.RequestId, 0, "late\n"));
+                        }
+
                         await WriteAsync(stream, new ZbrtFrame
                         {
                             Kind = ZbrtKind.CancelAck,

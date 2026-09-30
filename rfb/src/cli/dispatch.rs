@@ -107,7 +107,12 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
             Ok(())
         }
         ImageCommand::Build(args) => {
-            let value = image_build::build(&args.manifest, args.output.as_deref(), args.execute)?;
+            let value = image_build::build(
+                &args.manifest,
+                args.output.as_deref(),
+                args.execute,
+                args.force,
+            )?;
             render_output(json_out, value, "built".to_owned());
             Ok(())
         }

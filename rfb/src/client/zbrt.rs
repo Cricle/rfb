@@ -21,6 +21,7 @@
 //! executing the request). The control connection is opened lazily and closed
 //! when the owning `GuestSandbox` facade (and its clones) is dropped.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,9 @@ const MAX_ARGC: usize = u8::MAX as usize;
 /// Aggregate cap on one exec turn's captured output (mirrors the NDJSON
 /// response cap so a chatty guest cannot grow host memory without bound).
 const MAX_EXEC_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
+
+/// ZBRT v1 frame payload cap (`UNIFIED_API.md` §8: payload ≤ 16 MiB).
+const MAX_PAYLOAD_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
 
 /// Frame-count cap on one exec turn (mirrors the NDJSON response-row cap,
 /// `MAX_RESPONSE_LINES`): a guest that drips empty `Output` frames forever
@@ -189,6 +193,18 @@ impl ZbrtGuest {
         Ok(())
     }
 
+    /// ZBRT v1 payloads are u32-bounded at 16 MiB (`UNIFIED_API.md` §8):
+    /// reject an oversize exec payload locally (Validation, before the TCP
+    /// connection is opened) instead of failing at encode time as Transport.
+    fn validate_payload(len: usize) -> Result<(), RfbError> {
+        if len > MAX_PAYLOAD_BYTES {
+            return Err(RfbError::Validation(format!(
+                "exec payload exceeds the ZBRT limit of {MAX_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     /// Run one request/response exchange on the shared control connection,
     /// (re)connecting and Hello-ing as needed. Only failures that prove the
     /// request was never processed are retried on a fresh connection
@@ -279,6 +295,7 @@ impl ZbrtGuest {
         timeout_ms: u32,
     ) -> Result<GuestExecResult, RfbError> {
         Self::validate_argv(&argv)?;
+        Self::validate_payload(stdin.len())?;
         let request_id = Self::request_id();
         let payload = Execute {
             argv,
@@ -452,6 +469,7 @@ impl ZbrtGuest {
             started: false,
             terminal: false,
             cancel_sent: false,
+            pending: VecDeque::new(),
         })
     }
 }
@@ -464,13 +482,20 @@ pub(super) struct ZbrtStream {
     started: bool,
     terminal: bool,
     cancel_sent: bool,
+    /// Events buffered while draining the post-Cancel window in
+    /// [`stop`](Self::stop); delivered by [`next_event`](Self::next_event)
+    /// before any new frame is read (`UNIFIED_API.md` §5: 期间到的 Output 先缓冲).
+    pending: VecDeque<StreamEvent>,
 }
 
 impl ZbrtStream {
     /// Next stream event. The first poll synthesizes the `Started` event (ZBRT
-    /// has no started frame); `CancelAck` frames are skipped; peer close is a
-    /// clean end.
+    /// has no started frame); events buffered during `stop` are delivered
+    /// first; `CancelAck` frames are skipped; peer close is a clean end.
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent>, RfbError> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
         if self.terminal {
             return Ok(None);
         }
@@ -543,12 +568,17 @@ impl ZbrtStream {
         ))
     }
 
-    /// Idempotent stop: send `Cancel` targeting this request; the eventual
-    /// `CancelAck` is skipped by [`next_event`](Self::next_event).
+    /// Idempotent stop: send `Cancel` targeting this request and **wait for
+    /// the empty `CancelAck`** (`UNIFIED_API.md` §5), buffering any `Output`
+    /// frames that arrive before the ack for the next
+    /// [`next_event`](Self::next_event) call. An `Exit` arriving inside the
+    /// drain window is buffered as the terminal event; a guest `Error` frame
+    /// raises Remote; peer close ends the stream cleanly.
     pub(super) async fn stop(&mut self) -> Result<(), RfbError> {
         if self.terminal || self.cancel_sent {
             return Ok(());
         }
+        self.cancel_sent = true;
         let payload = Cancel {
             reason: Some("stop".to_owned()),
             target: Some(self.request_id),
@@ -562,7 +592,56 @@ impl ZbrtStream {
             payload,
         };
         ZbrtGuest::write_frame(&mut self.stream, &frame).await?;
-        self.cancel_sent = true;
-        Ok(())
+        loop {
+            let frame = match ZbrtGuest::read_frame(&mut self.stream, self.timeout).await {
+                Ok(frame) => frame,
+                Err(RfbError::Transport(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.terminal = true;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            ZbrtGuest::check_id(&frame, self.request_id)?;
+            match frame.kind {
+                Kind::CancelAck => return Ok(()),
+                Kind::Output => {
+                    let output = Output::decode(&frame.payload)
+                        .map_err(|_| decode_error("invalid Output payload"))?;
+                    let kind = match output.stream {
+                        0 => StreamEventKind::Stdout,
+                        1 => StreamEventKind::Stderr,
+                        other => {
+                            return Err(decode_error(format!("unknown output stream {other}")))
+                        }
+                    };
+                    self.pending.push_back(StreamEvent {
+                        kind,
+                        data: output.data,
+                        code: None,
+                    });
+                }
+                Kind::Exit => {
+                    let exit = Exit::decode(&frame.payload)
+                        .map_err(|_| decode_error("invalid Exit payload"))?;
+                    self.terminal = true;
+                    self.pending.push_back(StreamEvent {
+                        kind: StreamEventKind::Exit,
+                        data: Vec::new(),
+                        code: Some(exit.code),
+                    });
+                    return Ok(());
+                }
+                Kind::Error => {
+                    self.terminal = true;
+                    return Err(error_frame(&frame.payload));
+                }
+                _ => {
+                    return Err(decode_error(format!(
+                        "unexpected ZBRT frame kind {:?} during cancel",
+                        frame.kind
+                    )))
+                }
+            }
+        }
     }
 }

@@ -12,7 +12,7 @@
 //! `cargo`/`rustup`) are exercised only up to their pure rejection gates and
 //! documented here so the remaining lines are known to be tool-gated.
 
-use rfb::cli::error::{EXIT_IO, EXIT_VALIDATION};
+use rfb::cli::error::{EXIT_EXTERNAL, EXIT_IO, EXIT_VALIDATION};
 use rfb::cli::image_build::{
     build, build_static_runtime, check_kernel, image_diagnostics, init, inspect_rootfs, load,
     profile_summary, run_debugfs, safe_join, sha256, sha256_bytes, validate, ArtifactFile,
@@ -1222,7 +1222,7 @@ fn image_init_rejects_bad_sizes_and_existing_directories() {
 #[test]
 fn image_build_dry_run_reports_readiness_without_tools() {
     let (_dir, manifest) = valid_staging_tree();
-    let value = build(&manifest, None, false).expect("dry-run build succeeds");
+    let value = build(&manifest, None, false, false).expect("dry-run build succeeds");
 
     assert_eq!(value["ok"], true);
     assert_eq!(value["dry_run"], true);
@@ -1239,7 +1239,7 @@ fn image_build_dry_run_reports_readiness_without_tools() {
 
     // A caller-supplied output path is honored in the dry run.
     let custom = _dir.path().join("custom.img");
-    let value = build(&manifest, Some(&custom), false).expect("dry-run with output");
+    let value = build(&manifest, Some(&custom), false, false).expect("dry-run with output");
     assert_eq!(
         value["output"].as_str().expect("output present"),
         custom.to_string_lossy().as_ref()
@@ -1257,7 +1257,7 @@ fn image_build_dry_run_rejects_a_bad_manifest() {
             "staging": "staging", "files": [],
         }),
     );
-    let err = build(&manifest, None, false).expect_err("bad manifest rejected");
+    let err = build(&manifest, None, false, false).expect_err("bad manifest rejected");
     assert_eq!(err.code, EXIT_VALIDATION);
     assert!(err.message.contains("non-zero multiple of block_size"));
 }
@@ -1266,7 +1266,7 @@ fn image_build_dry_run_rejects_a_bad_manifest() {
 fn image_build_execute_requires_an_image_manifest() {
     let (_dir, manifest) = valid_staging_tree();
     let out = _dir.path().join("out.img");
-    let err = build(&manifest, Some(&out), true).expect_err("image required");
+    let err = build(&manifest, Some(&out), true, false).expect_err("image required");
     assert_eq!(err.code, EXIT_VALIDATION);
     assert!(err
         .message
@@ -1288,7 +1288,7 @@ fn image_build_execute_requires_a_non_empty_entrypoint() {
         }),
     );
     let out = dir.path().join("out.img");
-    let err = build(&manifest, Some(&out), true).expect_err("empty entrypoint rejected");
+    let err = build(&manifest, Some(&out), true, false).expect_err("empty entrypoint rejected");
     assert!(err
         .message
         .contains("requires a non-empty image entrypoint"));
@@ -1307,12 +1307,114 @@ fn image_build_execute_rejects_an_entrypoint_absent_from_files() {
         }),
     );
     let out = dir.path().join("out.img");
-    let err = build(&manifest, Some(&out), true)
+    let err = build(&manifest, Some(&out), true, false)
         .expect_err("absent entrypoint rejected before external tools");
     assert_eq!(err.code, EXIT_VALIDATION);
     assert!(err
         .message
         .contains("entrypoint is not present in staging files"));
+}
+
+/// Probe e2fsprogs without side effects (`-V` prints a version banner and
+/// exits). The execute-path tests below shell out for real mke2fs/debugfs.
+fn e2fsprogs_available() -> bool {
+    std::process::Command::new("mke2fs")
+        .arg("-V")
+        .output()
+        .is_ok()
+        && std::process::Command::new("debugfs")
+            .arg("-V")
+            .output()
+            .is_ok()
+}
+
+/// A staging manifest that reaches the real build: entrypoint present in the
+/// files, an 8 MiB image (large enough for mke2fs -t ext4), and an expected
+/// digest that can never match (drives the late failure of the atomicity
+/// test).
+fn executable_manifest_with_wrong_digest(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir.join("staging")).expect("staging directory");
+    let bytes = b"#!/bin/sh\nexit 0\n";
+    fs::write(dir.join("staging/init"), bytes).expect("write staging init");
+    let manifest_path = dir.join("manifest.json");
+    write_json(
+        &manifest_path,
+        &json!({
+            "format": "rfb-cli-staging/v1",
+            "image_size_bytes": 8 * 1024 * 1024,
+            "block_size": 4096,
+            "staging": "staging",
+            "files": [{
+                "path": "init", "size": bytes.len(),
+                "sha256": sha256_bytes(bytes), "source": "init",
+            }],
+            "image": {
+                "image_ref": "rfb-runtime", "transport": "vsock",
+                "entrypoint": ["/init"], "protocol": "rfb1", "arch": "x86_64",
+                "resources": {}, "digest": format!("sha256:{}", digest()),
+            },
+        }),
+    );
+    manifest_path
+}
+
+#[test]
+fn image_build_execute_refuses_to_overwrite_without_force() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let manifest = executable_manifest_with_wrong_digest(dir.path());
+    let out = dir.path().join("out.img");
+    fs::write(&out, b"previous good image").expect("seed a previous image");
+
+    let err = build(&manifest, Some(&out), true, false).expect_err("overwrite refused");
+    assert_eq!(err.code, EXIT_VALIDATION);
+    assert!(err
+        .message
+        .contains("refusing to overwrite existing output (use --force)"));
+    // The gate fires before any tool runs: the previous image is untouched.
+    assert_eq!(fs::read(&out).unwrap(), b"previous good image");
+}
+
+#[test]
+fn image_build_execute_publishes_atomically_on_a_late_failure() {
+    if !e2fsprogs_available() {
+        eprintln!("skipping: mke2fs/debugfs unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let manifest = executable_manifest_with_wrong_digest(dir.path());
+    let out = dir.path().join("out.img");
+    fs::write(&out, b"previous good image").expect("seed a previous image");
+
+    // The build runs to completion (mke2fs + debugfs injection + per-file
+    // verification) and fails at the final digest check. The image is built
+    // in a temp file beside the destination and published only on success,
+    // so the failure must leave the previous image byte-for-byte intact.
+    let err = build(&manifest, Some(&out), true, true).expect_err("digest mismatch");
+    assert_eq!(err.code, EXIT_EXTERNAL);
+    assert!(err.message.contains("image digest mismatch"));
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        b"previous good image",
+        "a failed --execute build replaced a good image"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn image_build_rejects_a_non_utf8_output_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().expect("temporary directory");
+    fs::create_dir_all(dir.path().join("staging")).expect("staging directory");
+    let manifest = write_staging_manifest(dir.path(), json!([]), Value::Null);
+    let bad = dir.path().join(OsStr::from_bytes(b"bad\xff.img"));
+
+    // The output path used to be silently retargeted to "image.img" via
+    // `unwrap_or`; it must fail validation instead.
+    let err = build(&manifest, Some(&bad), false, false).expect_err("non-UTF-8 rejected");
+    assert_eq!(err.code, EXIT_VALIDATION);
+    assert!(err.message.contains("valid UTF-8"));
 }
 
 #[test]

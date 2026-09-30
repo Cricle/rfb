@@ -37,8 +37,15 @@ public final class GuestStream implements AutoCloseable {
     }
 
     /**
-     * Read the next event. Returns null on clean close. The terminal
-     * {@code exit} event (with code, possibly null) is returned normally.
+     * Read the next event. Returns {@code null} once the stream closed
+     * cleanly (after the terminal {@code exit} event was delivered, or when
+     * the peer disconnected). The terminal {@code exit} event itself (with
+     * code, possibly null) is returned normally.
+     *
+     * @return the next event, or {@code null} after clean close
+     * @throws TransportError read failure or timeout
+     * @throws RemoteError    the guest sent an {@code error} line/frame
+     * @throws DecodeError    the guest sent an undecodable line/frame
      */
     public StreamEvent nextEvent() {
         if (ndjson != null) {
@@ -58,9 +65,14 @@ public final class GuestStream implements AutoCloseable {
     }
 
     /**
-     * Send input to the running stream. Only supported over the NDJSON
-     * transport; over ZBRT v1 raises {@link RemoteError}. Raises
+     * Send input to the running stream ({@code {"in": text}} on the wire).
+     * Only supported over the NDJSON transport; over ZBRT v1 there is no
+     * input channel, so the call raises {@link RemoteError}. Also raises
      * {@link RemoteError} after the stream terminated or was stopped.
+     *
+     * @param text input bytes (UTF-8) to forward to the stream
+     * @throws RemoteError ZBRT transport, or stream no longer running
+     * @throws TransportError write failure
      */
     public void sendInput(String text) {
         if (ndjson != null) {
@@ -70,7 +82,15 @@ public final class GuestStream implements AutoCloseable {
         throw new RemoteError("ZeroBoot V1 streams do not support input");
     }
 
-    /** Request termination; idempotent and safe after the exit event. */
+    /**
+     * Request termination; idempotent and safe after the exit event. NDJSON
+     * sends {@code {"action":"stop"}}; ZBRT sends a Cancel frame targeting
+     * this request's id and waits for the (empty) CancelAck, buffering any
+     * Output frames that arrive meanwhile (UNIFIED_API.md §5).
+     *
+     * @throws TransportError write/read failure while cancelling
+     * @throws RemoteError    the guest answered the cancel with an Error frame
+     */
     public void stop() {
         if (ndjson != null) {
             ndjson.stop();

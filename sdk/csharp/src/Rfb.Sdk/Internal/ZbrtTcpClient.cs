@@ -414,6 +414,7 @@ internal sealed class ZbrtStreamSession : IDisposable
 {
     private readonly ZbrtTcpClient _client;
     private readonly byte[] _requestId;
+    private readonly Queue<StreamEvent> _pending = new();
     private bool _terminal;
     private bool _stopped;
 
@@ -423,9 +424,15 @@ internal sealed class ZbrtStreamSession : IDisposable
         _requestId = requestId;
     }
 
-    /// <summary>Next stream event; Exit ends the session (subsequent calls return null).</summary>
+    /// <summary>Next stream event; Exit ends the session (subsequent calls return null).
+    /// Events buffered during a pending StopAsync are drained first.</summary>
     public async Task<StreamEvent?> NextEventAsync()
     {
+        if (_pending.Count > 0)
+        {
+            return _pending.Dequeue();
+        }
+
         if (_terminal)
         {
             return null;
@@ -499,9 +506,10 @@ internal sealed class ZbrtStreamSession : IDisposable
     }
 
     /// <summary>Idempotent stop: send Cancel (reason "stop") targeting this request
-    /// and await the CancelAck. Straggler Output/Exit frames for the cancelled
-    /// turn are skipped while waiting, mirroring the Python/Java baselines; the
-    /// caller's next NextEventAsync still delivers the terminal Exit.</summary>
+    /// and await the empty CancelAck. Output frames that arrive between the
+    /// Cancel and the CancelAck are buffered and delivered by the next
+    /// NextEventAsync calls (never dropped); an Exit frame marks the turn
+    /// terminal the same way — mirroring the Python baseline.</summary>
     public async Task StopAsync()
     {
         if (_terminal || _stopped)
@@ -523,6 +531,7 @@ internal sealed class ZbrtStreamSession : IDisposable
             catch (TransportException e) when (e.Message == "guest closed connection")
             {
                 // Clean close: the stream is over; the ack will never arrive.
+                _terminal = true;
                 return;
             }
 
@@ -542,9 +551,33 @@ internal sealed class ZbrtStreamSession : IDisposable
                 throw new RemoteException(message);
             }
 
-            if (frame.Kind == ZbrtKind.Output || frame.Kind == ZbrtKind.Exit)
+            if (frame.Kind == ZbrtKind.Output)
             {
+                // Buffer straggler output that arrives before the ack.
+                var (stream, data) = ZbrtFrameCodec.DecodeOutput(frame.Payload);
+                if (stream == 0)
+                {
+                    _pending.Enqueue(new StreamEvent(StreamEventKind.Stdout, data, null));
+                }
+                else if (stream == 1)
+                {
+                    _pending.Enqueue(new StreamEvent(StreamEventKind.Stderr, data, null));
+                }
+                else
+                {
+                    throw new DecodeException("invalid output stream");
+                }
+
                 continue;
+            }
+
+            if (frame.Kind == ZbrtKind.Exit)
+            {
+                // The turn already terminated: cancel is trivially complete.
+                var (code, _) = ZbrtFrameCodec.DecodeExit(frame.Payload);
+                _terminal = true;
+                _pending.Enqueue(new StreamEvent(StreamEventKind.Exit, [], code));
+                return;
             }
 
             throw new DecodeException($"expected CancelAck, got frame kind {(int)frame.Kind}");

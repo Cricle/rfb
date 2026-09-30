@@ -60,8 +60,15 @@ public final class GuestNdjsonStream {
         }
     }
 
-    /** Next raw event line; null on clean close. Marks the stream terminal on exit_code. */
+    /**
+     * Next raw event line; null on clean close or once the stream is terminal
+     * (the exit line was already delivered — later calls never block,
+     * mirroring Python {@code _NdjsonStream.next_event}).
+     */
     public JsonNode nextEvent() {
+        if (terminal) {
+            return null;
+        }
         JsonNode value = GuestNdjson.readLine(in);
         if (value == null) {
             return null;

@@ -288,6 +288,19 @@ fn client_new_rejects_invalid_base_url_as_validation() {
 }
 
 #[test]
+fn client_new_rejects_zero_timeout_as_validation() {
+    // UNIFIED_API.md §2: timeout_s must be > 0, else Validation.
+    let err = match RfbClient::new("http://127.0.0.1:8889", None, Duration::ZERO) {
+        Err(err) => err,
+        Ok(_) => panic!("zero timeout must be rejected"),
+    };
+    assert!(
+        matches!(err, RfbError::Validation(_)),
+        "expected Validation for a zero timeout, got {err:?}"
+    );
+}
+
+#[test]
 fn client_from_env_blank_forkd_url_falls_back_to_default() {
     // No other test in this binary reads FORKD_URL/FORKD_TOKEN, so mutating
     // the process environment here stays race-free.
@@ -381,6 +394,60 @@ async fn guest_stream_session_events_input_stop() {
         Err(RfbError::Remote(_))
     ));
     stream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn guest_stream_stop_then_send_input_is_remote_and_exit_code_null_terminates() {
+    // UNIFIED_API.md §5: send_input after stop raises Remote (the stop line
+    // must be the only follow-up on the wire) and §11: a signal-killed turn
+    // ends with {"exit_code":null} — the key being present terminates the
+    // stream with Exit(None) instead of hanging.
+    let guest = spawn_guest(|conn| {
+        let action = conn.recv().expect("stream request");
+        assert_eq!(action["action"], "stream");
+        conn.send(&json!({"stdout": "a"}));
+        let stop = conn.recv().expect("stop line");
+        assert_eq!(
+            stop["action"], "stop",
+            "no further write (e.g. input) may precede the stop"
+        );
+        conn.send(&json!({"exit_code": null}));
+    });
+    let (_client, sandbox) = connect_fake(&guest, GuestTransport::Ndjson).await;
+    let mut stream = sandbox
+        .stream(&["tail", "-f"], Some("/"), None, None)
+        .await
+        .unwrap();
+
+    let chunk = stream.next_event().await.unwrap().unwrap();
+    assert_eq!(chunk.kind, StreamEventKind::Stdout);
+    stream.stop().await.unwrap();
+    // send_input after stop raises Remote without touching the wire.
+    assert!(matches!(
+        stream.send_input("x").await,
+        Err(RfbError::Remote(_))
+    ));
+    // stop is idempotent: no second stop line is written.
+    stream.stop().await.unwrap();
+    // {"exit_code": null} terminates with an untyped exit code.
+    let exit = stream.next_event().await.unwrap().expect("terminal exit");
+    assert_eq!(exit.kind, StreamEventKind::Exit);
+    assert_eq!(exit.code, None, "null exit_code maps to Exit(None)");
+    assert!(stream.next_event().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn guest_eval_missing_status_defaults_to_zero() {
+    // UNIFIED_API.md §4: the eval exit code comes from `status` (legacy
+    // `exit_code`) and defaults to 0 when the guest sends neither.
+    let guest = spawn_guest(|conn| {
+        let _action = conn.recv().expect("eval request");
+        conn.send(&json!({"output": "2"}));
+    });
+    let (_client, sandbox) = connect_fake(&guest, GuestTransport::Ndjson).await;
+    let result = sandbox.eval("1+1", None, None).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stdout, b"2");
 }
 
 #[tokio::test]
@@ -710,6 +777,72 @@ async fn zbrt_hello_first_and_control_connection_reuse() {
             "conn1 fs".to_owned(),
         ],
         "every connection must start with Hello; health/fs must reuse one control connection"
+    );
+}
+
+#[tokio::test]
+async fn zbrt_stop_buffers_output_before_cancelack() {
+    // UNIFIED_API.md §5: stop sends Cancel (target = this request id) and
+    // waits for the empty CancelAck; Output frames arriving inside the drain
+    // window are buffered and delivered by the next next_event call.
+    let server = spawn_zbrt(move |frame| {
+        let rid = frame.request_id;
+        match frame.kind {
+            Kind::Execute => vec![],
+            Kind::Cancel => vec![zout(rid, 0, b"late"), zcancelack(rid), zexit(rid, 0)],
+            _ => vec![zerror(rid, 1, "unexpected")],
+        }
+    });
+    let (_client, sandbox) = connect_fake(&server, GuestTransport::Zbrt).await;
+    let mut stream = sandbox
+        .stream(&["tail", "-f"], Some("/"), None, None)
+        .await
+        .unwrap();
+
+    let started = stream.next_event().await.unwrap().unwrap();
+    assert_eq!(started.kind, StreamEventKind::Started);
+    stream.stop().await.unwrap();
+    // The Output frame that raced the CancelAck is buffered, not lost.
+    let chunk = stream.next_event().await.unwrap().unwrap();
+    assert_eq!(chunk.kind, StreamEventKind::Stdout);
+    assert_eq!(chunk.data, b"late");
+    // stop() must have blocked until the CancelAck: the Exit frame was only
+    // written by the server AFTER the ack, so reading it next proves order.
+    let exit = stream.next_event().await.unwrap().unwrap();
+    assert_eq!(exit.kind, StreamEventKind::Exit);
+    assert_eq!(exit.code, Some(0));
+    assert!(stream.next_event().await.unwrap().is_none());
+    // Idempotent stop and Remote send_input after the terminal.
+    stream.stop().await.unwrap();
+    assert!(matches!(
+        stream.send_input("x").await,
+        Err(RfbError::Remote(_))
+    ));
+}
+
+#[tokio::test]
+async fn zbrt_exec_oversize_stdin_fails_closed_without_connecting() {
+    // UNIFIED_API.md §4/§8: the ZBRT payload cap is 16 MiB; an oversize exec
+    // payload is a local Validation error before any TCP connection.
+    let connections = Arc::new(AtomicUsize::new(0));
+    let addr = FakeZbrt::new()
+        .count_connections(connections.clone())
+        .spawn();
+    let (_client, sandbox) = connect_fake(&addr, GuestTransport::Zbrt).await;
+
+    let stdin = vec![0u8; 16 * 1024 * 1024 + 1];
+    let err = sandbox
+        .exec(&["cat"], "/", 60.0, &stdin)
+        .await
+        .expect_err("oversize stdin must be rejected");
+    assert!(
+        matches!(err, RfbError::Validation(_)),
+        "expected Validation for an oversize ZBRT payload, got {err:?}"
+    );
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "zero TCP connections for an oversize payload"
     );
 }
 

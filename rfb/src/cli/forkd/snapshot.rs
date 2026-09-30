@@ -198,7 +198,11 @@ fn resolve_asset(
         let dir = resx.join(subdir);
         let preferred_path = dir.join(preferred);
         if preferred_path.is_file() {
-            verify_resx_checksum(&preferred_path, label)?;
+            // Same gate as the explicit/env branches: a resx candidate is an
+            // asset like any other, so a zero-byte or checksum-mismatched
+            // file must not be selected where an explicit path would be
+            // rejected.
+            require_asset(&preferred_path, label)?;
             accept(&preferred_path)?;
             return Ok(preferred_path);
         }
@@ -210,7 +214,7 @@ fn resolve_asset(
                 .collect();
             files.sort();
             if let Some(path) = files.into_iter().next() {
-                verify_resx_checksum(&path, label)?;
+                require_asset(&path, label)?;
                 accept(path.as_path())?;
                 return Ok(path);
             }

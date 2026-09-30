@@ -95,10 +95,25 @@ export interface StreamEvent {
   code: number | null;
 }
 
-/** Interactive stream handle (UNIFIED_API.md §5). */
+/** Interactive stream handle (§5). Consumed with `await for` over
+ * `nextEvent()`, or event-by-event; `null` marks a clean close. */
 export interface GuestStream {
+  /**
+   * Next event, or `null` once the stream closed cleanly (after the terminal
+   * exit, or when the peer disconnected). Over ZBRT the first event is a
+   * client-synthesized `started` (the wire has no started frame).
+   *
+   * @throws {RemoteError} Guest error line / Error frame / input after end.
+   * @throws {TransportError} Connection failure or read stall.
+   * @throws {DecodeError} Malformed frame or line.
+   */
   nextEvent(): Promise<StreamEvent | null>;
+  /**
+   * Send one stdin payload (NDJSON only; ZBRT v1 has no input channel →
+   * {@link RemoteError}). After a terminal exit or `stop()` → {@link RemoteError}.
+   */
   sendInput(text: string): Promise<void>;
+  /** Idempotently ask the guest to terminate the stream; the exit event follows. */
   stop(): Promise<void>;
 }
 
@@ -183,7 +198,21 @@ export class Sandbox {
     this.#guestTimeoutMs = guestTimeoutMs;
   }
 
-  /** Guest health check: true only when pong=true. */
+  /** Creation time from the controller, or null when absent (§4 readonly props). */
+  get createdAtUnix(): number | null {
+    return typeof this.info.created_at_unix === 'number' ? this.info.created_at_unix : null;
+  }
+
+  /**
+   * Guest health check (§4): `true` only when the agent answers `pong=true`
+   * (NDJSON ignores the extra `healthy`/`protocol_version` keys; ZBRT uses
+   * the HealthAck `healthy` flag).
+   *
+   * @returns `true` when the guest answers healthy.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} The agent reported an error.
+   * @throws {DecodeError} Malformed response.
+   */
   async ping(): Promise<boolean> {
     if (this.transport === TRANSPORT_ZBRT) {
       const conn = await this.#zbrt();
@@ -197,18 +226,42 @@ export class Sandbox {
     return last?.pong === true;
   }
 
+  /**
+   * Run one command in the guest (§4). All validation is local and fail
+   * closed: empty/non-string argv, bad cwd or timeout raise
+   * {@link ValidationError} before any frame; non-empty `stdin` over NDJSON
+   * (no stdin channel on that wire) and ZBRT argc > 255 / oversized stdin are
+   * rejected before a single frame — for ZBRT before the TCP connect itself.
+   * A missing or non-integer `exit_code` decodes to `-1`; legacy agents'
+   * `out`/`err` keys are accepted with the current keys taking precedence.
+   *
+   * @param args Command + arguments (non-empty string array).
+   * @param options Optional: `cwd` (default `/workspace`), `timeoutS`
+   *   (default 60), `stdin` (bytes, ZBRT only).
+   * @returns The unified exec result (stdout/stderr bytes + `stdoutText`/
+   *   `stderrText` UTF-8 replace decoding, `timedOut`).
+   * @throws {ValidationError} Local pre-send validation failed.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame / output over 16 MiB.
+   * @throws {DecodeError} Malformed response.
+   */
   async exec(args: readonly string[], options: ExecOptions = {}): Promise<ExecResult> {
     const { cwd = '/workspace', timeoutS = 60, stdin = null } = options;
     validation.argv(args);
     validation.filePath(cwd);
     validation.timeoutS(timeoutS);
     if (this.transport === TRANSPORT_ZBRT) {
+      // §4: argc and the stdin payload are rejected locally, BEFORE any
+      // connection is opened (fail closed, zero frames — not even TCP).
+      validation.zbrtArgs(args);
+      const stdinBytes = stdin ?? Buffer.alloc(0);
+      validation.payloadSize(stdinBytes.byteLength, validation.MAX_ZBRT_PAYLOAD_BYTES);
       const conn = await this.#zbrt();
       try {
         const exec = await conn.execute(
           args,
           cwd,
-          stdin ?? Buffer.alloc(0),
+          stdinBytes,
           zbrtTimeoutMs(timeoutS),
         );
         return this.#execResult(exec.code, exec.stdout, exec.stderr, exec.timedOut);
@@ -238,7 +291,23 @@ export class Sandbox {
     return this.#execResult(statusCode(last, -1), valueBytes(firstOf(last, 'stdout', 'out')), valueBytes(firstOf(last, 'stderr', 'err')), last.timed_out === true);
   }
 
-  /** Evaluate a code snippet; output maps to stdout. */
+  /**
+   * Evaluate a code snippet in the guest (§4): the agent's output maps to
+   * `stdout`, `stderr` is always empty and the exit code comes from `status`
+   * (legacy `exit_code` alias; default 0 when missing/non-integer). Over ZBRT
+   * this fails closed with {@link ValidationError} before any frame — ZBRT v1
+   * has no eval opcode.
+   *
+   * @param code Code to evaluate (non-empty after trim, ≤ 1 MiB).
+   * @param options Optional: `cwd` (guest default when null), `timeoutS`
+   *   (no deadline when null).
+   * @returns The unified result with `stderr` empty.
+   * @throws {ValidationError} Empty/oversized code, bad cwd/timeout, or eval
+   *   over ZBRT.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line.
+   * @throws {DecodeError} Malformed response.
+   */
   async eval(code: string, options: EvalOptions = {}): Promise<ExecResult> {
     validation.evalCode(code);
     if (options.cwd !== undefined && options.cwd !== null) validation.filePath(options.cwd);
@@ -273,7 +342,16 @@ export class Sandbox {
     );
   }
 
-  /** List directory entries (default path "."). */
+  /**
+   * List directory entries under `path` (§4; default `"."`, max 1000 entries).
+   *
+   * @param path Guest fs path (relative or under `/workspace`).
+   * @returns Entries with `name`/`isDir`/`size`.
+   * @throws {ValidationError} Invalid path.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame.
+   * @throws {DecodeError} Malformed or missing `entries`.
+   */
   async ls(path = '.'): Promise<DirEntry[]> {
     validation.fsPath(path);
     if (this.transport === TRANSPORT_ZBRT) {
@@ -291,7 +369,17 @@ export class Sandbox {
     return this.#parseLs(last);
   }
 
-  /** Find workspace paths matching a glob-ish pattern. */
+  /**
+   * Find workspace paths matching a glob-ish pattern (§4; max 1000 results).
+   *
+   * @param path Guest fs path (relative or under `/workspace`).
+   * @param pattern Non-empty, NUL-free pattern ≤ 1024 bytes.
+   * @returns Matching guest paths as strings.
+   * @throws {ValidationError} Invalid path or pattern.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame.
+   * @throws {DecodeError} Malformed or missing `matches`.
+   */
   async find(path: string, pattern: string): Promise<string[]> {
     validation.fsPath(path);
     validation.pattern(pattern);
@@ -311,7 +399,17 @@ export class Sandbox {
     return this.#parseFind(last);
   }
 
-  /** Grep file contents; matches carry path/line/column/text. */
+  /**
+   * Grep file contents (§4; max 1000 matches / 50 KiB of results).
+   *
+   * @param path Guest fs path (relative or under `/workspace`).
+   * @param pattern Non-empty, NUL-free pattern ≤ 1024 bytes.
+   * @returns Matches with `path`/`line`/`column`/`text`.
+   * @throws {ValidationError} Invalid path or pattern.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame.
+   * @throws {DecodeError} Malformed or missing `matches`.
+   */
   async grep(path: string, pattern: string): Promise<GrepMatch[]> {
     validation.fsPath(path);
     validation.pattern(pattern);
@@ -332,7 +430,20 @@ export class Sandbox {
     return this.#parseGrep(last);
   }
 
-  /** Read a guest file: `{data, truncated, totalBytes}`. */
+  /**
+   * Read a guest file (§4): `{data, truncated, totalBytes}`. `maxBytes` must
+   * be within `1..51200` when given; absent `offset`/`maxBytes` ride the wire
+   * as null (ZBRT) or omitted keys (NDJSON), letting the guest apply its own
+   * default.
+   *
+   * @param path Guest file path (relative or absolute, non-escaping).
+   * @param options Optional: `offset`, `maxBytes` (1..51200).
+   * @returns The file bytes plus truncation info.
+   * @throws {ValidationError} Invalid path or out-of-range `maxBytes`.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame.
+   * @throws {DecodeError} Malformed response.
+   */
   async read(path: string, options: ReadOptions = {}): Promise<FileRead> {
     validation.filePath(path);
     // No implicit cap: absent max_bytes rides the wire as null (PROTOCOL.md
@@ -363,7 +474,19 @@ export class Sandbox {
     };
   }
 
-  /** Write (or append to) a guest file; returns bytes_written. */
+  /**
+   * Write (or append to) a guest file (§4): payload ≤ 51200 bytes; returns
+   * the guest's `bytes_written` (missing key → {@link DecodeError}).
+   *
+   * @param path Guest file path (relative or absolute, non-escaping).
+   * @param data Bytes (or UTF-8 string) to write.
+   * @param options Optional: `append` (default false).
+   * @returns Bytes written as reported by the guest.
+   * @throws {ValidationError} Invalid path or oversized payload.
+   * @throws {TransportError} Connection failure, read stall or timeout.
+   * @throws {RemoteError} Guest error line / Error frame.
+   * @throws {DecodeError} Malformed response / missing `bytes_written`.
+   */
   async write(path: string, data: Uint8Array | string, options: WriteOptions = {}): Promise<number> {
     validation.filePath(path);
     const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
@@ -393,7 +516,21 @@ export class Sandbox {
     return last.bytes_written;
   }
 
-  /** Interactive stream over the sandbox transport. */
+  /**
+   * Open an interactive stream (§5). Fail closed before any frame: empty or
+   * non-string argv is rejected on both transports; over ZBRT `pty=true` or a
+   * non-empty `env` (and argc > 255) raise {@link ValidationError} before the
+   * TCP connect.
+   *
+   * @param args Command + arguments (non-empty string array).
+   * @param options Optional: `cwd` (guest default when null), `pty`
+   *   (NDJSON only), `env` (NDJSON only).
+   * @returns A {@link GuestStream} yielding started/stdout/stderr/exit events.
+   * @throws {ValidationError} Local pre-send validation failed.
+   * @throws {TransportError} Connection failure or read stall.
+   * @throws {RemoteError} Guest error line / Error frame / handshake failure.
+   * @throws {DecodeError} Malformed response.
+   */
   async stream(args: readonly string[], options: StreamOptions = {}): Promise<GuestStream> {
     validation.argv(args);
     const cwd = options.cwd ?? null;
@@ -408,6 +545,8 @@ export class Sandbox {
       if (env !== null && Object.keys(env).length > 0) {
         throw new ValidationError('env is not supported over the ZBRT transport');
       }
+      // Fail closed before any connection: ZBRT encodes argc in one byte.
+      validation.zbrtArgs(args);
       const conn = await this.#zbrt();
       const session = await conn.openStreamSession(args, cwd, Buffer.alloc(0), 0);
       return new ZbrtGuestStream(conn, session);
@@ -421,7 +560,13 @@ export class Sandbox {
     return new NdjsonGuestStream(this.guestAddr, action, this.#guestTimeoutMs);
   }
 
-  /** Delete the sandbox via the controller (2xx and 404 are both success). */
+  /**
+   * Delete this sandbox via the controller (§4: 2xx and 404 are both success).
+   *
+   * @throws {ValidationError} Malformed sandbox id.
+   * @throws {TransportError} Connection failure or timeout.
+   * @throws {HttpStatusError} Non-2xx, non-404 controller answer.
+   */
   async delete(): Promise<void> {
     await this.#client.deleteSandbox(this.id);
   }
@@ -467,7 +612,12 @@ export class Sandbox {
     if (!Array.isArray(matches)) {
       throw new DecodeError('guest response is missing matches');
     }
-    return matches.map((match: unknown) => String(match));
+    // Mirror the Python facade: find matches must be strings — coercing a
+    // non-string entry would hide a decode divergence.
+    if (!matches.every((match) => typeof match === 'string')) {
+      throw new DecodeError('find matches must be strings');
+    }
+    return matches.map((match: string) => match);
   }
 
   #parseGrep(last: Record<string, unknown>): GrepMatch[] {
@@ -499,7 +649,9 @@ export class Sandbox {
       exitCode,
       stdout,
       stderr,
-      stdoutText: stdout.toString('utf8').trimEnd(),
+      // §6: UTF-8 replace decoding only — no trimming (mirrors Python's
+      // stdout_text / the Rust baseline).
+      stdoutText: stdout.toString('utf8'),
       stderrText: stderr.toString('utf8'),
       timedOut,
     };

@@ -611,17 +611,28 @@ fn forkd_error(error: ForkdGuestError) -> SandboxError {
     }
 }
 
-fn forkd_stream_event(value: serde_json::Value) -> Result<core_guest::StreamEvent, SandboxError> {
-    if value.get("started").and_then(serde_json::Value::as_bool) == Some(true)
-        || value.get("stream").and_then(serde_json::Value::as_str) == Some("started")
-        || value.get("event").and_then(serde_json::Value::as_str) == Some("started")
-    {
-        return Ok(core_guest::StreamEvent::Started);
-    }
-    if let Some(code) = value.get("exit_code").and_then(serde_json::Value::as_i64) {
+/// Map one forkd NDJSON stream line to the unified event type. Test hook
+/// (`#[doc(hidden)]`, same pattern as the ZeroBootSession accessors): the
+/// key-precedence contract it implements is asserted from the forkd suites.
+#[doc(hidden)]
+pub fn forkd_stream_event(
+    value: serde_json::Value,
+) -> Result<core_guest::StreamEvent, SandboxError> {
+    // Key precedence mirrors `crate::client::ndjson::stream_event` (the
+    // Python reference's `_NdjsonStream.next_event`): exit_code first, then
+    // stdout/out, stderr/err, then started.
+    //
+    // UNIFIED_API.md §11 / PROTOCOL.md §2.5: a signal-killed turn ends with
+    // `{"exit_code":null}` — the KEY being present terminates the stream and
+    // a null value maps to Exit(None); it must not be skipped as an
+    // unrecognized line or the stream would hang past the turn's end.
+    if value.get("exit_code").is_some() {
         return Ok(core_guest::StreamEvent::Exit {
             // Wraparound would turn a huge failure code into 0 ("success").
-            code: Some(i32::try_from(code).unwrap_or(-1)),
+            code: value
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map(|code| i32::try_from(code).unwrap_or(-1)),
         });
     }
     if value.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -641,6 +652,12 @@ fn forkd_stream_event(value: serde_json::Value) -> Result<core_guest::StreamEven
                 core_guest::StreamEvent::Stdout { data }
             });
         }
+    }
+    if value.get("started").and_then(serde_json::Value::as_bool) == Some(true)
+        || value.get("stream").and_then(serde_json::Value::as_str) == Some("started")
+        || value.get("event").and_then(serde_json::Value::as_str) == Some("started")
+    {
+        return Ok(core_guest::StreamEvent::Started);
     }
     Err(SandboxError::Execution("invalid guest stream event".into()))
 }

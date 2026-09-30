@@ -14,7 +14,7 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::codec::{read_frame, write_frame, Frame, FrameCodec, MessageType};
 #[cfg(unix)]
-use crate::session::{control_type, ControlMessage, RuntimeMessage};
+use crate::session::{control_type, ControlMessage, RuntimeMessage, FILE_RPC_MAX_BYTES};
 
 /// A validated host-side vsock endpoint for one guest.
 ///
@@ -529,10 +529,14 @@ impl SharedHostSession {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VsockClientError> {
         validate_relative_path(path)?;
-        if max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
-            return Err(VsockClientError::InvalidArgument(
-                "invalid file size limit".into(),
-            ));
+        // Aligned with the guest executor's enforcement
+        // (`crate::session::FILE_RPC_MAX_BYTES`, workspace_executor uses the
+        // same constant): a read above the guest's cap would be advertised as
+        // legal here and then fail remotely with an opaque error.
+        if max_bytes == 0 || max_bytes > FILE_RPC_MAX_BYTES {
+            return Err(VsockClientError::InvalidArgument(format!(
+                "invalid file size limit: max {FILE_RPC_MAX_BYTES} bytes"
+            )));
         }
         let request_id = format!("rfb-web-{}", Uuid::now_v7());
         let mut session = self.0.lock().await;
@@ -1084,10 +1088,14 @@ impl VsockGuestClient {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VsockClientError> {
         validate_relative_path(path)?;
-        if max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
-            return Err(VsockClientError::InvalidArgument(
-                "invalid file size limit".into(),
-            ));
+        // Aligned with the guest executor's enforcement
+        // (`crate::session::FILE_RPC_MAX_BYTES`): a read above the guest's cap
+        // must be rejected here, not advertised as legal and then fail
+        // remotely with an opaque error.
+        if max_bytes == 0 || max_bytes > FILE_RPC_MAX_BYTES {
+            return Err(VsockClientError::InvalidArgument(format!(
+                "invalid file size limit: max {FILE_RPC_MAX_BYTES} bytes"
+            )));
         }
         let request_id = format!("rfb-web-{}", Uuid::now_v7());
         let mut client = self.begin().await?;

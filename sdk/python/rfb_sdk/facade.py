@@ -262,8 +262,9 @@ class Sandbox:
     def exec(self, args, cwd: str = "/workspace", timeout_s: float = DEFAULT_EXEC_TIMEOUT_S, stdin=b""):
         validate_argv(args)
         validate_guest_cwd(cwd)
-        if timeout_s is not None:
-            validate_timeout(timeout_s, "exec timeout")
+        if timeout_s is None:
+            timeout_s = DEFAULT_EXEC_TIMEOUT_S  # None = the §8 default
+        validate_timeout(timeout_s, "exec timeout")
         stdin = stdin.encode("utf-8") if isinstance(stdin, str) else bytes(stdin)
         if self._transport != "zbrt" and stdin:
             # The NDJSON wire has no exec stdin channel: non-empty stdin would

@@ -4,12 +4,19 @@
  */
 import { ValidationError } from './errors.js';
 
+export const TRANSPORT_NDJSON = 'ndjson';
+export const TRANSPORT_ZBRT = 'zbrt';
+
 export const MAX_GUEST_PATH_BYTES = 4096;
 export const MAX_GUEST_PATTERN_BYTES = 1024;
 export const MAX_GUEST_RESULTS = 1000;
 export const MAX_GUEST_RESULT_BYTES = 50 * 1024;
 export const MAX_GUEST_CODE_BYTES = 1024 * 1024;
 export const MAX_LINE_BYTES = 1024 * 1024;
+// ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded and the
+// reference guest enforces a 16 MiB cap on every frame payload (§8).
+export const MAX_ZBRT_ARGC = 255;
+export const MAX_ZBRT_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
 function isWorkspacePath(path: string): boolean {
   return path === '/workspace' || path.startsWith('/workspace/');
@@ -108,9 +115,27 @@ export function argv(args: readonly string[]): void {
   }
 }
 
+/** Guest transport name (§3): "ndjson" | "zbrt". */
+export function transport(value: string): void {
+  if (value !== TRANSPORT_NDJSON && value !== TRANSPORT_ZBRT) {
+    throw new ValidationError(`invalid transport: ${value}`);
+  }
+}
+
 /** exec timeout: positive finite seconds. */
 export function timeoutS(value: number): void {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new ValidationError('exec timeout must be a positive, finite number of seconds');
+  }
+}
+
+/**
+ * ZBRT v1 encodes argc in one byte: reject locally (fail closed, zero frames
+ * — not even the TCP connect) instead of leaking a codec error after the
+ * connection is already open. Mirrors Python `validate_zbrt_args`.
+ */
+export function zbrtArgs(args: readonly string[]): void {
+  if (args.length > MAX_ZBRT_ARGC) {
+    throw new ValidationError(`argv exceeds the ${MAX_ZBRT_ARGC}-argument ZBRT limit`);
   }
 }

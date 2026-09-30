@@ -95,27 +95,56 @@ public sealed class SandboxInfo
     [JsonPropertyName("has_branched")]
     public bool HasBranched { get; set; }
 
-    /// <summary>Number of branches spawned from this sandbox.</summary>
+    /// <summary>Number of branches spawned from this sandbox (serde(default):
+    /// a null or missing wire value reads as 0).</summary>
     [JsonPropertyName("branch_count")]
+    [JsonConverter(typeof(LongDefaultZeroConverter))]
     public long BranchCount { get; set; }
 }
 
+/// <summary>
+/// Reads a JSON number that may be null as 0 (serde(default) semantics — a
+/// null must not fail deserialization of the whole response).
+/// </summary>
+internal sealed class LongDefaultZeroConverter : JsonConverter<long>
+{
+    public override long Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        reader.TokenType == JsonTokenType.Null ? 0 : reader.GetInt64();
+
+    public override void Write(Utf8JsonWriter writer, long value, JsonSerializerOptions options) =>
+        writer.WriteNumberValue(value);
+}
+
 /// <summary>Unified result of exec/eval (UNIFIED_API.md §6).</summary>
+/// <param name="ExitCode">Process exit code (-1 when the guest omitted it).</param>
+/// <param name="Stdout">Captured stdout bytes (UTF-8 or byte array on the wire).</param>
+/// <param name="Stderr">Captured stderr bytes.</param>
+/// <param name="TimedOut">True when the guest reported a deadline miss.</param>
 public sealed record ExecResult(int ExitCode, byte[] Stdout, byte[] Stderr, bool TimedOut)
 {
-    /// <summary>stdout decoded as UTF-8 text.</summary>
+    /// <summary>stdout decoded as UTF-8 text (replacement fallback).</summary>
     public string StdoutText => Encoding.UTF8.GetString(Stdout);
-    /// <summary>stderr decoded as UTF-8 text.</summary>
+    /// <summary>stderr decoded as UTF-8 text (replacement fallback).</summary>
     public string StderrText => Encoding.UTF8.GetString(Stderr);
 }
 
 /// <summary>One directory entry returned by ls (UNIFIED_API.md §6).</summary>
+/// <param name="Name">Entry name.</param>
+/// <param name="IsDir">True for directories (default false).</param>
+/// <param name="Size">Entry size in bytes, when reported.</param>
 public sealed record DirEntry(string Name, bool IsDir, long? Size);
 
 /// <summary>One grep match with optional location (UNIFIED_API.md §6).</summary>
+/// <param name="Path">Guest path of the matching file.</param>
+/// <param name="Line">1-based line number, when reported.</param>
+/// <param name="Column">1-based column number, when reported.</param>
+/// <param name="Text">Matching line text.</param>
 public sealed record GrepMatch(string Path, long? Line, long? Column, string Text);
 
 /// <summary>Result of a guest file read (UNIFIED_API.md §6).</summary>
+/// <param name="Data">File bytes (missing on the wire reads as empty).</param>
+/// <param name="Truncated">True when the read hit the max_bytes cap (default false).</param>
+/// <param name="TotalBytes">Total file size, when reported.</param>
 public sealed record FileRead(byte[] Data, bool Truncated, long? TotalBytes);
 
 /// <summary>Stream event kind: started | stdout | stderr | exit.</summary>
@@ -132,4 +161,7 @@ public enum StreamEventKind
 }
 
 /// <summary>One event from an interactive guest stream (UNIFIED_API.md §5).</summary>
+/// <param name="Kind">Event kind.</param>
+/// <param name="Data">Chunk bytes (empty for started/exit events).</param>
+/// <param name="Code">Exit code; non-null only for exit events.</param>
 public sealed record StreamEvent(StreamEventKind Kind, byte[] Data, int? Code);

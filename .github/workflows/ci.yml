@@ -1,9 +1,11 @@
 name: CI
 
-# 同一 ref 的新推送会取消旧跑（PR 迭代场景），避免排队浪费。
+# 同一 ref 的新推送会取消旧跑（PR 迭代场景），避免排队浪费；手动
+# workflow_dispatch 不取消进行中的 push run（按事件名判定，否则在 main 上
+# 手动触发会取消正在跑的 push CI）。
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 # 触发约定：main 推送跑本工作流全部 job（含 e2e 真机）；PR 只跑 rust/sdk/msrv
 #（e2e job 有 if 门，真机分钟数不花在 PR 上）；
@@ -53,7 +55,9 @@ jobs:
       - name: Install system packages and toolchain components
         run: |
           apt-get update
-          apt-get install -y libffi-dev e2fsprogs musl-tools
+          # python3：check-boundary.sh 的依赖方向断言在 CI 里必须真正执行
+          #（该脚本对 CI=true + 工具缺失是硬失败，见其降级策略）。
+          apt-get install -y libffi-dev e2fsprogs musl-tools python3
           rustup component add rustfmt clippy
       # build_script_bakes_files_and_rust_apps_into_a_real_image（cli.rs）是
       # 工具门控测试：有 cargo+musl target+mke2fs/debugfs 才会真正执行
@@ -293,6 +297,37 @@ jobs:
       - name: cargo check –all-features
         run: cargo check --workspace --all-features --locked
 
+  # minimal-dist（split-minimal.sh 切出的 forkd-only 源树）作为 Release 资产
+  # 发布给 SDK 使用者，但此前从未在本工作流里被编译过——切错（漏文件/坏引用）
+  # 只会烂在使用者手里。这里对切出结果跑 --check 门禁（目标目录
+  # /tmp/minimal-ci），容器与基础步骤与 rust job 同款。
+  minimal-split:
+    name: Minimal split check (forkd-only bundle)
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1-bookworm
+    # 容器 job 的默认 shell 是 sh（dash）：`set -o pipefail` 直接 Illegal
+    # option——所有步骤显式走 bash。
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install system packages and toolchain components
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3
+          # 官方镜像带 clippy/rustfmt 组件，这里幂等补一次（与 rust job 同款）。
+          rustup component add rustfmt clippy
+      - name: Minimal split --check
+        run: |
+          set -euo pipefail
+          # 第一个参数是切出目标目录（split-minimal.sh 的 TARGET=${1:-...}）。
+          bash scripts/split-minimal.sh --check /tmp/minimal-ci
+
   e2e:
     name: forkd real-VM E2E (KVM)
     if: github.event_name != 'pull_request'
@@ -348,7 +383,7 @@ jobs:
       # rustpython 镜像链）大头是依赖树；与 ci.yml 同款 rust-cache（同一
       # commit SHA）。key 含 Cargo.lock 哈希，依赖变更自动失效；target/
       # 下 musl 子目录一并覆盖。
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Verify resx checksums and install forkd binaries
         run: |

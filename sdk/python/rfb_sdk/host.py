@@ -121,27 +121,45 @@ def _pkill_all(pattern: str) -> None:
     subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
 
 
+_subreaper_started = threading.Lock()
+_subreaper_live = False
+
+
 def _become_child_subreaper() -> None:
     """PR_SET_CHILD_SUBREAPER: orphaned descendants (the `forkd snapshot`
     daemon's parent VM survives the binary that spawned it) reparent to US
     instead of a non-reaping init. Without this, a SIGKILLed parent VM sits
     in the process table as an unreapable zombie — and the controller's
-    shared-TAP gate counts every firecracker entry, zombie or live."""
-    try:
-        import ctypes
+    shared-TAP gate counts every firecracker entry, zombie or live. One
+    process-wide reaper thread serves every ForkdHost instance."""
+    global _subreaper_live
+    with _subreaper_started:
+        if _subreaper_live:
+            return
+        try:
+            import ctypes
 
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(36, 1)  # PR_SET_CHILD_SUBREAPER, 1
-        threading.Thread(target=_reap_loop, daemon=True).start()
-    except Exception:
-        pass  # hygiene, not correctness
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            if libc.prctl(36, 1) != 0:  # PR_SET_CHILD_SUBREAPER, 1
+                return  # unsupported platform: skip reaping entirely
+            threading.Thread(target=_reap_loop, daemon=True).start()
+            _subreaper_live = True
+        except Exception:
+            pass  # hygiene, not correctness
 
 
 def _reap_loop() -> None:
-    """Drain reparented zombies so the process table stays clean."""
+    """Drain reparented zombies so the process table stays clean.
+
+    waitpid(-1, WNOHANG) returns (0, 0) when children exist but none have
+    exited — that is the steady state for the whole stack lifetime, so it
+    MUST back off (an unguarded loop spins at ~2M iters/s on one core).
+    """
     while True:
         try:
-            os.waitpid(-1, os.WNOHANG)
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                time.sleep(0.2)
         except ChildProcessError:
             time.sleep(1)
         except OSError:
@@ -293,22 +311,27 @@ class TcpVsockRelay:
 
     def _bridge(self, client: socket.socket) -> None:
         with client:
-            try:
-                uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                uds.settimeout(10)
-                uds.connect(self.uds_path)
-                uds.sendall(f"CONNECT {self.guest_port}\n".encode())
-                line = b""
-                while not line.endswith(b"\n"):
-                    byte = uds.recv(1)
-                    if not byte:
-                        return  # startup race: the guest had not bound yet
-                    line += byte
-                if not line.startswith(b"OK "):
-                    return  # relay rejected (guest not listening, ...)
-            except OSError:
-                return
-            with uds:
+            # The with-block covers the WHOLE handshake: every failure path
+            # (relay not ready, rejected preamble, timeout) closes the UDS —
+            # the boot window alone tries ~60 connects, one leaked fd per
+            # attempt adds up fast.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as uds:
+                try:
+                    uds.settimeout(10)
+                    uds.connect(self.uds_path)
+                    uds.sendall(f"CONNECT {self.guest_port}\n".encode())
+                    line = b""
+                    while not line.endswith(b"\n"):
+                        if len(line) >= _RELAY_MAX_LINE_BYTES:
+                            return  # a relay must answer within one line
+                        byte = uds.recv(1)
+                        if not byte:
+                            return  # startup race: the guest had not bound yet
+                        line += byte
+                    if not line.startswith(b"OK "):
+                        return  # relay rejected (guest not listening, ...)
+                except OSError:
+                    return
                 _pump_bidirectional(client, uds, self._stop)
 
 
@@ -335,13 +358,15 @@ class ZerobootHost:
         self.tcp_port = int(port)
         self.tcp = f"{self.host}:{self.tcp_port}"
         self.run_dir = run_dir
-        # Asset names are the convention (override any of them by passing the
-        # explicit path instead of `assets_dir`).
-        self.firecracker = restore_asset(assets_dir, "firecracker",
-                                         f"{run_dir}/firecracker")
-        self.kernel = restore_asset(assets_dir, "vmlinux", f"{run_dir}/vmlinux")
-        self.rootfs = restore_asset(assets_dir, "zeroboot-zbrt.ext4",
-                                    f"{run_dir}/rootfs.ext4")
+        # Asset names are the convention; an explicit path overrides the
+        # assets-dir resolution per slot. Neither = a hard error (a None
+        # assets_dir would otherwise die with a raw TypeError).
+        self.firecracker = firecracker or restore_asset(
+            assets_dir, "firecracker", f"{run_dir}/firecracker")
+        self.kernel = kernel or restore_asset(
+            assets_dir, "vmlinux", f"{run_dir}/vmlinux")
+        self.rootfs = rootfs or restore_asset(
+            assets_dir, "zeroboot-zbrt.ext4", f"{run_dir}/rootfs.ext4")
         self.guest_cid = guest_cid
         self.guest_port = guest_port
         self.mem_size_mib = mem_size_mib
@@ -376,7 +401,14 @@ class ZerobootHost:
         pidfile = os.path.join(self.run_dir, "firecracker.pid")
         if os.path.exists(pidfile):
             try:
-                os.kill(int(open(pidfile).read().strip()), 15)
+                pid = int(open(pidfile).read().strip())
+                with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
+                    ident = cmdline.read().replace(b"\0", b" ").decode(
+                        "utf-8", "replace")
+                # Only signal what IS our firecracker: after a reboot the pid
+                # may belong to an unrelated process.
+                if "firecracker" in ident:
+                    os.kill(pid, 15)
             except (ValueError, OSError):
                 pass
             os.remove(pidfile)
@@ -393,11 +425,15 @@ class ZerobootHost:
             os.path.join(self.run_dir, "vm"),
             cid=self.guest_cid, uds_path=uds_path,
             mem_size_mib=self.mem_size_mib)
-        with open(os.path.join(self.run_dir, "firecracker.pid"), "w") as pid:
-            pid.write(str(self._process.pid))
-        self._relay = TcpVsockRelay(self.host, self.tcp_port, uds_path,
-                                    self.guest_port)
-        self._relay.start()
+        try:
+            with open(os.path.join(self.run_dir, "firecracker.pid"), "w") as pid:
+                pid.write(str(self._process.pid))
+            self._relay = TcpVsockRelay(self.host, self.tcp_port, uds_path,
+                                        self.guest_port)
+            self._relay.start()
+        except BaseException:
+            self.down()  # a failed bind must not leak a running VM
+            raise
         for _ in range(60):
             if self.alive():
                 return
@@ -450,14 +486,16 @@ class ForkdHost:
         self.bind = url.removeprefix("http://")
         self.tag = tag
         self.run_dir = run_dir
-        self.firecracker = restore_asset(assets_dir, "firecracker",
-                                         f"{run_dir}/firecracker")
-        self.kernel = restore_asset(assets_dir, "vmlinux", f"{run_dir}/vmlinux")
-        self.rootfs = restore_asset(assets_dir, "forkd-agent.ext4",
-                                    f"{run_dir}/rootfs.ext4")
-        self.controller_bin = restore_asset(assets_dir, "forkd-controller",
-                                            f"{run_dir}/forkd-controller")
-        self.forkd_bin = restore_asset(assets_dir, "forkd", f"{run_dir}/forkd")
+        self.firecracker = firecracker or restore_asset(
+            assets_dir, "firecracker", f"{run_dir}/firecracker")
+        self.kernel = kernel or restore_asset(
+            assets_dir, "vmlinux", f"{run_dir}/vmlinux")
+        self.rootfs = rootfs or restore_asset(
+            assets_dir, "forkd-agent.ext4", f"{run_dir}/rootfs.ext4")
+        self.controller_bin = controller_bin or restore_asset(
+            assets_dir, "forkd-controller", f"{run_dir}/forkd-controller")
+        self.forkd_bin = forkd_bin or restore_asset(
+            assets_dir, "forkd", f"{run_dir}/forkd")
         self.tap = tap
         self.snapshot_root = snapshot_root or default_snapshot_root()
         self._process = None
@@ -563,17 +601,20 @@ class ForkdHost:
             # The official forkd binary boots, pauses, stores and registers
             # the snapshot. The rootfs is copied per tag INTO THE SNAPSHOT
             # DATA DIR (the Rust reference's copy_rootfs_private: the copy is
-            # part of the snapshot's persistent state — a run-dir copy would
-            # leave the snapshot pointing at a deleted file) so the asset
-            # stays pristine and the snapshot survives run-dir wipes.
+            # part of the snapshot's persistent state — a run-dir copy dies
+            # with every run-dir wipe and leaves the snapshot pointing at a
+            # deleted file). Copy to a temp name + os.replace so a crash
+            # mid-copy can never leave a truncated rootfs behind.
             # --boot-wait-secs bounds the origin boot.
-            private_rootfs = os.path.join(self.run_dir,
-                                          f"{self.tag}-rootfs.ext4")
+            private_rootfs = os.path.join(self.snapshot_root, self.tag,
+                                          "rootfs.ext4")
             if not os.path.exists(private_rootfs):
                 import shutil
 
                 os.makedirs(os.path.dirname(private_rootfs), exist_ok=True)
-                shutil.copy(self.rootfs, private_rootfs)
+                staging = private_rootfs + ".partial"
+                shutil.copy(self.rootfs, staging)
+                os.replace(staging, private_rootfs)
             proc = subprocess.run(
                 [self.forkd_bin, "snapshot",
                  "--tag", self.tag,
@@ -596,7 +637,7 @@ class ForkdHost:
             # for the process table to drain before handing the stack over.
             _pkill_all("firecracker.*forkd-parent-")
             for _ in range(15):
-                probe = subprocess.run(["pgrep", "-f", "firecracker"],
+                probe = subprocess.run(["pgrep", "-f", "firecracker.*forkd-parent-"],
                                        capture_output=True)
                 if probe.returncode != 0:
                     break
@@ -613,6 +654,15 @@ class ForkdHost:
             self._process = None
         # The controller (SIGTERMed above) reaps its own VMs; the sweep only
         # force-kills what survived, and never SIGKILLs a VM while its
-        # parent might still reap it (see _pkill_all).
+        # parent might still reap it (see _pkill_all). The snapshot daemon
+        # goes down WITH the stack — its parent VM holds the shared TAP and
+        # jams every later create otherwise.
         _pkill_all("forkd-controller serve")
         _pkill_all(f"firecracker.*{self.run_dir}")
+        _pkill_all("forkd-daemon-")
+        import glob as _glob
+
+        for stale_dir in _glob.glob("/tmp/forkd-daemon-*"):
+            import shutil
+
+            shutil.rmtree(stale_dir, ignore_errors=True)

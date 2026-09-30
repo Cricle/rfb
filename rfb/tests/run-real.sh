@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-real.sh —— 真机 forkd E2E 本地驱动（tests/forkd_real_e2e.rs 的注释所
-# 承诺的入口）。与 .github/workflows/e2e.yml 走同一条序列：环境检查 →
+# 承诺的入口）。与 ci.yml 的 e2e job 走同一条序列：环境检查 →
 # /dev/kvm 检查 → 构建（可用环境变量跳过）→ 建 TAP → 启动 forkd-controller
 # → snapshot-create → 等 ready+bootable → 以 RFB_REAL_E2E=1 串行跑 #[ignore]
 # 测试 → trap 清理。适用 WSL2 / 原生 Linux。
@@ -16,7 +16,7 @@
 # "Kernel panic - not syncing: Fatal exception in interrupt"（PID 1 =
 # forkd-init.sh，console 见 child-*.console）。现象是所有 sandbox 的
 # guest agent 不可达（10.42.x.x ARP INCOMPLETE）。快照创建（全新 boot）
-# 不受影响。此类环境请以 GitHub KVM runner 的 e2e.yml 为准（那里 resume
+# 不受影响。此类环境请以 GitHub KVM runner 上 ci.yml 的 e2e job 为准（那里 resume
 # 正常）；本脚本用于原生 Linux / 未受影响的 WSL2。
 #
 # 退出码（与 docs 的退出码表一致）：
@@ -102,8 +102,7 @@ if [ -n "$MISSING" ]; then
   die12 "缺少工具:$MISSING（apt 装 musl-tools/e2fsprogs/binutils）"
 fi
 
-# firecracker：PATH 缺失时从 resx 安装 v1.12.1 到 /usr/local/bin（与 CI 的
-# e2e.yml 一致；版本门禁要求 v1.12.x，v1.16.1 会被拒绝）。
+# firecracker：PATH 缺失时从 resx 安装 v1.12.1 到 /usr/local/bin（与 ci.yml 的 e2e job 一致；版本门禁要求 v1.12.x，v1.16.1 会被拒绝）。
 if ! command -v firecracker >/dev/null 2>&1; then
   if [ -f "$WORKSPACE/resx/firecracker/firecracker-v1.12.1" ]; then
     log "firecracker 不在 PATH，从 resx 安装 v1.12.1 到 /usr/local/bin"
@@ -164,7 +163,7 @@ fi
 # ---- forkd-controller：独立 state/audit/pid，snapshot root 指向默认快照目录
 # （provenance 测试会从 $HOME/.local/share/forkd/snapshots/<tag> 读取产物）。
 # 注意：controller 必须带 serve 子命令，--state 是 JSON 文件路径、--bind 是
-# 监听地址（与 e2e.yml 保持一致；裸 --state-dir/--listen 会被 clap 拒绝）。
+# 监听地址（与 ci.yml 的 e2e job 保持一致；裸 --state-dir/--listen 会被 clap 拒绝）。
 mkdir -p "$RUN_DIR/controller/state" "$SNAPSHOT_ROOT"
 log "启动 forkd-controller serve（state=$RUN_DIR/controller/state/state.json）"
 "$CONTROLLER_BIN" serve \
@@ -228,7 +227,7 @@ log "快照 $TAG 就绪"
 
 # ---- 跑真机 E2E：三重门（unix+cli cfg / #[ignore] / RFB_REAL_E2E=1）。
 # --test-threads=1 是真机 E2E 的明确例外：真实 VM/快照栈无法安全并行，
-# 与 CI（e2e.yml）保持一致；仓库“测试默认并行”规则针对单元测试。
+# 与 CI（ci.yml 的 e2e job）保持一致；仓库“测试默认并行”规则针对单元测试。
 log "cargo test --test forkd_real_e2e（串行）"
 cd "$WORKSPACE"
 export RFB_REAL_E2E=1

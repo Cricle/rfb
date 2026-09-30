@@ -6,6 +6,7 @@
 
 use crate::cli::error::{external, validation, CliError};
 use crate::cli::image_build::{build_rootfs, RootfsOptions};
+use crate::cli::localhost::require_localhost;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,19 +17,28 @@ use std::time::Duration;
 /// cold, minutes on slow storage).
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Second-probe timeout for a controller that missed the first health check:
+/// declaring a controller dead leads to `kill_leftover_firecrackers`, so a
+/// slow-but-alive controller gets one retry with a longer timeout before
+/// backend-up declares death and sweeps.
+const CONTROLLER_SLOW_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn controller_client(url: &str) -> Result<crate::controller::ForkdClient, CliError> {
     crate::controller::ForkdClient::new(url.to_owned(), None, Duration::from_secs(10))
         .map_err(|error| external(format!("controller client: {error}")))
 }
 
+/// The current effective uid via `id -u` (portable across unix; the CLI
+/// already shells out for ip/pkill). `None` when `id` cannot be run.
+fn current_uid() -> Option<String> {
+    let uid = Command::new("id").arg("-u").output().ok()?;
+    Some(String::from_utf8_lossy(&uid.stdout).trim().to_owned())
+}
+
 /// Root check via `id -u` (portable across unix; the CLI already shells out
 /// for ip/pkill).
 fn require_root() -> Result<(), CliError> {
-    let uid = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|error| external(format!("id: {error}")))?;
-    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_owned();
+    let uid = current_uid().ok_or_else(|| external("id: failed to run"))?;
     if uid != "0" {
         return Err(validation(
             "backend-up needs root: it manages the TAP device and Firecracker",
@@ -39,13 +49,50 @@ fn require_root() -> Result<(), CliError> {
 
 /// Kill leftover Firecracker processes: a killed VM leaves a zombie holding
 /// the shared TAP, and the next create fails with "Resource busy" until it
-/// is gone. Scoped to an exact process-name match (`-x`, not a `-f` command
-/// line substring) so unrelated processes whose arguments merely mention
-/// firecracker are never hit. Best-effort: pkill may be absent.
-fn kill_leftover_firecrackers() {
-    let _ = Command::new("pkill")
-        .args(["-9", "-x", "firecracker"])
-        .status();
+/// is gone. A machine-global `pkill -9 -x firecracker` would also kill
+/// unrelated users' VMs (and a slow-controller blip would become a mass
+/// kill), so the sweep is scoped: first to the firecracker processes whose
+/// command line references THIS backend's state dir (`pgrep -f`, verified
+/// down to the process name so the controller's own `--state` argument never
+/// matches), then — only when that sweep is unavailable or finds nothing —
+/// to an exact-name match (`-x`, not a `-f` command line substring) restricted
+/// to the current effective user, which still never touches other users'
+/// VMs. Best-effort: pkill/pgrep may be absent.
+fn kill_leftover_firecrackers(state_dir: &Path) {
+    let needle = state_dir.to_string_lossy().into_owned();
+    if let Ok(output) = Command::new("pgrep").arg("-f").arg(&needle).output() {
+        if output.status.success() {
+            let mut matched = false;
+            for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                // pgrep -f matches the full command line, which also matches
+                // this backend's own controller (`--state <dir>/state.json`);
+                // verify the process name before killing.
+                let is_firecracker = Command::new("ps")
+                    .args(["-p", pid, "-o", "comm="])
+                    .output()
+                    .map(|out| {
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout).trim() == "firecracker"
+                    })
+                    .unwrap_or(false);
+                if is_firecracker {
+                    matched = true;
+                    let _ = Command::new("kill").args(["-9", pid]).status();
+                }
+            }
+            if matched {
+                return;
+            }
+        }
+    }
+    // Fallback sweep: same exact-name match as before, restricted to the
+    // current effective user. Without a usable uid the kill is skipped
+    // entirely — better one busy TAP than killing unknown processes.
+    if let Some(uid) = current_uid() {
+        let _ = Command::new("pkill")
+            .args(["-9", "-x", "-u", &uid, "firecracker"])
+            .status();
+    }
 }
 
 /// Ensure the shared TAP exists and is UP. The address is the standard
@@ -101,6 +148,40 @@ async fn clear_stale_sandboxes(client: &crate::controller::ForkdClient) {
             let _ = client.delete_sandbox(&sandbox.id).await;
         }
     }
+}
+
+/// [`clear_stale_sandboxes`], gated on this invocation having spawned the
+/// controller. A controller that was already running owns live sandboxes
+/// whose teardown is not this command's decision — re-running backend-up
+/// must converge instead of slaughtering a healthy stack's VMs (same
+/// contract as the bring-up logic that never touches a reachable
+/// controller).
+async fn clear_stale_sandboxes_if_spawned(
+    client: &crate::controller::ForkdClient,
+    controller_started: bool,
+) {
+    if !controller_started {
+        return;
+    }
+    clear_stale_sandboxes(client).await;
+}
+
+/// Test hook (same `#[doc(hidden)]` pattern as the ZeroBootSession test
+/// accessors): run the gated stale-sandbox sweep against a client built for
+/// `base_url`, so the no-clear-on-healthy-controller contract is assertable
+/// from a mock controller without a root/KVM backend-up run.
+///
+/// # Errors
+///
+/// Returns `Err` when the controller client cannot be built.
+#[doc(hidden)]
+pub async fn clear_stale_sandboxes_for_test(
+    base_url: &str,
+    controller_started: bool,
+) -> Result<(), CliError> {
+    let client = controller_client(base_url)?;
+    clear_stale_sandboxes_if_spawned(&client, controller_started).await;
+    Ok(())
 }
 
 /// Spawn the controller detached from this CLI's process group (a short-lived
@@ -234,6 +315,60 @@ async fn wait_snapshot(client: &crate::controller::ForkdClient, tag: &str) -> Re
     })
 }
 
+/// Whether a controller already answers `GET /v1/snapshots` on `url`. The
+/// first probe uses the standard client timeout; a controller that misses it
+/// gets ONE retry with a longer timeout before backend-up declares it dead —
+/// declaring death leads to `kill_leftover_firecrackers` plus a replacement
+/// controller spawn, neither of which may fire against a slow-but-alive
+/// controller that is merely over its health-check window.
+async fn controller_reachable(client: &crate::controller::ForkdClient, url: &str) -> bool {
+    if client.list_snapshots().await.is_ok() {
+        return true;
+    }
+    let Ok(retry) =
+        crate::controller::ForkdClient::new(url.to_owned(), None, CONTROLLER_SLOW_RETRY_TIMEOUT)
+    else {
+        return false;
+    };
+    retry.list_snapshots().await.is_ok()
+}
+
+/// Loopback gate for the controller bind target, via the shared
+/// [`require_localhost`] single source: `127.0.0.1:PORT` and `localhost:PORT`
+/// hosts are both accepted (the same vocabulary the zeroboot up path uses),
+/// and the validated base URL is returned for the controller client.
+///
+/// # Errors
+///
+/// Returns `Err` when the bind target is not loopback.
+pub fn require_loopback_bind(bind: &str) -> Result<String, CliError> {
+    require_localhost(&format!("http://{bind}"))
+}
+
+/// Build the delegated `forkd snapshot-create` arguments for the backend's
+/// own snapshot: the controller URL, the resolved rootfs, and — passed
+/// through, never dropped — the caller's `--require-provenance` gate.
+pub fn snapshot_create_args_for_backend(
+    url: &str,
+    args: &crate::cli::commands::ForkdBackendUpArgs,
+    rootfs: &Path,
+) -> crate::cli::commands::ForkdSnapshotCreateArgs {
+    super::super::commands::ForkdSnapshotCreateArgs {
+        url: super::super::commands::ForkdUrlArgs {
+            url: url.to_owned(),
+        },
+        tag: args.tag.clone(),
+        kernel: Some(args.kernel.clone()),
+        rootfs: Some(rootfs.to_path_buf()),
+        tap: Some(args.tap.clone()),
+        forkd_bin: None,
+        rootfs_copy: None,
+        mem_size_mib: None,
+        boot_wait_secs: 10,
+        require_provenance: args.require_provenance,
+    }
+}
+
 /// The snapshot data directory `forkd snapshot` writes to by default
 /// (`$XDG_DATA_HOME/forkd/snapshots`, else `$HOME/.local/share/forkd/snapshots`).
 /// The controller's `--snapshot-root` must point here, or it lists nothing.
@@ -256,13 +391,10 @@ pub async fn backend_up(
 ) -> Result<Value, CliError> {
     // Pure argument validation first (permission-independent, so non-root
     // environments like CI exercise the same contract).
-    if args.bind.split(':').next() != Some("127.0.0.1") {
-        // The daemon itself refuses unauthenticated non-loopback binds; fail
-        // here with the actionable message instead of after the TAP churn.
-        return Err(validation(
-            "bind must be loopback (the controller refuses 0.0.0.0 without a token)",
-        ));
-    }
+    //
+    // The daemon itself refuses unauthenticated non-loopback binds; fail
+    // here with the actionable message instead of after the TAP churn.
+    let url = require_loopback_bind(&args.bind)?;
     let state_dir = args.state_dir.clone().unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -305,15 +437,14 @@ pub async fn backend_up(
 
     ensure_tap(&args.tap)?;
 
-    let url = format!("http://{}", args.bind);
     let client = controller_client(&url)?;
     let mut controller_started = false;
-    if client.list_snapshots().await.is_err() {
+    if !controller_reachable(&client, &url).await {
         // First bring-up (or the previous stack died): leftovers from the dead
         // run still hold the shared TAP, so clear them before spawning a new
         // controller. A REACHABLE controller is never touched — re-run
         // convergence must not slaughter the live VMs it owns.
-        kill_leftover_firecrackers();
+        kill_leftover_firecrackers(&state_dir);
         let snapshot_root = default_snapshot_root()?;
         spawn_controller(&controller_bin, &state_dir, &snapshot_root, &args.bind)?;
         controller_started = true;
@@ -323,23 +454,26 @@ pub async fn backend_up(
         external(format!("{error:?}; controller log: {}", log.display()))
     })?;
 
-    clear_stale_sandboxes(&client).await;
+    clear_stale_sandboxes_if_spawned(&client, controller_started).await;
 
     if !client.snapshot_ready(&args.tag).await.unwrap_or(false) {
-        let create_args = super::super::commands::ForkdSnapshotCreateArgs {
-            url: super::super::commands::ForkdUrlArgs { url: url.clone() },
-            tag: args.tag.clone(),
-            kernel: Some(args.kernel.clone()),
-            rootfs: Some(rootfs.clone()),
-            tap: Some(args.tap.clone()),
-            forkd_bin: None,
-            rootfs_copy: None,
-            mem_size_mib: None,
-            boot_wait_secs: 10,
-            require_provenance: false,
-        };
+        let create_args = snapshot_create_args_for_backend(&url, args, &rootfs);
         let _ = super::snapshot_create(&create_args)?;
         wait_snapshot(&client, &args.tag).await?;
+    }
+    // Fail closed on demand: once the snapshot is ready, re-check its info
+    // record when --require-provenance was set. The delegated create above
+    // already gates its own result; this re-check also covers the reuse path
+    // (an already-ready snapshot is never re-created, but its provenance
+    // must still verify before backend-up reports success).
+    if args.require_provenance {
+        let info_args = super::super::commands::ForkdSnapshotInfoArgs {
+            url: super::super::commands::ForkdUrlArgs { url: url.clone() },
+            tag: args.tag.clone(),
+            forkd_bin: None,
+            require_provenance: true,
+        };
+        let _ = super::snapshot_info(&info_args)?;
     }
 
     Ok(json!({

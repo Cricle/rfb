@@ -63,7 +63,10 @@ fn backend_up_rejects_non_loopback_bind() {
         "0.0.0.0:18889",
     ]);
     assert!(!output.status.success(), "non-loopback bind must fail");
-    assert!(combined_text(&output).contains("loopback"));
+    // The gate is the shared localhost single source
+    // (`crate::cli::localhost::require_localhost`), so the message is the
+    // shared "target localhost only" wording.
+    assert!(combined_text(&output).contains("localhost only"));
 }
 
 /// `zeroboot preflight` reports JSON even when the host cannot run VMs: the

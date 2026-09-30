@@ -7,12 +7,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Single-file read/write cap for the structured file RPCs. This is the wire
-/// contract value (sdk/PROTOCOL.md: read/write payloads ≤ 51200 bytes; the
-/// forkd agent's `rfb::guest::limits::MAX_GUEST_RESULT_BYTES`), not the
-/// (much larger) event/frame cap: both transports must refuse the same
-/// oversized file operations.
-pub(super) const FILE_RPC_MAX_BYTES: usize = 50 * 1024;
+// The single-file read/write cap for the structured file RPCs now lives in
+// [`crate::session`] (`FILE_RPC_MAX_BYTES`) so the host-side validation and
+// this guest-side enforcement share one wire-contract constant; re-imported
+// here (and re-exported to the workspace_executor module) unchanged.
+pub(super) use crate::session::FILE_RPC_MAX_BYTES;
 
 impl WorkspaceGuestExecutor {
     /// Typed read (host control message): fails closed when the file exceeds

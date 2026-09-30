@@ -21,11 +21,22 @@ internal static class GuestResults
 
     /// <summary>eval output maps to stdout (UNIFIED_API.md §4); the agent's
     /// current eval key is `status` (PROTOCOL.md §2.4), `exit_code` the
-    /// legacy alias — same precedence as the Rust facade.</summary>
+    /// legacy alias — same precedence as the Rust facade: a present-but-null
+    /// `status` falls through to `exit_code`, while a present non-integer
+    /// `status` reads as 0 (no legacy fallback).</summary>
     public static ExecResult ParseEval(JsonElement v)
     {
         var stdout = WireJson.ValueBytes(Prop(v, "output") ?? Prop(v, "out"));
-        var exit = WireJson.IntOr(v, "status", WireJson.IntOr(v, "exit_code", 0));
+        int exit;
+        if (WireJson.HasKey(v, "status") && v.GetProperty("status").ValueKind != JsonValueKind.Null)
+        {
+            exit = WireJson.IntOr(v, "status", 0);
+        }
+        else
+        {
+            exit = WireJson.IntOr(v, "exit_code", 0);
+        }
+
         var timedOut = WireJson.BoolOr(v, "timed_out", false);
         return new ExecResult(exit, stdout, [], timedOut);
     }
@@ -105,8 +116,11 @@ internal static class GuestResults
         ("stdout", false), ("out", false), ("stderr", true), ("err", true),
     };
 
-    /// <summary>NDJSON stream event mapping (mirror of forkd_stream_event).</summary>
-    public static StreamEvent MapStreamEvent(JsonElement value)
+    /// <summary>NDJSON stream event mapping (PROTOCOL.md §2.5): started →
+    /// exit_code (key presence is terminal; a null value — child killed by a
+    /// signal — is an uncoded Exit, not a protocol error) → done:true (uncoded
+    /// Exit) → output keys. Lines matching none of these return null (ignored).</summary>
+    public static StreamEvent? MapStreamEvent(JsonElement value)
     {
         if (WireJson.BoolOr(value, "started", false)
             || (value.TryGetProperty("stream", out var s) && s.ValueKind == JsonValueKind.String && s.GetString() == "started")
@@ -115,9 +129,9 @@ internal static class GuestResults
             return new StreamEvent(StreamEventKind.Started, [], null);
         }
 
-        if (WireJson.OptInt(value, "exit_code") is { } code)
+        if (WireJson.HasKey(value, "exit_code"))
         {
-            return new StreamEvent(StreamEventKind.Exit, [], (int)code);
+            return new StreamEvent(StreamEventKind.Exit, [], (int?)WireJson.OptInt(value, "exit_code"));
         }
 
         if (WireJson.BoolOr(value, "done", false))
@@ -134,7 +148,7 @@ internal static class GuestResults
             }
         }
 
-        throw new DecodeException("invalid guest stream event");
+        return null; // other non-terminal lines are ignored (PROTOCOL.md §2.5)
     }
 
     private static JsonElement? Prop(JsonElement v, string key)

@@ -51,15 +51,14 @@ pub(super) fn exec_result(value: &Value) -> Result<GuestExecResult, RfbError> {
 /// forkd/provider.rs so both surfaces agree on a guest that sends both.
 pub(super) fn eval_result(value: &Value) -> Result<GuestExecResult, RfbError> {
     Ok(GuestExecResult {
-        // Fail closed like exec: a missing or non-integer status must not be
-        // bleached into 0 ("success"); it maps to -1 (also UNIFIED_API §2.4:
-        // non-integer exit codes are -1).
+        // UNIFIED_API.md §4: eval exit comes from `status` (legacy
+        // `exit_code` alias) and defaults to 0 when missing or non-integer.
         exit_code: value
             .get("status")
             .or_else(|| value.get("exit_code"))
             .and_then(Value::as_i64)
             .map(|code| i32::try_from(code).unwrap_or(-1))
-            .unwrap_or(-1),
+            .unwrap_or(0),
         stdout: value_bytes(value.get("output").or_else(|| value.get("out")))?,
         stderr: Vec::new(),
         timed_out: value
@@ -77,21 +76,21 @@ pub(super) fn ping_healthy(value: &Value) -> bool {
 /// Map one stream event line to the unified event type. `Ok(None)` means the
 /// peer closed the stream cleanly.
 pub(super) fn stream_event(value: Value) -> Result<Option<StreamEvent>, RfbError> {
-    if value.get("started").and_then(Value::as_bool) == Some(true)
-        || value.get("stream").and_then(Value::as_str) == Some("started")
-        || value.get("event").and_then(Value::as_str) == Some("started")
-    {
-        return Ok(Some(StreamEvent {
-            kind: StreamEventKind::Started,
-            data: Vec::new(),
-            code: None,
-        }));
-    }
-    if let Some(code) = value.get("exit_code").and_then(Value::as_i64) {
+    // Key precedence mirrors the Python reference (`_NdjsonStream.next_event`):
+    // exit_code first, then stdout/out, stderr/err, then started.
+    //
+    // UNIFIED_API.md §11: a signal-killed turn ends with `{"exit_code":null}`
+    // (no `done`); the KEY being present terminates the stream, a null /
+    // non-integer value maps to Exit(None) — it must not be skipped as an
+    // unrecognized line or the stream would hang past the turn's end.
+    if value.get("exit_code").is_some() {
         return Ok(Some(StreamEvent {
             kind: StreamEventKind::Exit,
             data: Vec::new(),
-            code: Some(i32::try_from(code).unwrap_or(-1)),
+            code: value
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|code| i32::try_from(code).unwrap_or(-1)),
         }));
     }
     if value.get("done").and_then(Value::as_bool) == Some(true) {
@@ -118,6 +117,16 @@ pub(super) fn stream_event(value: Value) -> Result<Option<StreamEvent>, RfbError
                 code: None,
             }));
         }
+    }
+    if value.get("started").and_then(Value::as_bool) == Some(true)
+        || value.get("stream").and_then(Value::as_str) == Some("started")
+        || value.get("event").and_then(Value::as_str) == Some("started")
+    {
+        return Ok(Some(StreamEvent {
+            kind: StreamEventKind::Started,
+            data: Vec::new(),
+            code: None,
+        }));
     }
     // PROTOCOL.md §2.5: unrecognized event keys are ignored (None) so future
     // frame additions do not break existing clients.

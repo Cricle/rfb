@@ -33,17 +33,25 @@ impl RfbClient {
     /// Create a client for the given controller base URL.
     ///
     /// `token` becomes a `Authorization: Bearer <token>` header on every
-    /// request when set.
+    /// request when set (blank tokens are dropped, `UNIFIED_API.md` §2).
+    /// `timeout` covers one controller HTTP request end to end and must be
+    /// greater than zero.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the operation fails; the error type carries the cause.
+    /// Returns [`RfbError::Validation`] for an invalid `base_url` or a
+    /// zero `timeout`, before any request is built.
     pub fn new(
         base_url: impl Into<String>,
         token: Option<String>,
         timeout: Duration,
     ) -> Result<Self, RfbError> {
         let base_url = base_url.into();
+        if timeout.is_zero() {
+            return Err(RfbError::Validation(
+                "client timeout must be greater than zero".to_owned(),
+            ));
+        }
         Self::validate_base_url(&base_url)?;
         Ok(Self {
             http: crate::controller::ForkdClient::new(base_url, token, timeout)?,
@@ -317,11 +325,7 @@ impl GuestSandbox {
         transport: GuestTransport,
         timeout: Duration,
     ) -> Result<Self, RfbError> {
-        let http = crate::controller::ForkdClient::new(
-            "http://127.0.0.1:8889",
-            None,
-            timeout,
-        )?;
+        let http = crate::controller::ForkdClient::new("http://127.0.0.1:8889", None, timeout)?;
         Ok(Self::new(http, info, transport, timeout))
     }
 
@@ -403,7 +407,9 @@ impl GuestSandbox {
 
     /// Execute a command. `cwd` is an opaque guest path — the guest maps both
     /// `/` and `/workspace` to the workspace root (the language SDKs default
-    /// to `/workspace`); `stdin`
+    /// to `/workspace`, with a 60 second `timeout_s` — `UNIFIED_API.md` §8;
+    /// Rust has no default arguments, so both are passed explicitly);
+    /// `stdin`
     /// is delivered on the ZBRT transport — the NDJSON wire has no exec stdin
     /// channel, so non-empty stdin over NDJSON fails closed (a silent drop
     /// would run the command without its input); `timeout_s` is ceil-ed to
@@ -814,6 +820,7 @@ impl GuestOps {
                 Ok(GuestStream {
                     inner: StreamInner::Ndjson(inner),
                     exited: false,
+                    stopped: false,
                 })
             }
             #[cfg(feature = "zeroboot")]
@@ -834,6 +841,7 @@ impl GuestOps {
                 Ok(GuestStream {
                     inner: StreamInner::Zbrt(inner),
                     exited: false,
+                    stopped: false,
                 })
             }
         }
@@ -844,7 +852,12 @@ impl GuestOps {
 /// peer disconnect) reads as `Ok(None)`.
 pub struct GuestStream {
     inner: StreamInner,
+    /// Set once the terminal `Exit` event has been delivered.
     exited: bool,
+    /// Set once [`GuestStream::stop`] has been called; further `send_input`
+    /// calls fail (`UNIFIED_API.md` §5: stopped → Remote) and further `stop`
+    /// calls are no-ops.
+    stopped: bool,
 }
 
 enum StreamInner {
@@ -891,13 +904,14 @@ impl GuestStream {
     }
 
     /// Send text to the guest's stdin. Raises [`RfbError::Remote`] after the
-    /// stream has terminated; unsupported outright over ZBRT (see README).
+    /// stream has terminated or been stopped; unsupported outright over ZBRT
+    /// (see README).
     ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn send_input(&mut self, text: impl Into<String>) -> Result<(), RfbError> {
-        if self.exited {
+        if self.exited || self.stopped {
             return Err(RfbError::Remote(
                 "guest stream is no longer running".to_owned(),
             ));
@@ -909,12 +923,17 @@ impl GuestStream {
         }
     }
 
-    /// Ask the guest to terminate the stream. Idempotent.
+    /// Ask the guest to terminate the stream. Idempotent: calls after the
+    /// first (or after the stream terminated) are no-ops.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn stop(&mut self) -> Result<(), RfbError> {
+        if self.exited || self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
         match &mut self.inner {
             StreamInner::Ndjson(inner) => Ok(inner.stop().await?),
             #[cfg(feature = "zeroboot")]

@@ -24,9 +24,10 @@ use std::sync::Arc;
 const COMPLETED_LIMIT: usize = 256;
 
 /// Cancelled turns retained for duplicate-cancel detection and replay, bounded
-/// like [`COMPLETED_LIMIT`]. An entry evicted from here degrades gracefully:
-/// a late cancel answers "request is not active" and a late completion falls
-/// back to the worker's own terminal result.
+/// like [`COMPLETED_LIMIT`]. An entry evicted from here moves to a bounded
+/// tombstone queue so a redelivered StartTurn for a cancelled request never
+/// silently re-executes; a late cancel for an evicted request still answers
+/// "request is not active".
 const CANCELLED_LIMIT: usize = 256;
 
 /// Guest runtime state machine: identity, sequencing, lifecycle, and protocol
@@ -47,6 +48,10 @@ pub struct RuntimeService {
     /// Insertion order of `cancelled_sessions` keys, for oldest-first eviction
     /// past [`CANCELLED_LIMIT`].
     cancelled_order: VecDeque<(String, String)>,
+    /// Bounded tombstones for cancelled turns whose terminal was evicted: a
+    /// redelivered StartTurn gets an explicit rejection instead of silently
+    /// re-executing a request the caller already cancelled.
+    evicted_cancelled: VecDeque<(String, String)>,
     shutdown: bool,
     limits: RuntimeLimits,
     /// `None` while an in-flight turn has taken the executor out to run it on
@@ -84,8 +89,11 @@ impl RuntimeService {
     }
 
     /// Record a cancelled turn's terminal responses, evicting the oldest
-    /// entry past [`CANCELLED_LIMIT`] (no tombstone: a late cancel for an
-    /// evicted request already fails with "request is not active").
+    /// entry past [`CANCELLED_LIMIT`]. Evicted keys move to the bounded
+    /// tombstone queue (`evicted_cancelled`) so a redelivered StartTurn is
+    /// rejected explicitly instead of silently re-executing the cancelled
+    /// request (a late cancel for an evicted request still fails with
+    /// "request is not active").
     fn record_cancelled(&mut self, key: (String, String), responses: Vec<RuntimeMessage>) {
         if !self.cancelled_sessions.contains_key(&key) {
             self.cancelled_order.push_back(key.clone());
@@ -94,6 +102,10 @@ impl RuntimeService {
         while self.cancelled_order.len() > CANCELLED_LIMIT {
             if let Some(oldest) = self.cancelled_order.pop_front() {
                 self.cancelled_sessions.remove(&oldest);
+                self.evicted_cancelled.push_back(oldest);
+            }
+            while self.evicted_cancelled.len() > CANCELLED_LIMIT {
+                self.evicted_cancelled.pop_front();
             }
         }
     }
@@ -103,6 +115,14 @@ impl RuntimeService {
         RuntimeMessage::Error {
             request_id: request_id.to_string(),
             message: "request completed earlier; result no longer available".into(),
+        }
+    }
+
+    /// Explicit rejection for a request whose cancelled terminal was evicted.
+    fn evicted_cancelled_error(request_id: &str) -> RuntimeMessage {
+        RuntimeMessage::Error {
+            request_id: request_id.to_string(),
+            message: "request was cancelled earlier; terminal no longer available".into(),
         }
     }
 
@@ -234,6 +254,7 @@ impl RuntimeService {
                 self.evicted_requests.clear();
                 self.cancelled_sessions.clear();
                 self.cancelled_order.clear();
+                self.evicted_cancelled.clear();
                 self.shutdown = true;
                 match result {
                     Ok(()) => vec![RuntimeMessage::ShutdownAck],
@@ -279,6 +300,15 @@ impl RuntimeService {
         &mut self,
         turn: &SessionRequest,
     ) -> Result<Box<dyn GuestExecutor>, RuntimeMessage> {
+        // Mirror handle()'s shutdown guard: guest_connection's worker path
+        // calls spawn_turn directly, bypassing handle(), so a StartTurn that
+        // races or follows Shutdown must fail here too.
+        if self.shutdown {
+            return Err(RuntimeMessage::Error {
+                request_id: turn.request_id.clone(),
+                message: "runtime has shut down".into(),
+            });
+        }
         if let Some(error) = validate_identity(&turn.session_id, &turn.request_id) {
             return Err(error);
         }
@@ -291,6 +321,17 @@ impl RuntimeService {
         }
         if self.evicted_requests.contains(&key) {
             return Err(Self::evicted_replay_error(&turn.request_id));
+        }
+        // A cancelled request must never re-execute: the caller already saw
+        // (or explicitly issued) its cancellation.
+        if self.cancelled_sessions.contains_key(&key) {
+            return Err(RuntimeMessage::Error {
+                request_id: turn.request_id.clone(),
+                message: "request was cancelled".into(),
+            });
+        }
+        if self.evicted_cancelled.contains(&key) {
+            return Err(Self::evicted_cancelled_error(&turn.request_id));
         }
         if let Some(active) = self.active_sessions.get(&turn.session_id) {
             return Err(RuntimeMessage::Error {
@@ -330,6 +371,15 @@ impl RuntimeService {
     /// results get their explicit rejection. `None` = not a replay, proceed
     /// with a fresh claim.
     pub fn replay_cached_turn(&mut self, turn: &SessionRequest) -> Option<Vec<RuntimeMessage>> {
+        // Mirror handle()'s shutdown guard: guest_connection's StartTurn arm
+        // calls this directly, bypassing handle(), so a StartTurn that races
+        // or follows Shutdown must fail here too.
+        if self.shutdown {
+            return Some(vec![RuntimeMessage::Error {
+                request_id: turn.request_id.clone(),
+                message: "runtime has shut down".into(),
+            }]);
+        }
         if let Some(error) = validate_identity(&turn.session_id, &turn.request_id) {
             return Some(vec![error]);
         }
@@ -339,6 +389,9 @@ impl RuntimeService {
         }
         if self.evicted_requests.contains(&key) {
             return Some(vec![Self::evicted_replay_error(&turn.request_id)]);
+        }
+        if self.evicted_cancelled.contains(&key) {
+            return Some(vec![Self::evicted_cancelled_error(&turn.request_id)]);
         }
         if let Some(previous) = self.cancelled_sessions.get(&key) {
             return Some(if previous.is_empty() {
@@ -475,6 +528,24 @@ impl RuntimeService {
         }
         if self.evicted_requests.contains(&key) {
             return vec![Self::evicted_replay_error(&request.request_id)];
+        }
+        // A redelivered StartTurn for a cancelled request must never
+        // re-execute: replay the cancel terminal (or its explicit tombstone
+        // rejection once eviction removed the recorded responses).
+        if let Some(previous) = self.cancelled_sessions.get(&key) {
+            return if previous.is_empty() {
+                vec![RuntimeMessage::Event(SessionEvent {
+                    session_id: request.session_id.clone(),
+                    sequence: self.next(),
+                    kind: "turn.cancelled".into(),
+                    payload: Vec::new(),
+                })]
+            } else {
+                previous.clone()
+            };
+        }
+        if self.evicted_cancelled.contains(&key) {
+            return vec![Self::evicted_cancelled_error(&request.request_id)];
         }
         if let Some(active) = self.active_sessions.get(&request.session_id) {
             return vec![RuntimeMessage::Error {

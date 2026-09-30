@@ -51,8 +51,12 @@ pub mod guest_entrypoint;
 /// Guest-facing operation DTOs.
 #[cfg(feature = "guest")]
 pub mod guest_protocol;
+/// RFB1 guest vsock listener: one shared runtime for every connection so
+/// sessions survive disconnects and a Cancel from connection B can stop a turn
+/// started on connection A. [`guest_vsock::dispatcher`] is the testable serve
+/// seam (vsock listeners and fake transports hand it stream halves).
 #[cfg(feature = "guest")]
-pub(crate) mod guest_vsock;
+pub mod guest_vsock;
 /// Host-side Firecracker `/vsock` UDS relay and RFB1 client.
 #[cfg(feature = "host-vsock")]
 pub mod host_vsock;

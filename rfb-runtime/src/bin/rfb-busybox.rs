@@ -402,7 +402,7 @@ mod imp {
                         self.pos += 2;
                         word.push_str(&self.last_status.to_string());
                     }
-                    Some(c) if is_word_terminator(c, self.peek_at(1)) => break,
+                    Some(c) if is_word_terminator(c, self.peek_at(1), word.is_empty()) => break,
                     Some(c) => {
                         word.push(c);
                         self.pos += 1;
@@ -417,10 +417,15 @@ mod imp {
         }
     }
 
-    fn is_word_terminator(c: char, next: Option<char>) -> bool {
+    /// Whether `c` ends the current word. A digit is only an IO_NUMBER
+    /// (`2>`) when it sits at the token's very start — `parse_command`
+    /// routes those to `parse_redir` before `read_word` ever runs. Mid-word
+    /// digits are plain word characters: `echo a2>b` must print `a2` and
+    /// truncate `b`, not misparse `a` + `2>` as an fd-2 redirection.
+    fn is_word_terminator(c: char, next: Option<char>, at_token_start: bool) -> bool {
         match c {
             ' ' | '\t' | '|' | '<' | '>' | '&' => true,
-            '0'..='9' => matches!(next, Some('<') | Some('>')),
+            '0'..='9' if at_token_start => matches!(next, Some('<') | Some('>')),
             _ => false,
         }
     }
@@ -515,6 +520,12 @@ mod imp {
                     Ok(pair) => (Some(pair.0), Some(pair.1)),
                     Err(error) => {
                         eprintln!("sh: pipe: {error}");
+                        // Same leak guard as the spawn-failure path below:
+                        // do not abandon stages that already started.
+                        for mut child in children {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
                         return Outcome::Status(1);
                     }
                 }
@@ -525,6 +536,14 @@ mod imp {
                 Ok(child) => children.push(child),
                 Err(error) => {
                     eprintln!("sh: {error}");
+                    // A failed spawn must not leak the stages that already
+                    // started: `sleep 100 | nonexistent` would otherwise keep
+                    // the sleep running after the pipeline reports 127. Kill
+                    // them and reap so no zombie is left behind either.
+                    for mut child in children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     return Outcome::Status(127);
                 }
             }

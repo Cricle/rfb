@@ -23,52 +23,13 @@ use tokio::sync::Mutex;
 /// The ZeroBoot V1 guest vsock port (shared with the ZBRT provider contract).
 pub const GUEST_PORT: u32 = 5000;
 
-/// Short backoff between vsock accept retries. A transient accept failure
-/// (ECONNRESET on a probe that connected and vanished, an interrupted syscall)
-/// must not tear down the whole guest service.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const ACCEPT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// How many consecutive accept failures are treated as unrecoverable and end
-/// the guest service. A single error is transient; a persistent stream of
-/// failures means the listener is broken in a way retrying cannot fix, and an
-/// unbounded retry loop would instead spin (and flood stderr) forever.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[doc(hidden)]
-pub const ACCEPT_FAILURE_LIMIT: u32 = 100;
-
-/// What the accept loop does with one failed accept.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[doc(hidden)]
-pub enum AcceptFailure {
-    /// Transient (probe reset, interrupted syscall, ...): back off and retry.
-    Retry,
-    /// Unrecoverable: give up and surface the error to the caller.
-    GiveUp,
-}
-
-/// Classify one failed vsock accept.
-///
-/// Config-class errors (`InvalidInput`, `Unsupported`) are programming or
-/// image-contract mistakes — retrying can never fix them, so they give up
-/// immediately. Everything else is treated as transient and retried with a
-/// short backoff; only a long consecutive failure streak gives up, because a
-/// listener that fails unboundedly would otherwise spin (and flood stderr)
-/// forever while the pid-1 guest looks alive but accepts nothing.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[doc(hidden)]
-pub fn accept_failure_action(error: &io::Error, consecutive_failures: u32) -> AcceptFailure {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-    ) {
-        return AcceptFailure::GiveUp;
-    }
-    if consecutive_failures >= ACCEPT_FAILURE_LIMIT {
-        return AcceptFailure::GiveUp;
-    }
-    AcceptFailure::Retry
-}
+// The accept-failure classifier lives with the vsock transport it serves (the
+// RFB1 guest listener shares it); re-exported here so the ZeroBoot guest keeps
+// its public contract.
+#[cfg(target_os = "linux")]
+pub use crate::vsock::{
+    accept_failure_action, AcceptFailure, ACCEPT_FAILURE_LIMIT, ACCEPT_RETRY_BACKOFF,
+};
 
 /// Run the ZeroBoot V1 guest service: bind the guest vsock port, and serve
 /// every accepted connection with a fresh workspace executor (Linux only).

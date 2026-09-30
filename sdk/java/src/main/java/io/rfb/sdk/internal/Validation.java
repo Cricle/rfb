@@ -16,6 +16,9 @@ public final class Validation {
     public static final int MAX_GUEST_RESULT_BYTES = 50 * 1024;
     public static final int MAX_GUEST_CODE_BYTES = 1024 * 1024;
     public static final int MAX_LINE_BYTES = 1024 * 1024;
+    /** ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded. */
+    public static final int MAX_ZBRT_ARGC = 255;
+    public static final int MAX_ZBRT_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
     private Validation() {
     }
@@ -80,6 +83,19 @@ public final class Validation {
         }
         if (code.getBytes(StandardCharsets.UTF_8).length > MAX_GUEST_CODE_BYTES) {
             throw new ValidationError("eval code exceeds " + MAX_GUEST_CODE_BYTES + " bytes");
+        }
+    }
+
+    /**
+     * ZBRT argv: at most {@value #MAX_ZBRT_ARGC} entries — the wire encodes
+     * argc in a single header byte, so a longer argv is rejected locally
+     * (fail closed, zero frames) instead of failing after the connection is
+     * open (mirrors Python {@code validate_zbrt_args}).
+     */
+    public static void zbrtArgs(java.util.List<String> argv) {
+        if (argv == null || argv.size() > MAX_ZBRT_ARGC) {
+            throw new ValidationError(
+                    "argv exceeds the " + MAX_ZBRT_ARGC + "-argument ZBRT limit");
         }
     }
 

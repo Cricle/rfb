@@ -550,16 +550,16 @@ impl FirecrackerVm {
         // filesystem entry appears. A dead child fails in milliseconds (the
         // exit status is checked on every iteration) instead of burning the
         // whole socket deadline with a misleading timeout message.
+        //
+        // Only a plain blocking connect is used here: probing via
+        // `Handle::try_current()` + `block_on` PANICS when called from an
+        // async-runtime worker thread (a legal context for this public SDK
+        // API), so the async branch is deliberately absent. This function is
+        // synchronous spawn glue — blocking the caller for the socket deadline
+        // is its documented behavior.
         let start = Instant::now();
         loop {
-            let connected = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => handle
-                    .block_on(tokio::net::UnixStream::connect(socket_path))
-                    .is_ok(),
-                // No runtime in this thread (pure synchronous caller): a
-                // plain blocking connect still proves the listener is up.
-                Err(_) => UnixStream::connect(socket_path).is_ok(),
-            };
+            let connected = UnixStream::connect(socket_path).is_ok();
             if connected {
                 break;
             }

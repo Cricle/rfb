@@ -166,8 +166,10 @@ drop_lines("rfb/src/cli/mod.rs",
 
 # rfb/src/lib.rs：zeroboot 家族声明的手术。
 # - protocol：共享 wire（RFB1/SDK 都引用）→ 去 zeroboot feature 门，保留。
-# - firecracker：**通用 Firecracker HTTP 驱动，rfb1 的 boot 复用它** →
-#   门从 zeroboot feature 改为 unix（模块文件保留）。
+# - firecracker：lib.rs 里现在是内联 re-export 块（pub use
+#   rfb_runtime::firecracker_core::firecracker::*；模块本体在 rfb-runtime），
+#   其 zeroboot → forkd 的门改写在 §3c 统一做（forkd feature 同时挂上
+#   rfb-runtime/firecracker，见 rfb/Cargo.toml 的 forkd features 改写）。
 # - vsock：rfb1 也用 connect_vsock_uds → 保留（文件不删；本脚本第 2 步的
 #   REMOVE 若含它则此处无操作）。
 # - zeroboot（provider 汇聚模块）：删除。
@@ -179,13 +181,6 @@ t = t.replace(
     "pub mod protocol;",
     "/// ZBRT binary frame types and codec used by the ZeroBoot provider.\n"
     "pub mod protocol;")
-t = t.replace(
-    '#[cfg(all(feature = "zeroboot", target_os = "linux"))]\n'
-    '#[path = "zeroboot/firecracker.rs"]\n'
-    "pub mod firecracker;",
-    '#[cfg(all(unix, feature = "forkd"))]\n'
-    '#[path = "zeroboot/firecracker.rs"]\n'
-    "pub mod firecracker;")
 p.write_text(t, encoding="utf-8", newline="")
 drop_lines("rfb/src/lib.rs",
            [lambda l: re.match(r'pub mod (vsock|zeroboot);', l.strip()) is not None])
@@ -497,7 +492,38 @@ p = Path(init_py)
 t = p.read_text(encoding="utf-8")
 t = t.replace("protocol adapters (forkd controller HTTP, forkd guest NDJSON, ZBRT v1 frames)",
               "protocol adapters (forkd controller HTTP, forkd guest NDJSON)")
+# host.py 新增的 ZerobootHost（直连 Firecracker + ZBRT 客户端工厂）——minimal
+# 无 zeroboot：整类删，ForkdHost/TcpVsockRelay/boot_firecracker 保留。
+t = t.replace("from .host import ForkdHost, TcpVsockRelay, ZerobootHost\n",
+              "from .host import ForkdHost, TcpVsockRelay\n")
+t = t.replace('    "ZerobootHost",\n', "")
+assert "ZerobootHost" not in t, "__init__.py: ZerobootHost leftover"
 p.write_text(t, encoding="utf-8", newline="")
+
+host_py = f"{S}/rfb_sdk/host.py"
+must_replace(host_py, '''- :class:`ZerobootHost` boots one Firecracker microVM directly (the UDS
+  management API), bridges its vsock relay UDS onto TCP (Firecracker's
+  ``CONNECT <guest-port>`` preamble protocol), and hands out a ZBRT client.
+- :class:`ForkdHost` spawns''',
+             '''- :class:`ForkdHost` spawns''')
+must_replace(host_py, "from ._zbrt import _ZbrtGuestClient as _ZbrtClient\n", "")
+must_replace(host_py, "from .models import SandboxInfo\n", "")
+must_replace(host_py, "from .facade import RfbClient, Sandbox\n",
+             "from .facade import RfbClient\n")
+must_replace(host_py,
+             '__all__ = ["ForkdHost", "TcpVsockRelay", "ZerobootHost", "boot_firecracker"]',
+             '__all__ = ["ForkdHost", "TcpVsockRelay", "boot_firecracker"]')
+must_replace(host_py, '''# ---------------------------------------------------------------------------
+# Zeroboot host: one VM + TCP bridge, ZBRT clients direct
+# ---------------------------------------------------------------------------
+
+
+''', "")
+drop_py_block(host_py, "class ZerobootHost:")
+assert "zbrt" not in Path(host_py).read_text(encoding="utf-8").lower(), \
+    "host.py zbrt leftover"
+assert "zeroboot" not in Path(host_py).read_text(encoding="utf-8").lower(), \
+    "host.py zeroboot leftover"
 errors_py = f"{S}/rfb_sdk/errors.py"
 p = Path(errors_py)
 t = p.read_text(encoding="utf-8")
@@ -571,15 +597,32 @@ must_replace(f"{N}/src/sandbox.ts", "'stdin is only supported over the ZBRT tran
              "'stdin is not supported over the ndjson transport'")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #zbrt(")
 drop_brace_block(f"{N}/src/sandbox.ts", "class ZbrtGuestStream")
-must_replace(f"{N}/src/client.ts",
-             "transport !== TRANSPORT_NDJSON && transport !== TRANSPORT_ZBRT",
-             "transport !== TRANSPORT_NDJSON", count=2)
+# validation.ts：transport 校验收口 + ZBRT 上限/zbrtArgs 删除（zbrt 的调用
+# 点都在 sandbox.ts 的 zbrt 分支里，随分支一起删）。
+V = f"{N}/src/validation.ts"
+must_replace(V, "export const TRANSPORT_ZBRT = 'zbrt';\n", "")
+must_replace(V, '''// ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded and the
+// reference guest enforces a 16 MiB cap on every frame payload (§8).
+export const MAX_ZBRT_ARGC = 255;
+export const MAX_ZBRT_PAYLOAD_BYTES = 16 * 1024 * 1024;
+''', "")
+must_replace(V, "  if (value !== TRANSPORT_NDJSON && value !== TRANSPORT_ZBRT) {",
+             "  if (value !== TRANSPORT_NDJSON) {")
+drop_brace_block(V, "export function zbrtArgs(")
 must_replace(f"{N}/src/client.ts",
              "import { Sandbox, TRANSPORT_NDJSON, TRANSPORT_ZBRT } from './sandbox.js';",
              "import { Sandbox, TRANSPORT_NDJSON } from './sandbox.js';")
 must_replace(f"{N}/package.json",
-             'node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-vectors.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js && node dist/test/sandbox-zbrt.test.js && node dist/test/sandbox-ndjson.test.js && node dist/test/ndjson-stream.test.js',
-             'node dist/test/validation.test.js && node dist/test/client.test.js && node dist/test/sandbox-ndjson.test.js && node dist/test/ndjson-stream.test.js')
+             'node dist/test/validation.test.js && node dist/test/zbrt.test.js && node dist/test/zbrt-vectors.test.js && node dist/test/zbrt-connection.test.js && node dist/test/client.test.js && node dist/test/sandbox-zbrt.test.js && node dist/test/sandbox-ndjson.test.js && node dist/test/fs-actions.test.js && node dist/test/ndjson-stream.test.js',
+             'node dist/test/validation.test.js && node dist/test/client.test.js && node dist/test/sandbox-ndjson.test.js && node dist/test/fs-actions.test.js && node dist/test/ndjson-stream.test.js')
+must_replace(f"{N}/package.json",
+             "(TCP NDJSON + ZBRT v1 binary frames)", "(TCP NDJSON)")
+# client.test.ts：connect(sandbox, transport) 覆盖测试里的 zbrt 覆盖断言整行
+# 删（minimal 里 zbrt 一律 fail-closed；同用例的 'grpc' 拒绝断言已覆盖校验，
+# 且 node 的 src/test 在残留扫描范围内，不能留 'zbrt' 字面量）。
+must_replace(f"{N}/src/test/client.test.ts",
+             "    assert.equal((await client.connect(handle, 'zbrt')).transport, 'zbrt');\n",
+             "")
 drop_brace_block(f"{N}/src/test/client.test.ts", "zbrt stream rejects pty before connecting")
 drop_brace_block(f"{N}/src/test/client.test.ts", "zbrt stream rejects env before connecting")
 print("  nodejs done")
@@ -696,13 +739,25 @@ t = p.read_text(encoding="utf-8")
 t = t.replace(
     '/** Transport choice for {@link #connect}: NDJSON (default) or ZBRT v1 frames. */',
     '/** Transport choice for {@link #connect}: NDJSON. */')
-t = t.replace('    public static final String TRANSPORT_ZBRT = "zbrt";\n', "")
+# TRANSPORT_ZBRT 常量连同其文档行一起删（只删 const 行会留下悬空 javadoc）。
+t = t.replace(
+    '    /** ZBRT (ZeroBoot v1) guest transport selector for {@link #connect}. */\n'
+    '    public static final String TRANSPORT_ZBRT = "zbrt";\n', "")
 t = t.replace('!TRANSPORT_NDJSON.equals(transport) && !TRANSPORT_ZBRT.equals(transport)',
               '!TRANSPORT_NDJSON.equals(transport)')
 t = t.replace('throw new ValidationError("transport must be \\"ndjson\\" or \\"zbrt\\"");',
               'throw new ValidationError("transport must be \\"ndjson\\"");')
 assert "ZBRT" not in t, f"RfbClient.java: ZBRT leftover"
 p.write_text(t, encoding="utf-8", newline="")
+
+# internal/Validation.java：ZBRT 上限常量与 zbrtArgs 校验器删除（调用点都在
+# Sandbox.java 的 zbrt 分支里，随分支一起删）。
+JVAL = f"{J}/src/main/java/io/rfb/sdk/internal/Validation.java"
+must_replace(JVAL, '''    /** ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded. */
+    public static final int MAX_ZBRT_ARGC = 255;
+    public static final int MAX_ZBRT_PAYLOAD_BYTES = 16 * 1024 * 1024;
+''', "")
+drop_brace_block(JVAL, "public static void zbrtArgs(")
 
 ft = f"{J}/tests/src/test/java/io/rfb/sdk/RfbClientFacadeTest.java"
 p = Path(ft)
@@ -715,6 +770,9 @@ print("  java done")
 # ---------- csharp ----------
 C = "sdk/csharp"
 sb = f"{C}/src/Rfb.Sdk/Sandbox.cs"
+# Sandbox.Attach（直连 guest 地址的入口）：与构造器同语义收口成 ndjson-only。
+must_replace(sb, 'if (transport != RfbClient.TransportNdjson && transport != RfbClient.TransportZbrt)',
+             'if (transport != RfbClient.TransportNdjson)')
 must_replace(sb, 'if (transport is not ("ndjson" or "zbrt"))', 'if (transport != "ndjson")')
 must_replace(sb, 'throw new ValidationException("transport must be \\"ndjson\\" or \\"zbrt\\"");',
              'throw new ValidationException("transport must be \\"ndjson\\"");')
@@ -727,6 +785,20 @@ must_replace(f"{C}/src/Rfb.Sdk/Internal/GuestValidation.cs",
 must_replace(f"{C}/src/Rfb.Sdk/Internal/GuestValidation.cs",
              'throw new ValidationException("transport must be \\"ndjson\\" or \\"zbrt\\"");',
              'throw new ValidationException("transport must be \\"ndjson\\"");')
+# GuestValidation：ZBRT 上限常量与 ZbrtArgc 校验器删除（调用点都在 Sandbox.cs
+# 的 zbrt 尾巴里，随 unwrap_ndjson_if 一起删）。
+gv = f"{C}/src/Rfb.Sdk/Internal/GuestValidation.cs"
+must_replace(gv, '''    // ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded
+    // (PROTOCOL.md §3.2; rfb/src/guest/limits.rs).
+    public const int MaxZbrtArgc = 255;
+    public const int MaxZbrtPayloadBytes = 16 * 1024 * 1024; // 16 MiB
+''', "")
+drop_brace_block(gv, "public static void ZbrtArgc(")
+# RfbClient：TransportZbrt 常量连同文档行删除（Attach 改写后唯一调用点消失）。
+must_replace(f"{C}/src/Rfb.Sdk/RfbClient.cs",
+             '''    /// <summary>Guest transport: ZBRT v1 frames.</summary>
+    public const string TransportZbrt = "zbrt";
+''', "")
 drop_lines_csharp = [
     "    private readonly Lazy<ZbrtTcpClient> _zbrt;",
     "        _zbrt = new Lazy<ZbrtTcpClient>(() => new ZbrtTcpClient(info.GuestAddr, timeout));",
@@ -844,6 +916,14 @@ t = p.read_text(encoding="utf-8")
 t = t.replace('        if (transport == "ndjson") {\n            var g = new FakeNdjsonGuest();\n            guest = g;\n            guestAddr = g.Address;\n        } else {\n            var g = new FakeZbrtServer();\n            guest = g;\n            guestAddr = g.Address;\n        }\n',
               '        var g = new FakeNdjsonGuest();\n        guest = g;\n        guestAddr = g.Address;\n')
 t = t.replace('    [InlineData("zbrt")]\n', "")
+# Connect_ExplicitTransport_OverridesHandle：zbrt 覆盖分支改为 fail-closed
+# 断言（minimal 里显式 zbrt 在流量前抛 ValidationException）。
+t = t.replace('''        var overridden = await fx.Client.Connect(fx.Sandbox, "zbrt");
+        Assert.Equal("zbrt", overridden.Transport);
+        Assert.Equal("sb-1", overridden.Id);
+''', '        await Assert.ThrowsAsync<ValidationException>(() => fx.Client.Connect(fx.Sandbox, "zbrt"));\n')
+assert 'Assert.Equal("zbrt", overridden.Transport)' not in t, \
+    "FacadeTests.cs: zbrt transport-override assert leftover"
 p.write_text(t, encoding="utf-8", newline="")
 drop_brace_block(ft, "public async Task Eval_OverZbrt_FailsClosed(")
 drop_brace_block(ft, "public async Task Stream_Zbrt_EventsStop(")
@@ -986,6 +1066,9 @@ drop_lines("rfb/src/cli/dispatch.rs",
 drop_lines("rfb/src/cli/forkd/backend_up.rs",
            [lambda l: l.strip() in ("with_lua: bool,", "with_lua,", "args.with_lua,",
                                     "lua_lib_dir: None,")])
+# rfb/tests/cli_forkd.rs：ForkdBackendUpArgs 测试字面量里的 with_lua 字段。
+drop_lines("rfb/tests/cli_forkd.rs",
+           [lambda l: l.strip() in ("with_lua: false,",)])
 
 # image_build/mod.rs：LUA_LIB_DIR 再导出。
 must_replace("rfb/src/cli/image_build/mod.rs", "LUA_LIB_DIR, ", "")
@@ -1247,21 +1330,20 @@ Path("rfb/tests/client_codec.rs").unlink()
 must_replace("rfb/tests/backend_factory.rs",
              '#![cfg(all(feature = "forkd", feature = "zeroboot"))]',
              '#![cfg(feature = "forkd")]')
-# client_facade.rs：门收成 forkd；ZBRT 假服务器全家（辅助函数 + 全部 zbrt
-# 专属用例）整块删除——注意同族测试不止 4 个具名用例，连接复用/stale 重连/
-# error frame/argv 上限也是 zbrt 假服务器版。
+# client_facade.rs：门收成 forkd；ZBRT 假服务器用例整块删除——zbrt fake 的
+# 辅助函数（zframe/zout/...）已合并进 tests/common/zbrt.rs（第 2 步删除），
+# 这里按名删除全部 zbrt 专属用例（对照当前测试文件逐一枚举，勿凭记忆增删）。
 must_replace("rfb/tests/client_facade.rs",
              '#![cfg(all(feature = "forkd", feature = "zeroboot"))]',
              '#![cfg(feature = "forkd")]')
 for fn_marker in (
-    "fn zframe(", "fn zout(", "fn zexit(", "fn zerror(", "fn zfsresult(",
-    "fn zhealthack(", "fn zcancelack(", "fn hello_capabilities(",
-    "fn spawn_zbrt<", "fn spawn_zbrt_recording(", "fn read_exact_blocking(",
     "async fn facade_zbrt_identical_shapes(",
     "async fn zbrt_error_frame_raises_remote(",
     "async fn zbrt_stream_output_exit_and_cancel(",
     "async fn eval_zbrt_fails_closed_without_sending_frames(",
     "async fn zbrt_hello_first_and_control_connection_reuse(",
+    "async fn zbrt_stop_buffers_output_before_cancelack(",
+    "async fn zbrt_exec_oversize_stdin_fails_closed_without_connecting(",
     "async fn zbrt_control_connection_reconnects_once_after_stale(",
     "async fn zbrt_handshake_failure_is_transport(",
     "async fn zbrt_argv_over_255_fails_closed_without_connecting(",
@@ -1270,16 +1352,8 @@ for fn_marker in (
     drop_block("rfb/tests/client_facade.rs", fn_marker)
 p = Path("rfb/tests/client_facade.rs")
 t = p.read_text(encoding="utf-8")
-t = t.replace(
-    "// ---------------------------------------------------------------------------\n"
-    "// Fake ZBRT frame server (blocking frame loop; handler runs per frame)\n"
-    "// ---------------------------------------------------------------------------\n\n",
-    "")
-t = t.replace('''use rfb::protocol::{
-    Error as ZbrtErrorFrame, Exit as ZbrtExit, Frame, Fs, Health, Hello, HelloAck, Kind,
-    Output as ZbrtOutput, ZBRT_V1_CAPABILITIES,
-};
-''', "")
+# rfb::protocol 只剩 zbrt 用例在用（Kind/Fs/ZBRT_V1_CAPABILITIES）→ 整行删。
+t = t.replace("use rfb::protocol::{Fs, Kind, ZBRT_V1_CAPABILITIES};\n", "")
 t = re.sub(r'use common::zbrt::\{[^}]*\};\n', "", t)
 p.write_text(t, encoding="utf-8", newline="")
 # tests/common/mod.rs：minimal 不再编译共享 zbrt fake 与 realvm 助手，
@@ -1289,9 +1363,12 @@ drop_lines("rfb/tests/common/mod.rs",
                                     '#[cfg(feature = "zeroboot")]',
                                     '#[cfg(all(feature = "zeroboot", target_os = "linux"))]')])
 
-for leftover in ("spawn_zbrt", "GuestTransport::Zbrt", "zerror(", "ZbrtOutput",
+for leftover in ("spawn_zbrt", "FakeZbrt", "GuestTransport::Zbrt", "zerror(", "ZbrtOutput",
                  "ZbrtExit", "ZbrtErrorFrame", "zfsresult", "zhealthack",
-                 "zcancelack", "hello_capabilities", "read_exact_blocking"):
+                 "zcancelack", "hello_capabilities", "read_exact_blocking",
+                 "ZBRT_V1_CAPABILITIES",
+                 "zbrt_stop_buffers_output_before_cancelack",
+                 "zbrt_exec_oversize_stdin_fails_closed_without_connecting"):
     assert leftover not in t, f"client_facade.rs: {leftover!r} leftover"
 
 
@@ -1349,8 +1426,20 @@ PY
 
 echo "== 3d. 刷新 Cargo.lock（裁掉的依赖出清，裸产物 lock 自洽）=="
 source ~/.cargo/env 2>/dev/null || true
-cargo check --workspace --no-default-features --features forkd,cli >/dev/null 2>&1
-cargo check --workspace --no-default-features >/dev/null 2>&1
+# 编译失败必须可见：日志落盘，失败时把尾部打出来再退出（不能 2>&1 >/dev/null
+# 静默吞掉——否则 lock 刷新门形同虚设）。
+if ! cargo check --workspace --no-default-features --features forkd,cli \
+        > /tmp/minimal-check-forkd-cli.log 2>&1; then
+  echo "  cargo check (forkd,cli) FAILED — log tail:"
+  tail -25 /tmp/minimal-check-forkd-cli.log
+  exit 1
+fi
+if ! cargo check --workspace --no-default-features \
+        > /tmp/minimal-check-nodefault.log 2>&1; then
+  echo "  cargo check (no-default-features) FAILED — log tail:"
+  tail -25 /tmp/minimal-check-nodefault.log
+  exit 1
+fi
 if grep -q '^name = "mlua"' Cargo.lock; then
   echo "  Cargo.lock 仍含 mlua — 出清失败"
   exit 1

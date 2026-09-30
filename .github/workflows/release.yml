@@ -65,6 +65,11 @@ jobs:
       - name: Trust the workspace for git
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # rust:1-bookworm 镜像不带 python3，而版本一致性门
+          # （sync-versions.sh --check）与 release.sh 都依赖它——先补装，
+          # 否则下一个 tag push 会死在版本门上。
+          apt-get update
+          apt-get install -y --no-install-recommends python3
           # rust:1-bookworm 的 rustup 是 minimal profile（只有 rustc/cargo）；
           # release.sh 跑 fmt/test/doc 全套，rustfmt/clippy 组件必须补装。
           rustup component add rustfmt clippy
@@ -78,80 +83,45 @@ jobs:
           # crate 会放过 SDK 渠道的"部分 bump"——各渠道的 already-published
           # guard 只查存在性、不查一致性，版本漂移会让新 tag 悄悄发布旧版本
           # 依赖。锚点是 sdk/VERSION（唯一手写版本号；传播用
-          # scripts/sync-versions.sh），比对九处清单（sdk/VERSION /
-          # workspace Cargo.toml / pyproject.toml / package.json / pom.xml /
-          # tests pom 两处 / 两个 csproj / rust 示例依赖）与三个 crate，收集
-          # 全部失配后一次性报错（消息列出每一个不一致文件）并 exit 1。
+          # scripts/sync-versions.sh），清单失配全部收集后一次性报错
+          # （消息列出每一个不一致文件）并 exit 1。
           expected="${TAG#v}"
           canonical=$(tr -d '[:space:]' < sdk/VERSION)
           if [ "$expected" != "$canonical" ]; then
             echo "::error title=version-mismatch::tag $TAG 与 sdk/VERSION ($canonical) 不一致：先 scripts/sync-versions.sh $expected 再重试"
             exit 1
           fi
-          crate_versions=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print("\n".join("%s %s" % (p["name"], p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"] in ("rfb-runtime", "rfb-sdk", "rfb-rig")))')
-          problems=$(CRATE_VERSIONS="$crate_versions" python3 - "$expected" <<'PY'
-          import json, os, re, sys
-          import xml.etree.ElementTree as ET
-
-          expected = sys.argv[1]
-          problems = []
-
-          def check(label, got):
-              if got is None:
-                  problems.append(label + ": version field missing/unparseable")
-              elif got != expected:
-                  problems.append(label + ": " + str(got))
-
-          # 三个已发布 crate（cargo metadata，含 workspace 内真实包名）。
-          for entry in os.environ["CRATE_VERSIONS"].splitlines():
-              name, _, ver = entry.partition(" ")
-              check(name + " (workspace crate)", ver if ver else None)
-
-          # workspace Cargo.toml：[workspace.package] 段内的 version（member
-          # crate 继承自它；各 crate 自身版本已由上面 cargo metadata 覆盖）。
-          ws = open("Cargo.toml", encoding="utf-8").read()
-          m = re.search(r'\[workspace\.package\][^\[]*?^\s*version\s*=\s*"([^"]+)"',
-                        ws, re.M | re.S)
-          check("Cargo.toml [workspace.package] version",
-                m.group(1) if m else None)
-
-          # pyproject.toml：[project] version（文件内首个 version 键）。
-          py = open("sdk/python/pyproject.toml", encoding="utf-8").read()
-          m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', py)
-          check("sdk/python/pyproject.toml", m.group(1) if m else None)
-
-          # package.json：顶层 "version" 键。
-          pkg = json.load(open("sdk/nodejs/package.json", encoding="utf-8"))
-          check("sdk/nodejs/package.json", pkg.get("version"))
-
-          # pom.xml：project 直下首个 <version>（本 POM 无 <parent> 块）。
-          # 输入是仓库内版本受控文件（非不可信外部 XML）；ElementTree 不解析
-          # 外部实体，无 DTD/外部实体风险面。
-          root = ET.parse("sdk/java/pom.xml").getroot()
-          el = root.find("{http://maven.apache.org/POM/4.0.0}version")
-          check("sdk/java/pom.xml",
-                el.text.strip() if el is not None and el.text else None)
-
-          # 两个 csproj：首个 <Version> 属性（大小写按 MSBuild 属性名）。
-          for csproj in ("sdk/csharp/src/Rfb.Sdk/Rfb.Sdk.csproj",
-                         "sdk/csharp/Rfb.Cli/Rfb.Cli.csproj"):
-              text = open(csproj, encoding="utf-8").read()
-              m = re.search(r"<Version>([^<]+)</Version>", text)
-              check(csproj, m.group(1).strip() if m else None)
-
-          print("\n".join(problems))
-          sys.exit(1 if problems else 0)
-          PY
-          )
-          if [ -n "$problems" ]; then
-            printf '%s\n' "$problems" >&2
-            printf '%s\n' "$problems" | while IFS= read -r line; do
+          # 清单比对整体委托给 `sync-versions.sh --check`：它逐条校验该脚本
+          # 写入的每一处清单（pyproject / package.json / package-lock 两处 /
+          # 三份 pom 共五处 / 两个 csproj / Cargo.toml 三段 / rust 示例依赖）
+          # 与 sdk/VERSION 一致，收集全部失配后一次性列出并 exit 1——在这里
+          # 手工重抄一遍清单只会漏（此前 sdk/examples/java/pom.xml 停在
+          # 0.0.1 而 VERSION 已是 0.0.3，就没有被拦下）。
+          if ! gate_log=$(bash scripts/sync-versions.sh --check 2>&1); then
+            printf '%s\n' "$gate_log" >&2
+            printf '%s\n' "$gate_log" | while IFS= read -r line; do
               echo "::error title=version-mismatch::$line"
             done
             echo "::error::tag $TAG 与发布清单版本不一致（expected $expected，明细见上方注解）：先同步全部清单再重试"
             exit 1
           fi
-          echo "版本一致性门通过：tag=$TAG，六处清单与三个 crate 均为 $expected"
+          printf '%s\n' "$gate_log"
+          # 三个已发布 crate 的版本没有清单文件可表达，仍从 cargo metadata
+          # 读取比对（workspace 内真实包名）。
+          crate_versions=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print("\n".join("%s %s" % (p["name"], p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"] in ("rfb-runtime", "rfb-sdk", "rfb-rig")))')
+          bad=0
+          while IFS=' ' read -r crate_name crate_ver; do
+            [ -n "$crate_name" ] || continue
+            if [ "$crate_ver" != "$expected" ]; then
+              echo "::error title=version-mismatch::$crate_name (workspace crate): $crate_ver != $expected"
+              bad=1
+            fi
+          done <<< "$crate_versions"
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::tag $TAG 与 workspace crate 版本不一致（expected $expected）：先同步全部清单再重试"
+            exit 1
+          fi
+          echo "版本一致性门通过：tag=$TAG，sync-versions 全部清单与三个 crate 均为 $expected"
       - name: Publish (gates + package + three crates in dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
@@ -334,6 +304,7 @@ jobs:
             exit 1
           fi
           mkdir -p "$HOME/.m2"
+          umask 077   # 0600：凭据配置仅限当前用户可读写（与 nuget 步骤同款纪律）
           # 兼容两种形态：整份 settings.xml 原样落盘；裸 <server> 块则包一层
           if printf '%s' "$MAVEN_KEY" | grep -q '<settings'; then
             printf '%s\n' "$MAVEN_KEY" > "$HOME/.m2/settings.xml"

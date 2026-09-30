@@ -505,3 +505,5 @@ sdk/csharp/Rfb.Cli/tools/
 /dist/
 # Snapshots must never be committed (README:80)
 resx/snapshots/
+# the standalone quickstart crate has its own workspace root
+sdk/examples/rust/target/

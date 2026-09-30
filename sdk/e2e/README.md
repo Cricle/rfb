@@ -21,7 +21,7 @@
 | C# | `sdk/csharp` | `dotnet build` + `dotnet test tests/Rfb.Sdk.Tests/Rfb.Sdk.Tests.csproj` | netstandard2.1 + net8.0 编译通过；125 个用例全绿 |
 | Java | `sdk/java` | `mvn install -DskipTests` + `mvn test`（openjdk-17 + maven） | 108 个用例，0 失败 0 错误 0 跳过 |
 | Node.js | `sdk/nodejs` | `npm ci` + `npm test` | 38 个用例全绿 |
-| Rust | 不在本脚本范围 | — | 由 cargo 门禁（fmt/clippy/test）与 `.github/workflows/e2e.yml` 覆盖 |
+| Rust | 不在本脚本范围 | — | 由 cargo 门禁（fmt/clippy/test）与 `ci.yml` 的 e2e job 覆盖 |
 
 ## 本地用法（Windows + WSL2）
 
@@ -88,7 +88,7 @@ E2E_SKIP_PYTHON=1 E2E_SKIP_DOTNET=1 E2E_SKIP_NODE=1 E2E_SKIP_APT=1  # 例如只�
 ## CI 行为
 
 `.github/workflows/ci.yml` 的 `SDK build and tests (debian:12)` job（非 main 分支推送触发；
-main 分支由 `e2e.yml` 跑真机 E2E）：
+main 分支由 `ci.yml` 的 e2e job 跑真机 E2E）：
 
 - 运行环境：`ubuntu-latest` 上的 `container: debian:12`，与本地 WSL 验证环境同源，
   无需 WSL —— 脚本自动识别非 WSL 环境，走同一套 apt + dotnet-install 依赖流程。
@@ -100,5 +100,5 @@ main 分支由 `e2e.yml` 跑真机 E2E）：
 
 Rust 侧（`rfb` / `rfb-runtime` 等 crate）由仓库强制的 cargo 门禁
 （`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-`cargo test --workspace`）以及真机 E2E 工作流 `.github/workflows/e2e.yml` 覆盖，
+`cargo test --workspace`）以及真机 E2E（`ci.yml` 的 e2e job）覆盖，
 本脚本只聚焦四个 SDK 的"全新环境可验证性"。

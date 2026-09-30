@@ -12,6 +12,10 @@ use crate::codec::FrameCodec;
 #[cfg(target_os = "linux")]
 use crate::runtime_service::RuntimeService;
 #[cfg(target_os = "linux")]
+use crate::vsock::{
+    accept_failure_action, AcceptFailure, ACCEPT_FAILURE_LIMIT, ACCEPT_RETRY_BACKOFF,
+};
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use tokio::sync::Mutex;
@@ -51,8 +55,34 @@ pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
     let shared = Arc::new(Mutex::new(RuntimeService::from_environment_with_limits(
         limits,
     )));
+    // A transient accept error must not terminate the pid-1 guest service:
+    // there is no supervisor to restart it, so one bad accept would leave the
+    // VM permanently unreachable. Retry with a short backoff instead, and only
+    // give up on a persistent failure streak (or a non-retryable config error).
+    let mut consecutive_failures: u32 = 0;
     loop {
-        let stream = crate::vsock::accept(&listener).await?;
+        let stream = match crate::vsock::accept(&listener).await {
+            Ok(stream) => {
+                consecutive_failures = 0;
+                stream
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                if let AcceptFailure::GiveUp = accept_failure_action(&error, consecutive_failures) {
+                    eprintln!(
+                        "rfb-guest: vsock accept failed unrecoverably after \
+                         {consecutive_failures} consecutive errors: {error}"
+                    );
+                    return Err(error);
+                }
+                eprintln!(
+                    "rfb-guest: vsock accept failed ({consecutive_failures}/\
+                     {ACCEPT_FAILURE_LIMIT}): {error}"
+                );
+                tokio::time::sleep(ACCEPT_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
         let shared = shared.clone();
         let codec = codec.clone();
         tokio::spawn(async move {

@@ -25,6 +25,13 @@ mod workload;
 pub use acceptance::acceptance;
 #[cfg(unix)]
 pub use backend_up::backend_up;
+// Test hooks for the backend-up decision helpers (same #[doc(hidden)] pattern
+// as the ZeroBootSession test accessors).
+#[cfg(unix)]
+#[doc(hidden)]
+pub use backend_up::{
+    clear_stale_sandboxes_for_test, require_loopback_bind, snapshot_create_args_for_backend,
+};
 pub use benchmark::benchmark;
 pub use binding::{load_snapshot_binding, snapshot_bind, BindingOutput};
 pub use preflight::{client_from_env, preflight, preflight_checks, preflight_text, PreflightCheck};

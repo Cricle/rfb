@@ -17,6 +17,11 @@ public sealed class Sandbox
     /// <summary>Attach a sandbox at a KNOWN guest address with an explicit
     /// transport — the entry point for direct ZBRT bridges (no controller
     /// involved). Mirrors the java SDK's <c>Sandbox.attach</c>.</summary>
+    /// <param name="client">Owning client (supplies the timeout).</param>
+    /// <param name="info">Controller metadata carrying the guest address.</param>
+    /// <param name="transport">Guest transport: "ndjson" or "zbrt".</param>
+    /// <returns>A sandbox handle bound to the given guest address.</returns>
+    /// <exception cref="ValidationException">Invalid transport.</exception>
     public static Sandbox Attach(RfbClient client, SandboxInfo info, string transport)
     {
         if (transport != RfbClient.TransportNdjson && transport != RfbClient.TransportZbrt)
@@ -65,7 +70,10 @@ public sealed class Sandbox
         ? _zbrt.Value
         : throw new InvalidOperationException("zbrt transport not active");
 
-    /// <summary>Guest health: true only when the agent answers pong=true.</summary>
+    /// <summary>Guest health: true only when the agent answers pong=true
+    /// (NDJSON) or reports a healthy HealthAck (ZBRT).</summary>
+    /// <returns>True when the guest agent is healthy.</returns>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
     public async Task<bool> Ping()
     {
         if (Transport == "ndjson")
@@ -79,7 +87,18 @@ public sealed class Sandbox
         return await Zbrt.HealthAsync().ConfigureAwait(false);
     }
 
-    /// <summary>Run `args` in the guest; stdin is ZBRT-only (NDJSON fails closed). <c>cwd</c> defaults to the workspace root.</summary>
+    /// <summary>Run <paramref name="args"/> in the guest; stdin is ZBRT-only
+    /// (NDJSON fails closed). <c>cwd</c> defaults to the workspace root.</summary>
+    /// <param name="args">Non-empty argv to execute.</param>
+    /// <param name="cwd">Working directory inside the guest (default /workspace).</param>
+    /// <param name="timeoutS">Deadline for the command in seconds (default 60).</param>
+    /// <param name="stdin">Standard input; only carried by the ZBRT transport.</param>
+    /// <returns>The aggregated result of the single exec turn.</returns>
+    /// <exception cref="ValidationException">Empty argv, bad cwd/timeout, non-empty
+    /// stdin over NDJSON, or (ZBRT) argc &gt; 255 / stdin &gt; 16 MiB — all before any frame.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
+    /// <exception cref="RemoteException">The guest reported an error or exceeded the output cap.</exception>
+    /// <exception cref="DecodeException">The response could not be decoded.</exception>
     public async Task<ExecResult> Exec(IReadOnlyList<string> args, string cwd = "/workspace", double timeoutS = 60.0, byte[]? stdin = null)
     {
         if (args.Count == 0)
@@ -104,6 +123,10 @@ public sealed class Sandbox
             return GuestResults.ParseExec(v);
         }
 
+        // ZBRT argc fits one header byte and payloads are u32-bounded: reject
+        // locally, with zero frames and no TCP connection (UNIFIED_API.md §4).
+        GuestValidation.ZbrtArgc(args.Count);
+        GuestValidation.PayloadSize((stdin ?? []).Length, GuestValidation.MaxZbrtPayloadBytes);
         var outcome = await Zbrt.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS)).ConfigureAwait(false);
         // ZBRT v1 has no timed-out wire flag: the guest's executor surfaces a
         // deadline miss as an Error frame (an exception here), so the flag is
@@ -111,7 +134,16 @@ public sealed class Sandbox
         return new ExecResult(outcome.ExitCode, outcome.Stdout, outcome.Stderr, false);
     }
 
-    /// <summary>Evaluate a code snippet in the guest; output maps to stdout.</summary>
+    /// <summary>Evaluate a code snippet in the guest; output maps to stdout.
+    /// Not supported over the ZBRT transport (fails closed locally).</summary>
+    /// <param name="code">Code snippet; blank or &gt; 1 MiB is rejected.</param>
+    /// <param name="cwd">Optional guest working directory.</param>
+    /// <param name="timeoutS">Optional deadline in seconds (&gt; 0).</param>
+    /// <returns>The eval result: output in <see cref="ExecResult.Stdout"/>, stderr always empty.</returns>
+    /// <exception cref="ValidationException">Invalid code/cwd/timeout, or ZBRT transport.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
+    /// <exception cref="RemoteException">The guest reported an error.</exception>
+    /// <exception cref="DecodeException">The response could not be decoded.</exception>
     public async Task<ExecResult> Eval(string code, string? cwd = null, double? timeoutS = null)
     {
         GuestValidation.EvalCode(code);
@@ -136,7 +168,11 @@ public sealed class Sandbox
         throw new ValidationException("eval is not supported over the ZBRT transport");
     }
 
-    /// <summary>Directory entries under `path` (default ".").</summary>
+    /// <summary>Directory entries under <paramref name="path"/> (default ".").</summary>
+    /// <param name="path">Guest fs path (relative or /workspace-prefixed).</param>
+    /// <returns>The entries under the path (capped at 1000).</returns>
+    /// <exception cref="ValidationException">Invalid path.</exception>
+    /// <exception cref="DecodeException">The result shape was invalid.</exception>
     public async Task<IReadOnlyList<DirEntry>> Ls(string path = ".")
     {
         GuestValidation.FsPath(path);
@@ -146,7 +182,7 @@ public sealed class Sandbox
             {
                 ["path"] = path,
                 ["max_results"] = GuestValidation.MaxResults,
-            });
+            }).ConfigureAwait(false);
             return GuestResults.ParseLs(v);
         }
 
@@ -155,6 +191,11 @@ public sealed class Sandbox
     }
 
     /// <summary>Find guest paths whose file name matches <paramref name="pattern"/> (path first, UNIFIED_API.md §4).</summary>
+    /// <param name="path">Guest fs path to walk.</param>
+    /// <param name="pattern">Glob name pattern (≤ 1024 bytes, non-empty).</param>
+    /// <returns>Matching paths, relative to <paramref name="path"/> (capped at 1000).</returns>
+    /// <exception cref="ValidationException">Invalid path or pattern.</exception>
+    /// <exception cref="DecodeException">The result shape was invalid.</exception>
     public Task<IReadOnlyList<string>> Find(string path, string pattern)
     {
         GuestValidation.FsPath(path);
@@ -168,6 +209,8 @@ public sealed class Sandbox
     }
 
     /// <summary>Convenience overload: <c>Find(".", pattern)</c>.</summary>
+    /// <param name="pattern">Glob name pattern.</param>
+    /// <returns>Matching paths under the working directory.</returns>
     public Task<IReadOnlyList<string>> Find(string pattern) => Find(".", pattern);
 
     private async Task<IReadOnlyList<string>> FindCore(string path, string pattern)
@@ -177,7 +220,7 @@ public sealed class Sandbox
             ["path"] = path,
             ["pattern"] = pattern,
             ["max_results"] = GuestValidation.MaxResults,
-        });
+        }).ConfigureAwait(false);
         return GuestResults.ParseFind(v);
     }
 
@@ -193,6 +236,11 @@ public sealed class Sandbox
     }
 
     /// <summary>Grep guest file contents (path first, UNIFIED_API.md §4).</summary>
+    /// <param name="path">Guest fs path to search.</param>
+    /// <param name="pattern">Non-empty pattern (≤ 1024 bytes).</param>
+    /// <returns>Matching lines with optional location (capped at 1000 matches / 50 KiB).</returns>
+    /// <exception cref="ValidationException">Invalid path or pattern.</exception>
+    /// <exception cref="DecodeException">The result shape was invalid.</exception>
     public Task<IReadOnlyList<GrepMatch>> Grep(string path, string pattern)
     {
         GuestValidation.FsPath(path);
@@ -206,6 +254,8 @@ public sealed class Sandbox
     }
 
     /// <summary>Convenience overload: <c>Grep(".", pattern)</c>.</summary>
+    /// <param name="pattern">Non-empty pattern.</param>
+    /// <returns>Matching lines under the working directory.</returns>
     public Task<IReadOnlyList<GrepMatch>> Grep(string pattern) => Grep(".", pattern);
 
     private async Task<IReadOnlyList<GrepMatch>> GrepCore(string path, string pattern)
@@ -216,7 +266,7 @@ public sealed class Sandbox
             ["pattern"] = pattern,
             ["max_results"] = GuestValidation.MaxResults,
             ["max_bytes"] = GuestValidation.MaxResultBytes,
-        });
+        }).ConfigureAwait(false);
         return GuestResults.ParseGrep(v);
     }
 
@@ -233,6 +283,12 @@ public sealed class Sandbox
     }
 
     /// <summary>Read a guest file with optional offset / maxBytes cap.</summary>
+    /// <param name="path">Guest file path (relative or absolute, non-escaping).</param>
+    /// <param name="offset">Optional byte offset to start reading at.</param>
+    /// <param name="maxBytes">Optional cap; must be 1..=51200 when present.</param>
+    /// <returns>The file bytes with truncation metadata.</returns>
+    /// <exception cref="ValidationException">Invalid path or out-of-range maxBytes.</exception>
+    /// <exception cref="DecodeException">The result shape was invalid.</exception>
     public async Task<FileRead> Read(string path, long? offset = null, long? maxBytes = null)
     {
         GuestValidation.FilePath(path);
@@ -267,7 +323,14 @@ public sealed class Sandbox
         return GuestResults.ParseRead(result);
     }
 
-    /// <summary>Write (or append) `data`; returns bytes written.</summary>
+    /// <summary>Write (or append) <paramref name="data"/>; returns bytes written.</summary>
+    /// <param name="path">Guest file path (relative or absolute, non-escaping).</param>
+    /// <param name="data">Payload bytes (≤ 51200).</param>
+    /// <param name="append">Append instead of truncate-create.</param>
+    /// <param name="mode">Optional file mode (e.g. 0o644).</param>
+    /// <returns>Number of bytes written as confirmed by the guest.</returns>
+    /// <exception cref="ValidationException">Invalid path or oversized payload.</exception>
+    /// <exception cref="DecodeException">The result lacked bytes_written.</exception>
     public async Task<long> Write(string path, byte[] data, bool append = false, uint? mode = null)
     {
         GuestValidation.FilePath(path);
@@ -300,6 +363,14 @@ public sealed class Sandbox
     }
 
     /// <summary>Start an interactive stream. env/pty are NDJSON-only options.</summary>
+    /// <param name="args">Non-empty argv to run under the stream.</param>
+    /// <param name="cwd">Optional guest working directory.</param>
+    /// <param name="pty">Allocate a pseudo-terminal (NDJSON only).</param>
+    /// <param name="env">Extra environment variables (NDJSON only).</param>
+    /// <returns>An interactive stream handle.</returns>
+    /// <exception cref="ValidationException">Empty argv, invalid cwd, or (ZBRT)
+    /// pty/env/argc — all rejected before any frame is sent.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
     public async Task<GuestStream> Stream(
         IReadOnlyList<string> args,
         string? cwd = null,
@@ -335,11 +406,16 @@ public sealed class Sandbox
             throw new ValidationException("env is not supported over zbrt transport");
         }
 
+        // ZBRT argc fits one header byte: reject locally, with zero frames and
+        // no TCP connection (PROTOCOL.md §3.2).
+        GuestValidation.ZbrtArgc(args.Count);
+
         var zbrtSession = await Zbrt.StreamAsync(args, cwd).ConfigureAwait(false);
         return new GuestStream(zbrtSession);
     }
 
     /// <summary>Delete this sandbox (2xx/404 both succeed).</summary>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx, non-404 status.</exception>
     public async Task Delete()
     {
         await _client.DeleteSandbox(Id).ConfigureAwait(false);

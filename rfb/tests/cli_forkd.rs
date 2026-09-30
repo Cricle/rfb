@@ -1,11 +1,19 @@
 #![cfg(feature = "cli")]
 
+mod common;
+
+use common::http::mock_once::{mock_http, CapturedRequest};
+use rfb::cli::commands::ForkdBackendUpArgs;
+use rfb::cli::error::EXIT_VALIDATION;
 use rfb::cli::forkd::{
-    acceptance, benchmark, load_snapshot_binding, preflight_text, provenance_state,
-    resolve_forkd_bin, sanitize_snapshot_info, wait_for_guest_ready,
+    acceptance, benchmark, clear_stale_sandboxes_for_test, load_snapshot_binding, preflight_text,
+    provenance_state, require_loopback_bind, resolve_forkd_bin, sanitize_snapshot_info,
+    snapshot_create_args_for_backend, wait_for_guest_ready,
 };
 use serde_json::json;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
@@ -127,4 +135,82 @@ async fn offline_validation_paths_do_not_connect() {
         .await
         .is_err());
     assert!(acceptance("not a url", "snap", false).await.is_err());
+}
+
+/// A `ForkdBackendUpArgs` with only the fields the helpers read varied.
+fn backend_up_args(require_provenance: bool) -> ForkdBackendUpArgs {
+    ForkdBackendUpArgs {
+        rootfs: None,
+        pid1_dir: None,
+        with_python: false,
+        with_lua: false,
+        allow_dynamic: false,
+        kernel: PathBuf::from("/boot/vmlinux"),
+        tap: "forkd-tap0".to_owned(),
+        bind: "127.0.0.1:8889".to_owned(),
+        tag: "sample".to_owned(),
+        state_dir: None,
+        require_provenance,
+    }
+}
+
+#[test]
+fn backend_up_flows_require_provenance_into_snapshot_create() {
+    // P1: `--require-provenance` used to be accepted and silently ignored —
+    // the delegated snapshot create was built with a hardcoded `false`.
+    let passed = snapshot_create_args_for_backend(
+        "http://127.0.0.1:8889",
+        &backend_up_args(true),
+        Path::new("/tmp/forkd-agent.ext4"),
+    );
+    assert!(passed.require_provenance);
+    let unset = snapshot_create_args_for_backend(
+        "http://127.0.0.1:8889",
+        &backend_up_args(false),
+        Path::new("/tmp/forkd-agent.ext4"),
+    );
+    assert!(!unset.require_provenance);
+}
+
+#[test]
+fn backend_up_bind_gate_accepts_localhost_and_rejects_non_loopback() {
+    // The gate is the shared localhost single source: `localhost:PORT` is
+    // accepted exactly like `127.0.0.1:PORT` (matching the zeroboot up path),
+    // and a non-loopback bind is a validation error.
+    assert_eq!(
+        require_loopback_bind("127.0.0.1:8889").unwrap(),
+        "http://127.0.0.1:8889"
+    );
+    assert!(require_loopback_bind("localhost:8889").is_ok());
+    let err = require_loopback_bind("0.0.0.0:8889").expect_err("non-loopback rejected");
+    assert_eq!(err.code, EXIT_VALIDATION);
+}
+
+#[tokio::test]
+async fn backend_up_clears_sandboxes_only_when_it_spawned_the_controller() {
+    // A controller this invocation did NOT spawn owns live sandboxes: the
+    // gate must issue no request at all.
+    let (tx, rx) = mpsc::channel::<CapturedRequest>();
+    let (addr, server) = mock_http("200 OK", "[]".to_owned(), None, Some(tx)).await;
+    clear_stale_sandboxes_for_test(&format!("http://{addr}"), false)
+        .await
+        .expect("gated sweep with controller_started=false");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "no-clear gate issued a request to the healthy controller"
+    );
+    server.abort();
+
+    // When THIS invocation spawned the controller, the sweep runs.
+    let (tx2, rx2) = mpsc::channel::<CapturedRequest>();
+    let (addr2, server2) = mock_http("200 OK", "[]".to_owned(), None, Some(tx2)).await;
+    clear_stale_sandboxes_for_test(&format!("http://{addr2}"), true)
+        .await
+        .expect("gated sweep with controller_started=true");
+    let captured = rx2
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the sweep ran against the spawned controller");
+    assert_eq!(captured.method, "GET");
+    assert_eq!(captured.path, "/v1/sandboxes");
+    server2.await.unwrap();
 }

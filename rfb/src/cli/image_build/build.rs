@@ -86,11 +86,21 @@ pub fn build(
     manifest_path: &Path,
     output: Option<&Path>,
     execute: bool,
+    force: bool,
 ) -> Result<Value, CliError> {
     let manifest = validate(manifest_path)?;
     let output_path = output
         .map(Path::to_path_buf)
         .unwrap_or_else(|| manifest_path.with_extension("img"));
+    // The output path is passed to mke2fs/debugfs as an argv string; a
+    // non-UTF-8 path must fail validation instead of silently retargeting
+    // the build to a default name.
+    if output_path.to_str().is_none() {
+        return Err(validation(format!(
+            "output image path must be valid UTF-8: {}",
+            output_path.display()
+        )));
+    }
     if !execute {
         let mke2fs = tool_available("mke2fs");
         let debugfs = tool_available("debugfs");
@@ -127,13 +137,38 @@ pub fn build(
     if !tool_available("mke2fs") || !tool_available("debugfs") {
         return Err(external("mke2fs and debugfs are required for --execute"));
     }
+    // Overwrite gate, same contract as build_rootfs: a previous image is only
+    // replaced with --force.
+    if output_path.exists() && !force {
+        return Err(validation(format!(
+            "refusing to overwrite existing output (use --force): {}",
+            output_path.display()
+        )));
+    }
 
+    // Build beside the destination and publish only after all verification
+    // succeeds. Keeping the temporary file in the same directory makes the
+    // final rename atomic; a mid-build failure (mke2fs, a debugfs injection,
+    // the digest verify below) then leaves any prior output intact instead
+    // of a corrupt half-written image where a good one was.
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| io(error.to_string()))?;
+    }
+    let temp_image = NamedTempFile::new_in(output_path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| io(error.to_string()))?;
+    let image_path = temp_image.path().to_path_buf();
+    let image_arg = image_path.to_str().ok_or_else(|| {
+        external(format!(
+            "temporary image path is not valid UTF-8: {}",
+            image_path.display()
+        ))
+    })?;
     let status = Command::new("mke2fs")
         .args([
             "-t",
             "ext4",
             "-F",
-            output_path.to_str().unwrap_or("image.img"),
+            image_arg,
             &format!("{}", manifest.image_size_bytes / 4096),
         ])
         .status()
@@ -158,14 +193,14 @@ pub fn build(
         // mke2fs already creates default top-level directories (`/bin`, `/sbin`,
         // `/etc`, ...). Skip a directory that already exists instead of failing.
         if run_debugfs(
-            &output_path,
+            &image_path,
             &format!("stat {}", debugfs_quote(&directory)),
             false,
         )
         .is_err()
         {
             run_debugfs(
-                &output_path,
+                &image_path,
                 &format!("mkdir {}", debugfs_quote(&directory)),
                 false,
             )?;
@@ -178,7 +213,7 @@ pub fn build(
         )?;
         let destination = format!("/{}", file.path);
         run_debugfs(
-            &output_path,
+            &image_path,
             &format!(
                 "write {} {}",
                 debugfs_quote(&source.to_string_lossy()),
@@ -187,7 +222,7 @@ pub fn build(
             false,
         )?;
         let actual = run_debugfs(
-            &output_path,
+            &image_path,
             &format!("cat {}", debugfs_quote(&destination)),
             true,
         )?;
@@ -203,7 +238,7 @@ pub fn build(
         }
     }
 
-    let digest = sha256(&output_path).map_err(|error| io(error.to_string()))?;
+    let digest = sha256(&image_path).map_err(|error| io(error.to_string()))?;
     if let Some(expected) = image.digest.as_deref() {
         let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
         if !digest.eq_ignore_ascii_case(expected) {
@@ -212,6 +247,11 @@ pub fn build(
             )));
         }
     }
+    // Publish the fully verified image atomically, leaving any prior output
+    // intact if construction or verification above fails.
+    temp_image
+        .persist(&output_path)
+        .map_err(|error| io(error.error.to_string()))?;
     let artifact =
         crate::cli::image_build::ArtifactManifest::for_image(&output_path, &digest, image)?;
     artifact.validate_schema()?;

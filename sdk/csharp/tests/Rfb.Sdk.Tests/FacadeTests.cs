@@ -47,6 +47,15 @@ public class FacadeTests {
         return new Fixture(client, controller, guest, sandboxes[0]);
     }
 
+    /// <summary>Controller serving one sandbox handle bound to the given ndjson guest.</summary>
+    private static FakeHttpServer NewControllerFor(FakeNdjsonGuest guest) {
+        var body = string.Format(System.Globalization.CultureInfo.InvariantCulture, SandboxJson, "base", guest.Address);
+        return new FakeHttpServer(req => (req.Method, req.Path) switch {
+            ("POST", "/v1/sandboxes") => new FakeHttpServer.Response(200, $"[{body}]"),
+            _ => new FakeHttpServer.Response(404, "not found"),
+        });
+    }
+
     [Theory]
     [InlineData("ndjson")]
     [InlineData("zbrt")]
@@ -204,6 +213,35 @@ public class FacadeTests {
     public async Task Connect_BadId_RaisesValidationError() {
         using var fx = await NewFixtureAsync("ndjson");
         await Assert.ThrowsAsync<ValidationException>(() => fx.Client.Connect("bad id!"));
+    }
+
+    [Fact]
+    public async Task Connect_ExplicitTransport_OverridesHandle() {
+        // UNIFIED_API.md §3: attaching a Sandbox keeps its transport unless a
+        // transport is EXPLICITLY passed — then it overrides.
+        using var fx = await NewFixtureAsync("ndjson");
+        var overridden = await fx.Client.Connect(fx.Sandbox, "zbrt");
+        Assert.Equal("zbrt", overridden.Transport);
+        Assert.Equal("sb-1", overridden.Id);
+        var kept = await fx.Client.Connect(fx.Sandbox);
+        Assert.Equal("ndjson", kept.Transport);
+        await Assert.ThrowsAsync<ValidationException>(() => fx.Client.Connect(fx.Sandbox, "grpc"));
+    }
+
+    [Fact]
+    public async Task CreateSandbox_InvalidTransport_FailsClosedBeforeRequest() {
+        var requests = 0;
+        using var controller = new FakeHttpServer(_ => {
+            Interlocked.Increment(ref requests);
+            return new FakeHttpServer.Response(200, "[]");
+        });
+        var client = new RfbClient(controller.Url, token: null);
+        await Assert.ThrowsAsync<ValidationException>(
+            () => client.CreateSandbox("base", transport: "grpc"));
+        Assert.Equal(0, requests); // zero HTTP traffic
+        await Assert.ThrowsAsync<ValidationException>(
+            () => client.ListSandboxes("grpc"));
+        Assert.Equal(0, requests);
     }
 
     // ---- error classes -----------------------------------------------------
@@ -366,6 +404,11 @@ public class FacadeTests {
     public async Task Stream_Zbrt_EventsStop() {
         using var fx = await NewFixtureAsync("zbrt");
         var stream = await fx.Sandbox.Stream(new[] { "cat" });
+        // ZBRT has no started frame: the facade synthesizes it on first NextEvent.
+        var started = await stream.NextEvent();
+        Assert.Equal(StreamEventKind.Started, started!.Kind);
+        Assert.Empty(started.Data);
+
         var first = await stream.NextEvent();
         Assert.Equal(StreamEventKind.Stdout, first!.Kind);
         Assert.Equal("hi\n"u8.ToArray(), first.Data);
@@ -376,6 +419,38 @@ public class FacadeTests {
         Assert.Equal(-1, exit.Code);
         Assert.Null(await stream.NextEvent()); // sequence ended
         await Assert.ThrowsAsync<RemoteException>(() => stream.SendInput("late"));
+    }
+
+    [Fact]
+    public async Task Stream_Ndjson_IgnoresUnknownLines() {
+        // PROTOCOL.md §2.5: non-terminal lines matching no event key are ignored.
+        using var guest = new FakeNdjsonGuest {
+            Handler = async (session, value) => {
+                if (value.TryGetProperty("action", out var action) && action.GetString() == "stream") {
+                    await session.WriteAsync(new { progress = 1 }); // unmapped → ignored
+                    await session.WriteAsync(new { started = true });
+                    await session.WriteAsync(new { stdout = "hi" });
+                    await session.WriteAsync(new { exit_code = (int?)null }); // signal kill
+                    return;
+                }
+
+                await FakeNdjsonGuest.DefaultHandler(session, value);
+            },
+        };
+        var controller = NewControllerFor(guest);
+        using var client = new RfbClient(controller.Url, token: null);
+        var sandbox = (await client.CreateSandbox("base"))[0];
+        using var stream = await sandbox.Stream(new[] { "cat" });
+
+        Assert.Equal(StreamEventKind.Started, (await stream.NextEvent())!.Kind);
+        var stdout = await stream.NextEvent();
+        Assert.Equal(StreamEventKind.Stdout, stdout!.Kind);
+        Assert.Equal("hi"u8.ToArray(), stdout.Data);
+        // {"exit_code":null} — key presence is terminal, null value → Exit(null).
+        var exit = await stream.NextEvent();
+        Assert.Equal(StreamEventKind.Exit, exit!.Kind);
+        Assert.Null(exit.Code);
+        Assert.Null(await stream.NextEvent());
     }
 
     [Fact]

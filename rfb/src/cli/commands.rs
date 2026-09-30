@@ -212,6 +212,10 @@ pub struct BuildArgs {
     /// Allow invoking mke2fs/debugfs; without this, only a safe dry-run is performed.
     #[arg(long)]
     pub execute: bool,
+    /// Refuse to overwrite an existing output without this flag (the build
+    /// publishes atomically, so an existing image survives a failed build).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `rfb-cli image build-rootfs`.

@@ -71,7 +71,13 @@ where
         }
     });
 
-    loop {
+    // Every loop exit is a `break` carrying the I/O outcome — never a bare
+    // `return`. An early return would drop `result_rx` while a turn is still
+    // in flight: the worker's later delivery would fail, the executor would
+    // be dropped, and the shared service would stay executor-less forever
+    // (every future turn on this runtime bricked). The detached-turn
+    // recovery after the loop therefore runs unconditionally.
+    let io_result = loop {
         tokio::select! {
             biased;
             result = result_rx.recv(), if worker_active => {
@@ -83,7 +89,11 @@ where
                             let mut runtime = shared.lock().await;
                             runtime.complete_turn(session_id, request_id, result, executor)
                         };
-                        write_responses(&mut writer, &codec, sequence, &responses).await?;
+                        if let Err(error) =
+                            write_responses(&mut writer, &codec, sequence, &responses).await
+                        {
+                            break Err(error);
+                        }
                     }
                     // The worker dropped its sender without delivering: the
                     // result can never arrive — reclaim the in-flight turn
@@ -96,7 +106,11 @@ where
                             let mut runtime = shared.lock().await;
                             runtime.abandon_active_turn()
                         };
-                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                        if let Err(error) =
+                            write_responses(&mut writer, &codec, 0, &responses).await
+                        {
+                            break Err(error);
+                        }
                     }
                 }
             }
@@ -119,7 +133,11 @@ where
                             let mut runtime = shared.lock().await;
                             runtime.abandon_active_turn()
                         };
-                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                        if let Err(error) =
+                            write_responses(&mut writer, &codec, 0, &responses).await
+                        {
+                            break Err(error);
+                        }
                     }
                     // The worker finished and its delivery is queued (the
                     // biased result branch lost the race): take it here.
@@ -128,7 +146,11 @@ where
                             let mut runtime = shared.lock().await;
                             runtime.complete_turn(session_id, request_id, result, executor)
                         };
-                        write_responses(&mut writer, &codec, sequence, &responses).await?;
+                        if let Err(error) =
+                            write_responses(&mut writer, &codec, sequence, &responses).await
+                        {
+                            break Err(error);
+                        }
                     }
                     // The worker finished but never delivered (send failed):
                     // reclaim.
@@ -137,18 +159,22 @@ where
                             let mut runtime = shared.lock().await;
                             runtime.abandon_active_turn()
                         };
-                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                        if let Err(error) =
+                            write_responses(&mut writer, &codec, 0, &responses).await
+                        {
+                            break Err(error);
+                        }
                     }
                 }
             }
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else {
-                    break;
+                    break Ok(());
                 };
                 let (frame, request) = match frame {
                     Ok(value) => value,
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(error) => return Err(error),
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                    Err(error) => break Err(error),
                 };
                 let response_sequence = frame.sequence;
                 let was_shutdown = shutdown_requested(&request);
@@ -164,8 +190,16 @@ where
                             runtime.replay_cached_turn(&turn)
                         };
                         if let Some(responses) = replay {
-                            write_responses(&mut writer, &codec, response_sequence, &responses)
-                                .await?;
+                            if let Err(error) = write_responses(
+                                &mut writer,
+                                &codec,
+                                response_sequence,
+                                &responses,
+                            )
+                            .await
+                            {
+                                break Err(error);
+                            }
                             continue;
                         }
                         // Claim the turn under the shared lock, then release it
@@ -213,23 +247,31 @@ where
                         runtime.handle(request)
                     }
                 };
-                write_responses(&mut writer, &codec, response_sequence, &responses).await?;
+                if let Err(error) =
+                    write_responses(&mut writer, &codec, response_sequence, &responses).await
+                {
+                    break Err(error);
+                }
                 if was_shutdown {
-                    break;
+                    break Ok(());
                 }
             }
         }
-    }
-    // If the connection ends while a turn is in flight (the client vanished),
-    // a detached task keeps the result channel alive so the worker's delivery
-    // succeeds and the executor is returned to the shared service exactly
-    // once. The FIRST wait is bounded: a worker that neither delivers nor dies
-    // within DETACHED_TURN_WAIT stops being treated as merely slow — the
-    // in-flight bookkeeping is abandoned so Cancel/health answers stop lying.
-    // But the channel stays alive past that point: a healthy worker with a
-    // long deadline (legal turns run up to 1800s) delivers later, and its
-    // complete_turn is what returns the single workspace executor — dropping
-    // the receiver here would brick every future turn on this runtime.
+    };
+    // If the connection ends while a turn is in flight (the client vanished,
+    // a read error, or a failed response write), a detached task keeps the
+    // result channel alive so the worker's delivery succeeds and the executor
+    // is returned to the shared service exactly once. This recovery is
+    // UNCONDITIONAL: any loop exit (graceful EOF or an I/O error) must run
+    // it, because the in-flight worker's late `complete_turn` is the single
+    // workspace executor's only way home — dropping the receiver here would
+    // brick every future turn on this runtime. The FIRST wait is bounded: a
+    // worker that neither delivers nor dies within DETACHED_TURN_WAIT stops
+    // being treated as merely slow — the in-flight bookkeeping is abandoned
+    // so Cancel/health answers stop lying. But the channel stays alive past
+    // that point: a healthy worker with a long deadline (legal turns run up
+    // to 1800s) delivers later, and its complete_turn is what returns the
+    // single workspace executor.
     if worker_active {
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
@@ -266,7 +308,7 @@ where
             }
         });
     }
-    Ok(())
+    io_result
 }
 
 fn shutdown_requested(request: &ControlMessage) -> bool {

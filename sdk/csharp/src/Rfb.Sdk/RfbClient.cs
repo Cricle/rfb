@@ -22,9 +22,15 @@ public sealed class RfbClient : IDisposable
     public double TimeoutS => _timeout.TotalSeconds;
 
     /// <summary>
-    /// <paramref name="baseUrl"/> defaults to env FORKD_URL (http://127.0.0.1:8889);
-    /// <paramref name="token"/> defaults to env FORKD_TOKEN (non-empty only).
+    /// Create a client. <paramref name="baseUrl"/> defaults to env FORKD_URL
+    /// (http://127.0.0.1:8889 — unset or blank both fall back); <paramref
+    /// name="token"/> defaults to env FORKD_TOKEN (a Bearer header is sent
+    /// only when non-empty).
     /// </summary>
+    /// <param name="baseUrl">forkd controller base URL (http/https with host).</param>
+    /// <param name="token">Controller Bearer token; null/empty sends no header.</param>
+    /// <param name="timeoutS">Per-request timeout (connect + read) in seconds; must be &gt; 0 and finite.</param>
+    /// <exception cref="ValidationException">Invalid base URL or non-positive/non-finite timeout.</exception>
     public RfbClient(string? baseUrl = null, string? token = null, double timeoutS = 10.0)
     {
         var url = baseUrl ?? Environment.GetEnvironmentVariable("FORKD_URL");
@@ -50,7 +56,11 @@ public sealed class RfbClient : IDisposable
         _controller = new ForkdControllerHttp(url, tok, _timeout);
     }
 
-    /// <summary>All snapshots as reported by the controller.</summary>
+    /// <summary>All snapshots as reported by the controller (<c>GET /v1/snapshots</c>).</summary>
+    /// <returns>The snapshots known to the controller.</returns>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx status.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
+    /// <exception cref="DecodeException">The controller response could not be decoded.</exception>
     public async Task<IReadOnlyList<Snapshot>> ListSnapshots()
     {
         var arr = await _controller.ListSnapshotsAsync().ConfigureAwait(false);
@@ -58,6 +68,11 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Snapshot detail via /info → legacy fallback; both 404 → null.</summary>
+    /// <param name="tag">Snapshot tag to look up.</param>
+    /// <returns>The snapshot, or null when the controller does not know it.</returns>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx (non-404) status.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
+    /// <exception cref="DecodeException">The controller response could not be decoded.</exception>
     public async Task<Snapshot?> Snapshot(string tag)
     {
         var v = await _controller.SnapshotInfoAsync(tag).ConfigureAwait(false);
@@ -65,6 +80,12 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Poll every 100 ms until ready; "failed" → RemoteException; timeout → TransportException.</summary>
+    /// <param name="tag">Snapshot tag to wait for.</param>
+    /// <param name="timeoutS">Wait budget in seconds (default 60); a timeout is a transport-class error.</param>
+    /// <returns>The ready and bootable snapshot.</returns>
+    /// <exception cref="RemoteException">The snapshot reported a failed status.</exception>
+    /// <exception cref="TransportException">The snapshot did not become ready within the budget.</exception>
+    /// <exception cref="ValidationException">Non-positive or non-finite <paramref name="timeoutS"/>.</exception>
     public async Task<Snapshot> WaitSnapshot(string tag, double timeoutS = 60)
     {
         // Fail closed like the Java/Python baselines: NaN/Infinity would
@@ -109,6 +130,19 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Create `n` sandboxes from a bootable snapshot tag.</summary>
+    /// <param name="snapshotTag">Bootable snapshot tag to spawn from.</param>
+    /// <param name="n">Number of sandboxes to create.</param>
+    /// <param name="perChildNetns">Give each child its own network namespace.</param>
+    /// <param name="memoryLimitMib">Memory cap in MiB (null = controller default).</param>
+    /// <param name="prewarm">Ask the controller to prewarm the sandbox.</param>
+    /// <param name="liveFork">Fork the sandbox live from the parent VM.</param>
+    /// <param name="hugepages">Use hugepages for the guest memory.</param>
+    /// <param name="transport">Guest transport of the returned handles: "ndjson" (default) or "zbrt".</param>
+    /// <returns>The created sandboxes.</returns>
+    /// <exception cref="ValidationException">Invalid transport (rejected before any request).</exception>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx status.</exception>
+    /// <exception cref="TransportException">Connection failure or timeout.</exception>
+    /// <exception cref="DecodeException">The controller response could not be decoded.</exception>
     public async Task<IReadOnlyList<Sandbox>> CreateSandbox(
         string snapshotTag,
         int n = 1,
@@ -119,6 +153,10 @@ public sealed class RfbClient : IDisposable
         bool hugepages = false,
         string transport = "ndjson")
     {
+        // Fail closed on the transport BEFORE any network traffic (§9.8):
+        // validating only in the Sandbox ctor would leak an invalid value
+        // into an already-issued POST.
+        GuestValidation.Transport(transport);
         var body = new Dictionary<string, object?>
         {
             ["snapshot_tag"] = snapshotTag,
@@ -134,8 +172,12 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Live sandboxes; `transport` selects the guest transport of the returned handles.</summary>
+    /// <param name="transport">Guest transport of the returned handles: "ndjson" (default) or "zbrt".</param>
+    /// <returns>The live sandboxes as reported by the controller.</returns>
+    /// <exception cref="ValidationException">Invalid transport (rejected before any request).</exception>
     public async Task<IReadOnlyList<Sandbox>> ListSandboxes(string transport = "ndjson")
     {
+        GuestValidation.Transport(transport);
         var arr = await _controller.ListSandboxesAsync().ConfigureAwait(false);
         return ToSandboxes(ParseList<SandboxInfo>(arr), transport);
     }
@@ -152,21 +194,31 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Attach an existing sandbox by id string or by Sandbox value.</summary>
-    public async Task<Sandbox> Connect(object sandboxOrId, string transport = "ndjson")
+    /// <param name="sandboxOrId">A <see cref="Sandbox"/> handle, or a sandbox id string.</param>
+    /// <param name="transport">
+    /// Guest transport override: only an EXPLICIT value overrides an attached
+    /// <see cref="Sandbox"/> handle (null keeps the handle's transport); an id
+    /// string resolves via the live pool with null meaning "ndjson".
+    /// </param>
+    /// <returns>The attached sandbox handle.</returns>
+    /// <exception cref="ValidationException">Invalid transport, invalid id, or unsupported argument type.</exception>
+    /// <exception cref="RemoteException">No live sandbox matches the id ("sandbox not found").</exception>
+    public async Task<Sandbox> Connect(object sandboxOrId, string? transport = null)
     {
+        GuestValidation.Transport(transport);
         switch (sandboxOrId)
         {
             case Sandbox existing:
-                // Attach as-is: an existing handle keeps its transport instead
-                // of being silently reset to the default.
-                return existing;
+                // Rust attach semantics (ConnectTarget for &Sandbox): attach the
+                // handle as-is; only an explicitly passed transport overrides it.
+                return transport is null
+                    ? existing
+                    : new Sandbox(this, existing.Info, transport, _timeout);
             case string id:
                 {
                     GuestValidation.Id(id);
-                    // Fail closed on the transport BEFORE any network traffic
-                    // (§9.8), matching Java/Node/Python's validation order.
-                    GuestValidation.Transport(transport);
-                    var list = await ListSandboxes(transport).ConfigureAwait(false);
+                    var resolved = transport ?? TransportNdjson;
+                    var list = await ListSandboxes(resolved).ConfigureAwait(false);
                     foreach (var sandbox in list)
                     {
                         if (sandbox.Id == id)
@@ -183,10 +235,17 @@ public sealed class RfbClient : IDisposable
     }
 
     /// <summary>Raw controller ping reply, returned as-is.</summary>
+    /// <param name="id">Sandbox id to ping.</param>
+    /// <returns>The controller's ping response JSON.</returns>
+    /// <exception cref="ValidationException">Invalid sandbox id.</exception>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx status.</exception>
     public async Task<JsonElement> PingSandbox(string id) =>
         await _controller.PingAsync(id).ConfigureAwait(false);
 
     /// <summary>Delete a sandbox; 2xx and 404 are both success.</summary>
+    /// <param name="id">Sandbox id to delete.</param>
+    /// <exception cref="ValidationException">Invalid sandbox id.</exception>
+    /// <exception cref="HttpStatusException">The controller returned a non-2xx, non-404 status.</exception>
     public async Task DeleteSandbox(string id) =>
         await _controller.DeleteSandboxAsync(id).ConfigureAwait(false);
 

@@ -225,6 +225,12 @@ class _GuestNdjsonClient:
         except OSError as e:
             sock.close()
             raise TransportError(f"guest write failed: {e}") from e
+        except BaseException:
+            # Auth failures (RemoteError for a rejected token) escaped the
+            # OSError handler and leaked both the socket and its reader.
+            sock.close()
+            rfile.close()
+            raise
         # Reuse the already-buffered reader so bytes read ahead of the auth
         # exchange cannot be lost between two makefile() handles.
         return _NdjsonStream(sock, rfile)

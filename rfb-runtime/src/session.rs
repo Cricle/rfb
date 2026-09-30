@@ -10,6 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Single-file read/write cap for the structured workspace file RPCs. This is
+/// the wire contract value (sdk/PROTOCOL.md: read/write payloads ≤ 51200
+/// bytes; the forkd agent's `rfb::guest::limits::MAX_GUEST_RESULT_BYTES`), not
+/// the (much larger) event/frame cap: host-side validation and the guest
+/// executor must refuse the same oversized file operations, so ONE constant
+/// owns the contract and both sides consume it.
+pub const FILE_RPC_MAX_BYTES: usize = 50 * 1024;
+
 /// The request opcode each control message is carried with.
 #[cfg(any(feature = "guest", all(feature = "host-vsock", unix)))]
 use crate::codec::MessageType;

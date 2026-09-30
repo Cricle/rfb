@@ -67,6 +67,19 @@ public class ControllerHttpTests
     }
 
     [Fact]
+    public void SandboxInfo_BranchCountNull_ReadsAsZero()
+    {
+        // serde(default) semantics (UNIFIED_API.md §1/§6): a null branch_count
+        // must not fail deserialization — it reads as 0, like the Python model.
+        var info = System.Text.Json.JsonSerializer.Deserialize<Rfb.Sdk.SandboxInfo>(
+            """{"id":"x","branch_count":null}""");
+        Assert.NotNull(info);
+        Assert.Equal(0, info!.BranchCount);
+        var missing = System.Text.Json.JsonSerializer.Deserialize<Rfb.Sdk.SandboxInfo>("""{"id":"y"}""");
+        Assert.Equal(0, missing!.BranchCount);
+    }
+
+    [Fact]
     public async Task SnapshotInfo_Both404_ReturnsNull()
     {
         using var server = new FakeHttpServer(_ => new FakeHttpServer.Response(404, "missing"));

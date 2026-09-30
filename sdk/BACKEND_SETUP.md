@@ -173,7 +173,7 @@ export RFB_ZBRT_VM_MEM_MIB=48         # 2GB 机器档位；默认 128（Firecrac
 100 并发 create **100/100 成功**，摊薄 **~54ms/create**（4 分片）；随后 100 个
 并发 echo 全部成功（~1s）。分片数按 CPU 预算（每分片第一个 create 付一次
 父快照 ~1.1s）。首次创建会自动把快照目录收紧为 0700/0600（memory.bin 含
-VM 内存，禁止 world-readable）。CI 门禁：e2e.yml 的
+VM 内存，禁止 world-readable）。CI 门禁：ci.yml 的 e2e job
 "Real-VM 100-concurrency gate" 步骤。
 
 跑这两个真机测试（concurrency / fork）需要的环境变量（测试里都有默认值，
@@ -227,7 +227,7 @@ let (fork, grandchild) = fork.fork().await?;     // 链式 fork 同样可用
   共享持有，最后一个 drop 时自动删除（`fork_checkpoint_dir()` 可查）。
 - 需要 `RFB_ZBRT_SNAPSHOT_DIR`（热模式）；冷启动 VM 的 relay 路径在私有
   tempdir 里，随原沙箱消亡，fork 不支持。
-- 真机门禁：`rfb/tests/zeroboot_fork.rs`（e2e.yml "Real-VM fork gate" 步骤）；
+- 真机门禁：`rfb/tests/zeroboot_fork.rs`（ci.yml 的 e2e job "Real-VM fork gate" 步骤）；
   单元门禁：fork 前置条件 fail-closed（`zeroboot_session.rs`）。
 
 ### 6c) forkd（root 权限，TAP 网络）

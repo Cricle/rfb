@@ -1446,3 +1446,135 @@ fn workspace_executor_live_stream_never_splits_multibyte_across_chunks() {
     assert!(!streamed.contains('\u{FFFD}'));
     let _ = fs::remove_dir_all(root);
 }
+
+// The cancelled-replay tombstone bound mirrors the src-side CANCELLED_LIMIT
+// (kept private); keep the two in sync if the constant ever moves.
+const CANCELLED_LIMIT: usize = 256;
+
+fn turn_request_owned(session_id: &str, request_id: &str) -> SessionRequest {
+    SessionRequest {
+        session_id: session_id.into(),
+        request_id: request_id.into(),
+        prompt: "prompt".into(),
+    }
+}
+
+#[test]
+fn cancelled_request_eviction_leaves_a_tombstone_against_reexecution() {
+    let mut service =
+        RuntimeService::with_executor_impl(RuntimeLimits::default(), RecordingExecutor::default());
+    ready(&mut service);
+
+    // Cancel one more distinct turn than the retention bound so the oldest
+    // cancelled entry is evicted. Each cycle: claim (worker path), cancel,
+    // then hand the executor back via complete_turn so the next cycle can
+    // claim again.
+    for i in 0..=CANCELLED_LIMIT {
+        let request_id = format!("r{i}");
+        let turn = turn_request_owned("s", &request_id);
+        let executor = service.spawn_turn(&turn).unwrap();
+        assert_eq!(
+            service.cancel_active("s", &request_id),
+            Vec::<RuntimeMessage>::new()
+        );
+        service.complete_turn(
+            "s".into(),
+            request_id,
+            Err("request cancelled".into()),
+            executor,
+        );
+    }
+
+    let evicted_turn = turn_request_owned("s", "r0");
+    // The redelivered StartTurn must never re-execute: every claim path
+    // rejects explicitly.
+    assert!(
+        matches!(
+            &service.replay_cached_turn(&evicted_turn).unwrap()[..],
+            [RuntimeMessage::Error { message, .. }]
+                if message == "request was cancelled earlier; terminal no longer available"
+        ),
+        "evicted cancelled turn must replay the tombstone rejection"
+    );
+    let evicted_error = match service.spawn_turn(&evicted_turn) {
+        Ok(_) => panic!("evicted cancelled turn must not be claimable again"),
+        Err(message) => message,
+    };
+    assert!(
+        matches!(
+            &evicted_error,
+            RuntimeMessage::Error { message, .. }
+                if message == "request was cancelled earlier; terminal no longer available"
+        ),
+        "evicted cancelled turn must not be claimable again"
+    );
+    assert!(
+        matches!(
+            &service.handle(ControlMessage::StartTurn(turn_request_owned("s", "r0")))[..],
+            [RuntimeMessage::Error { message, .. }]
+                if message == "request was cancelled earlier; terminal no longer available"
+        ),
+        "the serial path must reject the evicted cancelled turn too"
+    );
+
+    // The most recent cancelled entry is still retained: its cancel terminal
+    // replays and a fresh claim is refused — no silent re-execution either.
+    let retained_id = format!("r{CANCELLED_LIMIT}");
+    let retained_turn = turn_request_owned("s", &retained_id);
+    assert!(
+        matches!(
+            &service.replay_cached_turn(&retained_turn).unwrap()[..],
+            [RuntimeMessage::Event(event)] if event.kind == "turn.cancelled"
+        ),
+        "retained cancelled turn must replay its cancel terminal"
+    );
+    let retained_error = match service.spawn_turn(&retained_turn) {
+        Ok(_) => panic!("retained cancelled turn must not be claimable again"),
+        Err(message) => message,
+    };
+    assert!(
+        matches!(
+            &retained_error,
+            RuntimeMessage::Error { message, .. } if message == "request was cancelled"
+        ),
+        "retained cancelled turn must not be claimable again"
+    );
+    assert!(
+        matches!(
+            &service.handle(ControlMessage::StartTurn(turn_request_owned(
+                "s",
+                &retained_id
+            )))[..],
+            [RuntimeMessage::Event(event)] if event.kind == "turn.cancelled"
+        ),
+        "the serial path must replay the retained cancel terminal"
+    );
+}
+
+#[test]
+fn worker_path_turn_claims_fail_closed_after_shutdown() {
+    let mut service =
+        RuntimeService::with_executor_impl(RuntimeLimits::default(), RecordingExecutor::default());
+    ready(&mut service);
+    assert_eq!(
+        service.handle(ControlMessage::Shutdown),
+        vec![RuntimeMessage::ShutdownAck]
+    );
+
+    // guest_connection's StartTurn arm bypasses handle() for these two calls,
+    // so each must enforce the shutdown guard itself.
+    let turn = turn_request_owned("s", "r");
+    let spawn_error = match service.spawn_turn(&turn) {
+        Ok(_) => panic!("spawn_turn must reject after shutdown"),
+        Err(message) => message,
+    };
+    assert!(
+        matches!(&spawn_error, RuntimeMessage::Error { message, .. } if message == "runtime has shut down"),
+        "spawn_turn must reject after shutdown, got: {spawn_error:?}"
+    );
+    let replay = service.replay_cached_turn(&turn).unwrap();
+    assert!(
+        matches!(&replay[..], [RuntimeMessage::Error { message, .. }] if message == "runtime has shut down"),
+        "replay_cached_turn must reject after shutdown, got: {replay:?}"
+    );
+}

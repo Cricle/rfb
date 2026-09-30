@@ -3,7 +3,7 @@
  * UTF-8 text, byte arrays, optional-flag forms. Mirrors the Java ZbrtCodec.
  * INTERNAL.
  */
-import { DecodeError } from './errors.js';
+import { DecodeError, ValidationError } from './errors.js';
 
 export const MAX_CAPABILITIES = 255;
 export const MAX_ARGV = 255;
@@ -176,7 +176,8 @@ export function encodeExecute(
   timeoutMs: number,
 ): Buffer {
   if (argv.length > MAX_ARGV) {
-    throw new DecodeError('too many arguments');
+    // §4/§9.8: argc > 255 is a pre-send validation failure, not a decode one.
+    throw new ValidationError(`argv exceeds the ${MAX_ARGV}-argument ZBRT limit`);
   }
   // The facade computes whole-second deadlines (ceil×1000); out-of-range
   // values clamp to u32::MAX like the Rust/C#/Python baselines instead of

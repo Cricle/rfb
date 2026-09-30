@@ -11,6 +11,7 @@ public sealed class GuestStream : IDisposable
 {
     private readonly ForkdGuestNdjsonStream? _ndjson;
     private readonly ZbrtStreamSession? _zbrt;
+    private bool _zbrtStartedSent;
 
     internal GuestStream(ForkdGuestNdjsonStream session) => _ndjson = session;
 
@@ -23,19 +24,55 @@ public sealed class GuestStream : IDisposable
         _zbrt?.Dispose();
     }
 
-    /// <summary>Next stream event; null when the stream closed cleanly.</summary>
+    /// <summary>
+    /// Next stream event; null once the stream closed cleanly (after the
+    /// terminal Exit event or when the peer disconnected). ZBRT has no
+    /// started frame: the first call synthesizes one (UNIFIED_API.md §5).
+    /// </summary>
+    /// <returns>The next event, or null after a clean close.</returns>
+    /// <exception cref="TransportException">Read/write failure or timeout.</exception>
+    /// <exception cref="DecodeException">A frame or line could not be decoded.</exception>
+    /// <exception cref="RemoteException">The guest reported an error.</exception>
     public async Task<StreamEvent?> NextEvent()
     {
         if (_ndjson is not null)
         {
-            var value = await _ndjson.NextEventAsync().ConfigureAwait(false);
-            return value is null ? null : GuestResults.MapStreamEvent(value.Value);
+            // Unknown non-terminal lines are ignored (PROTOCOL.md §2.5), so
+            // keep reading until a line maps to an event or the stream ends.
+            while (true)
+            {
+                var value = await _ndjson.NextEventAsync().ConfigureAwait(false);
+                if (value is null)
+                {
+                    return null;
+                }
+
+                if (GuestResults.MapStreamEvent(value.Value) is { } mapped)
+                {
+                    return mapped;
+                }
+            }
+        }
+
+        if (!_zbrtStartedSent)
+        {
+            // ZBRT has no started frame: the first next_event synthesizes one
+            // (Rust baseline client/zbrt.rs ZbrtStream::next_event).
+            _zbrtStartedSent = true;
+            return new StreamEvent(StreamEventKind.Started, [], null);
         }
 
         return await _zbrt!.NextEventAsync().ConfigureAwait(false);
     }
 
-    /// <summary>Send stdin text; calling after the terminal event raises RemoteException.</summary>
+    /// <summary>
+    /// Send stdin text to the running command. ZBRT v1 has no stdin channel:
+    /// calling it there raises RemoteException, as does calling after the
+    /// terminal event.
+    /// </summary>
+    /// <param name="text">Input forwarded to the guest process.</param>
+    /// <exception cref="RemoteException">Stream already ended, or ZBRT transport.</exception>
+    /// <exception cref="TransportException">Write failure or timeout.</exception>
     public async Task SendInput(string text)
     {
         if (_ndjson is not null)
@@ -49,6 +86,8 @@ public sealed class GuestStream : IDisposable
     }
 
     /// <summary>Request termination; idempotent.</summary>
+    /// <exception cref="TransportException">Write/read failure or timeout.</exception>
+    /// <exception cref="RemoteException">The guest reported an error.</exception>
     public async Task Stop()
     {
         if (_ndjson is not null)

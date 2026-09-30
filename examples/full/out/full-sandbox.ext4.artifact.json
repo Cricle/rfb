@@ -9,7 +9,7 @@
   "guest_port": 5000,
   "rootfs": {
     "path": "examples/full/out/full-sandbox.ext4",
-    "sha256": "6e5fd65bce763df91f26717f65814c9e6b99b275b0be53e0c0119f342b41ab48"
+    "sha256": "0e933f07f1acaed387dbe1289479270b5ac6a4a44256a3ec76938c361f319311"
   },
   "vm": {
     "cpus": 1,

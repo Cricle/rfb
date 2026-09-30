@@ -14,6 +14,11 @@ internal static class GuestValidation
     public const int MaxResultBytes = 51200; // 50 KiB
     public const int MaxCodeBytes = 1048576; // 1 MiB
 
+    // ZBRT v1 caps: argc fits one header byte, payloads are u32-bounded
+    // (PROTOCOL.md §3.2; rfb/src/guest/limits.rs).
+    public const int MaxZbrtArgc = 255;
+    public const int MaxZbrtPayloadBytes = 16 * 1024 * 1024; // 16 MiB
+
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     private static int Utf8Len(string s)
@@ -109,6 +114,16 @@ internal static class GuestValidation
         if (value < 0 || value > max)
         {
             throw new ValidationException("guest result limit exceeded");
+        }
+    }
+
+    /// <summary>ZBRT v1 encodes argc in one header byte: reject locally (before
+    /// any TCP connection or frame) instead of failing mid-encode.</summary>
+    public static void ZbrtArgc(int count)
+    {
+        if (count > MaxZbrtArgc)
+        {
+            throw new ValidationException($"argv exceeds the {MaxZbrtArgc}-argument ZBRT limit");
         }
     }
 

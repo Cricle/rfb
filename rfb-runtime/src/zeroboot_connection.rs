@@ -220,7 +220,10 @@ where
                     // executor gone, every later FS RPC) would report "turn in
                     // progress" forever. Abandon the in-flight turn
                     // bookkeeping and fail THIS request closed with an Error
-                    // frame; the connection itself stays usable.
+                    // frame. The connection itself stays servable for control
+                    // RPCs (Health, Cancel) only: with the executor lost, every
+                    // later Execute stays rejected with an actionable
+                    // "still finishing" error instead of hanging.
                     Err(_) => {
                         worker_active = false;
                         worker_handle = None;
