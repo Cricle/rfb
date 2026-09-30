@@ -29,7 +29,8 @@ import time
 
 from ._zbrt import _ZbrtGuestClient as _ZbrtClient
 from .errors import RfbError
-from .facade import RfbClient
+from .models import SandboxInfo
+from .facade import RfbClient, Sandbox
 
 __all__ = ["ForkdHost", "TcpVsockRelay", "ZerobootHost", "boot_firecracker"]
 
@@ -42,6 +43,30 @@ _RELAY_MAX_LINE_BYTES = 256
 # Matches the Rust reference `BootArgs::new().random_trust_cpu().init(..)`;
 # Firecracker appends the virtio_mmio.device line itself.
 ZB_BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 init=/init"
+
+
+def restore_asset(assets_dir: str, name: str, target: str) -> str:
+    """`assets_dir/<name>[.gz]` -> `target` (unwrapped or copied); returns the
+    target. An existing target is left alone — a running binary cannot be
+    overwritten (ETXTBSY); bump assets by taking the stack down first."""
+    import gzip
+    import shutil
+
+    target = str(target)
+    if os.path.exists(target):
+        return target
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    packed = os.path.join(assets_dir, name + ".gz")
+    plain = os.path.join(assets_dir, name)
+    if os.path.exists(packed):
+        with gzip.open(packed, "rb") as reader, open(target, "wb") as writer:
+            shutil.copyfileobj(reader, writer)
+    elif os.path.exists(plain):
+        shutil.copy(plain, target)
+    else:
+        raise RfbError(f"missing asset: {name} (looked in {assets_dir})")
+    os.chmod(target, 0o755)
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -258,18 +283,22 @@ class ZerobootHost:
     (pidfile + a run-dir-scoped pkill, never a global one).
     """
 
-    def __init__(self, *, tcp: str, kernel: str, rootfs: str,
-                 firecracker: str, run_dir: str,
+    def __init__(self, *, tcp: str, run_dir: str, assets_dir: str = None,
+                 kernel: str = None, rootfs: str = None, firecracker: str = None,
                  guest_cid: int = 3, guest_port: int = 5000,
                  mem_size_mib: int = 512):
         host, _, port = tcp.rpartition(":")
         self.host = host or "127.0.0.1"
         self.tcp_port = int(port)
         self.tcp = f"{self.host}:{self.tcp_port}"
-        self.kernel = kernel
-        self.rootfs = rootfs
-        self.firecracker = firecracker
         self.run_dir = run_dir
+        # Asset names are the convention (override any of them by passing the
+        # explicit path instead of `assets_dir`).
+        self.firecracker = restore_asset(assets_dir, "firecracker",
+                                         f"{run_dir}/firecracker")
+        self.kernel = restore_asset(assets_dir, "vmlinux", f"{run_dir}/vmlinux")
+        self.rootfs = restore_asset(assets_dir, "zeroboot-zbrt.ext4",
+                                    f"{run_dir}/rootfs.ext4")
         self.guest_cid = guest_cid
         self.guest_port = guest_port
         self.mem_size_mib = mem_size_mib
@@ -283,8 +312,22 @@ class ZerobootHost:
             return False
 
     def client(self):
-        """A ZBRT client bound to the bridged TCP address."""
+        """A raw ZBRT client bound to the bridged TCP address."""
         return _ZbrtClient(self.tcp, timeout_s=120.0)
+
+    def sandbox(self) -> Sandbox:
+        """The unified facade `Sandbox` over the bridged ZBRT transport.
+
+        Identical method shapes to the forkd facade (`exec` -> `ExecResult`,
+        `ls` -> `DirEntry`, ...) — the UNIFIED_API contract holds across both
+        transports; callers cannot tell this sandbox apart from a
+        controller-created one.
+        """
+        info = SandboxInfo(id="zeroboot-direct", snapshot_tag="zeroboot-zbrt",
+                           guest_addr=self.tcp)
+        # The zbrt facade path only reads the client's timeout; the
+        # controller handle is inert (no requests are ever made).
+        return Sandbox(info, RfbClient(timeout_s=120.0), transport="zbrt")
 
     def _kill_stale(self) -> None:
         pidfile = os.path.join(self.run_dir, "firecracker.pid")
@@ -358,19 +401,23 @@ class ForkdHost:
     controller; a tag that already exists is reused as-is.
     """
 
-    def __init__(self, *, url: str, tag: str, kernel: str, rootfs: str,
-                 firecracker: str, controller_bin: str, forkd_bin: str,
-                 run_dir: str, tap: str = "forkd-tap0",
+    def __init__(self, *, url: str, tag: str, run_dir: str,
+                 assets_dir: str = None, kernel: str = None, rootfs: str = None,
+                 firecracker: str = None, controller_bin: str = None,
+                 forkd_bin: str = None, tap: str = "forkd-tap0",
                  snapshot_root: str = None):
         self.url = url
         self.bind = url.removeprefix("http://")
         self.tag = tag
-        self.kernel = kernel
-        self.rootfs = rootfs
-        self.firecracker = firecracker
-        self.controller_bin = controller_bin
-        self.forkd_bin = forkd_bin
         self.run_dir = run_dir
+        self.firecracker = restore_asset(assets_dir, "firecracker",
+                                         f"{run_dir}/firecracker")
+        self.kernel = restore_asset(assets_dir, "vmlinux", f"{run_dir}/vmlinux")
+        self.rootfs = restore_asset(assets_dir, "forkd-agent.ext4",
+                                    f"{run_dir}/rootfs.ext4")
+        self.controller_bin = restore_asset(assets_dir, "forkd-controller",
+                                            f"{run_dir}/forkd-controller")
+        self.forkd_bin = restore_asset(assets_dir, "forkd", f"{run_dir}/forkd")
         self.tap = tap
         self.snapshot_root = snapshot_root or default_snapshot_root()
         self._process = None
