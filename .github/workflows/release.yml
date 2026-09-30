@@ -39,6 +39,15 @@ jobs:
   crates:
     name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
     runs-on: ubuntu-latest
+    # 与 ci.yml 的 rust job 同款：官方 rust 镜像（省每次 run 的工具链安装）
+    # + bash 默认 shell（容器 sh=dash 不认 pipefail）+ rust-cache。
+    # release.sh 的全特性 test+doc 峰值盘占用在容器里天然不存在（镜像没有
+    # dotnet/android/ghc 预装大件），清盘步骤随之移除。
+    container:
+      image: rust:1-bookworm
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 60
     # Only the crates job creates the GitHub Release.
     permissions:
@@ -49,18 +58,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      # release.sh 会跑全特性 test+doc（rustpython/mlua/ring/zstd 的构建峰值
-      # 顶满 runner 剩余盘：链接阶段 SIGBUS=Bus error 就是写产物时空间耗尽），
-      # 先清预装大件换回 ~20GB——与 ci.yml rust job 的同名步骤一致。
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h /
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
-        with:
-          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Validate tag matches workspace and all SDK manifest versions
         env:
           TAG: ${{ github.ref_name }}
@@ -173,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          sudo apt-get install -y musl-tools
+          apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
           cargo build --locked --release -p rfb-runtime \
             --target x86_64-unknown-linux-musl \
