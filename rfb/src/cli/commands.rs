@@ -252,6 +252,7 @@ pub struct BuildRootfsArgs {
         help = "Install /bin/lua (hardlink to the runtime; the binary must be built with the mlua feature)"
     )]
     pub with_lua: bool,
+    /// Rootfs source directories (see [`BakeDirsArgs`]).
     #[command(flatten)]
     pub bake_dirs: BakeDirsArgs,
 }
@@ -361,6 +362,7 @@ pub struct BuildAllArgs {
     /// Refuse to overwrite an existing output without this flag.
     #[arg(long)]
     pub force: bool,
+    /// Rootfs source directories (see [`BakeDirsArgs`]).
     #[command(flatten)]
     pub bake_dirs: BakeDirsArgs,
     /// Kernel image to check and boot-verify the final rootfs against
@@ -432,6 +434,7 @@ pub struct ForkdUrlArgs {
 /// Arguments for the forkd acceptance path used by shell wrappers.
 #[derive(clap::Args, Debug)]
 pub struct RunForkdArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to use (`FORKD_SNAPSHOT_TAG`, default `rfb`).
@@ -470,6 +473,7 @@ pub enum WebCommand {
 /// Arguments for `rfb-cli forkd preflight`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdPreflightArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to preflight (`FORKD_SNAPSHOT_TAG`, default `rfb`).
@@ -489,6 +493,7 @@ pub struct ForkdPreflightArgs {
 /// Arguments for `rfb-cli forkd snapshot-bind`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotBindArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to bind.
@@ -508,6 +513,7 @@ pub struct ForkdSnapshotBindArgs {
 /// Arguments for `rfb-cli forkd acceptance`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdGateArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to accept (`FORKD_SNAPSHOT_TAG`, default `rfb`).
@@ -535,6 +541,7 @@ pub struct ForkdGateArgs {
 /// Arguments for `rfb-cli forkd benchmark`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdBenchArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to benchmark (`FORKD_SNAPSHOT_TAG`, default `rfb`).
@@ -548,6 +555,7 @@ pub struct ForkdBenchArgs {
 /// Arguments for `rfb-cli forkd workload`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdWorkloadArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to run the workload on (`FORKD_SNAPSHOT_TAG`, default `rfb-final-verified`).
@@ -567,6 +575,7 @@ pub struct ForkdWorkloadArgs {
 /// Arguments for `rfb-cli forkd sandbox-create`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSandboxArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to create the sandbox from (`FORKD_SNAPSHOT_TAG`, default `rfb`).
@@ -584,6 +593,7 @@ pub struct ForkdSandboxArgs {
 /// Arguments for `rfb-cli forkd sandbox-destroy`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSandboxDestroyArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Sandbox identifier to destroy.
@@ -594,6 +604,7 @@ pub struct ForkdSandboxDestroyArgs {
 /// Arguments for `rfb-cli forkd snapshot-create`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotCreateArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to create.
@@ -678,8 +689,11 @@ pub struct ForkdBackendUpArgs {
     #[arg(long)]
     pub require_provenance: bool,
 }
+/// Arguments for `forkd snapshot info`: inspect one snapshot's metadata
+/// (tag, sizes, provenance) via the official forkd binary.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotInfoArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to inspect.
@@ -699,6 +713,7 @@ pub struct ForkdSnapshotInfoArgs {
 /// Arguments for `rfb-cli forkd snapshot-delete`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotDeleteArgs {
+    /// Forkd controller URL and credentials (see [`ForkdUrlArgs`]).
     #[command(flatten)]
     pub url: ForkdUrlArgs,
     /// Snapshot tag to delete.
