@@ -185,14 +185,19 @@ jobs:
           apt-get update
           apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
-          cargo build --locked --release -p rfb-runtime \
+          # 走 build-static 单源：musl 的 CC/linker 接线 + RUSTFLAGS 静态
+          # 双保险（+crt-static + -static）都住在那里。裸 cargo 在容器里不
+          # 做自包含链接，GNU ld 会把 glibc 静态 libm 链进来
+          #（_dl_x86_cpu_features undefined）——2026-09-30 release run 实测。
+          # busybox 是 rfb-runtime 的 bin，随第一个 build-static 顺带产出。
+          ./target/release/rfb-cli image build-static --root . \
             --target x86_64-unknown-linux-musl \
-            --features cli,rustpython
+            --package rfb-runtime --features cli,rustpython
           gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-runtime \
             > dist/rfb-runtime-python.gz
-          cargo build --locked --release -p rfb-runtime \
+          ./target/release/rfb-cli image build-static --root . \
             --target x86_64-unknown-linux-musl \
-            --features cli,mlua
+            --package rfb-runtime --features cli,mlua
           gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-runtime \
             > dist/rfb-runtime-lua.gz
           gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-busybox \
