@@ -37,7 +37,7 @@ url = { version = "2", optional = true }
 anyhow = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 sha2 = { version = "0.11", optional = true }
-toml = { version = "0.9", optional = true, default-features = false, features = ["parse", "serde"] }
+toml = { version = "1.1", optional = true, default-features = false, features = ["parse", "serde"] }
 uuid = { version = "1", features = ["v4"], optional = true }
 rfb-runtime = { workspace = true, optional = true }
 # Only the zeroboot provider (and, through it, the cli feature) uses
