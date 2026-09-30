@@ -27,9 +27,16 @@ for crate in rfb-runtime rfb-rig; do
     exit 1
   fi
 done
+# describe 的 stderr 保留下来：门失败时把真实 git 错误与现场（HEAD/refs）
+# 一并打出来——2026-09-30 的容器 run 里这里空 tag 但 checkout 明明在 tag 上，
+# 没有 stderr 就只能瞎猜。
+describe_err=$(git describe --tags --exact-match 2>&1 >/dev/null) || true
 tag=$(git describe --tags --exact-match 2>/dev/null || true)
 if [[ "$mode" == publish && -z "$tag" ]]; then
   printf 'formal release requires an exact version tag\n' >&2
+  printf '  describe: %s\n' "${describe_err:-<empty>}" >&2
+  printf '  HEAD: %s\n' "$(git rev-parse HEAD 2>&1)" >&2
+  printf '  tags here: %s\n' "$(git tag --list | head -5 | tr '\n' ' ')" >&2
   exit 1
 fi
 if [[ -n "$tag" && "$tag" != "v$version" ]]; then
