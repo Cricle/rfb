@@ -183,6 +183,14 @@ pub fn build_static_runtime(
         if std::env::var_os(format!("CARGO_TARGET_{upper}_LINKER")).is_none() {
             cmd.env(format!("CARGO_TARGET_{upper}_LINKER"), "musl-gcc");
         }
+        // crt-static 是 musl target 的默认，但不再依赖默认值：rust:1-bookworm
+        // 容器（2026-09-30 CI）里同一条命令产出过带 INTERP 的动态二进制、
+        // 被下方静态门拒收。已有 RUSTFLAGS 追加而非覆盖。
+        let existing = std::env::var("RUSTFLAGS").unwrap_or_default();
+        cmd.env(
+            "RUSTFLAGS",
+            format!("{existing} -C target-feature=+crt-static").trim(),
+        );
     }
     let status = cmd
         .status()
@@ -203,9 +211,10 @@ pub fn build_static_runtime(
         )));
     }
     if is_dynamically_linked(&binary)? {
-        return Err(validation(
-            "runtime is dynamically linked; refusing final image",
-        ));
+        return Err(validation(format!(
+            "runtime is dynamically linked; refusing final image (INTERP in {})",
+            binary.display()
+        )));
     }
     let digest = sha256(&binary).map_err(|error| io(error.to_string()))?;
     let artifact = crate::cli::image_build::ArtifactManifest::for_static_runtime(
