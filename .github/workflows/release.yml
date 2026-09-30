@@ -202,6 +202,18 @@ jobs:
           sha256sum "dist/rfb-runtime-python.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-runtime-lua.gz" >> dist/SHA256SUMS
           sha256sum "dist/rfb-busybox.gz" >> dist/SHA256SUMS
+      # forkd-only 简版源码包：二进制打包完成后跑确定性手术
+      # （scripts/split-minimal.sh：zeroboot 后端 / SDK 四语言 ZBRT 传输 /
+      # mlua 整体移除），把 minimal-dist 源树作为 Release 资产上传——
+      # SDK 使用者拿到的简版与主树逐字节同源。不带 --check（编译门禁在
+      # ci.yml 与本仓 --check 里跑，发布流水线只做确定性变换）；tar 带
+      # minimal-dist/ 目录前缀，解包即得同名目录。
+      - name: Minimal split (forkd-only source bundle)
+        run: |
+          set -euo pipefail
+          bash scripts/split-minimal.sh
+          tar -czf "dist/rfb-${{ github.ref_name }}-minimal-forkd.tar.gz" minimal-dist
+          sha256sum "dist/rfb-${{ github.ref_name }}-minimal-forkd.tar.gz" >> dist/SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
@@ -211,6 +223,7 @@ jobs:
             dist/rfb-runtime-python.gz
             dist/rfb-runtime-lua.gz
             dist/rfb-busybox.gz
+            dist/rfb-${{ github.ref_name }}-minimal-forkd.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
       # CLI 二进制供 npm / nuget job 打包（rfb-cli / Rfb.Cli；两者都是
