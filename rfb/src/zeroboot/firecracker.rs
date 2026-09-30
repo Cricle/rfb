@@ -154,9 +154,49 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Make a Firecracker child die with its parent: prctl(PDEATHSIG, SIGKILL) is
+/// set in the child before exec (pre_exec runs between fork and exec), and the
+/// parent-pid check closes the fork/exec race where the parent already died
+/// before prctl ran. EVERY Firecracker spawn must go through this — a single
+/// unhardened spawn leaks an orphan VM (guest memory, snapshot dir, sockets)
+/// when the host process is SIGKILLed. The single shared helper concentrates
+/// the unsafe.
+///
+/// # Errors
+///
+/// Returns `Err` when the prctl setup fails (the child must not be spawned
+/// unhardened as a fallback).
+pub(crate) fn attach_pdeathsig(command: &mut Command) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent_pid = std::process::id() as libc::pid_t;
+        // SAFETY: pre_exec runs in the forked child before exec; only
+        // async-signal-safe calls (prctl, getppid, _exit) are made.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    // The intended parent is already gone: PDEATHSIG would
+                    // never fire, so exit instead of orphaning the VM.
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+    Ok(())
+}
+
 /// One booted Firecracker microVM: the child process handle plus the sockets
-/// it was started with. Dropping it does not kill the VM — call [`Self::kill`]
-/// (the ZeroBoot provider drives the lifecycle).
+/// it was started with. Dropping it KILLS the VM (kill + reap on Drop) — the
+/// owner drives the lifecycle, and a leaked handle must not leak a VM.
 pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
@@ -600,29 +640,9 @@ impl FirecrackerVm {
             .stderr(Stdio::from(log));
         // The VM must not outlive this process: without PDEATHSIG a SIGKILLed
         // host leaves an orphan Firecracker holding the snapshot dir and its
-        // 100s of MiB of guest memory. prctl is set in the child before exec
-        // (pre_exec runs between fork and exec); the parent-pid check closes
-        // the fork/exec race where the parent already died before prctl ran.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            let parent_pid = std::process::id() as libc::pid_t;
-            // SAFETY: pre_exec runs in the forked child before exec; only
-            // async-signal-safe calls (prctl, getppid, _exit) are made.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent_pid {
-                        // The intended parent is already gone: PDEATHSIG would
-                        // never fire, so exit instead of orphaning the VM.
-                        libc::_exit(1);
-                    }
-                    Ok(())
-                });
-            }
-        }
+        // 100s of MiB of guest memory. The single shared helper concentrates
+        // the unsafe; every Firecracker spawn goes through it.
+        crate::firecracker::attach_pdeathsig(&mut command)?;
         let process = command
             .spawn()
             .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;

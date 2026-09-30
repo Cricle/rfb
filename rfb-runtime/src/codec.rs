@@ -198,7 +198,13 @@ impl FrameCodec {
                 .try_into()
                 .map_err(|_| CodecError::Truncated)?,
         ) as usize;
-        if len > self.max_payload || bytes.len() < HEADER_LEN + len {
+        if len > self.max_payload {
+            // A declared length over the limit is an OVERSIZED frame, not a
+            // truncated one: the two need different handling upstream (the
+            // TooLarge variant exists for exactly this distinction).
+            return Err(CodecError::TooLarge);
+        }
+        if bytes.len() < HEADER_LEN + len {
             return Err(CodecError::Truncated);
         }
         if bytes.len() != HEADER_LEN + len {

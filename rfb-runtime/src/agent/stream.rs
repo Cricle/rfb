@@ -5,6 +5,7 @@ use super::builtin::{builtin, builtin_result, validate_builtin_request};
 use super::process_exec::{command_from, prepare_process, terminate};
 use super::MAX_LINE;
 use crate::agent::write_json;
+use crate::utf8_boundary::Utf8ChunkDecoder;
 use serde_json::{json, Value};
 use std::io;
 use std::time::Duration;
@@ -79,6 +80,10 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut err = BufReader::new(stderr);
     let mut ob = vec![0u8; 8192];
     let mut eb = vec![0u8; 8192];
+    // One boundary-aware decoder per stream: a multi-byte character
+    // straddling an 8 KiB read boundary must not be split into U+FFFD.
+    let mut out_dec = Utf8ChunkDecoder::new();
+    let mut err_dec = Utf8ChunkDecoder::new();
     let mut input = Vec::new();
     // Latch pipes at EOF: a read on an EOF'd pipe is immediately ready, so an
     // unlatched branch busy-polls the select until the child reaps. Once a
@@ -103,7 +108,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // terminal frame. The process-group kill above also covers
                 // descendants that inherited the pipes.
                 let _ = child.wait().await;
-                drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                drain_streams_bounded(
+                    &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                    &mut out_dec, &mut err_dec, writer,
+                )
+                .await?;
                 // `done` is the host's terminal marker for a null exit_code;
                 // without it a null exit_code frame fails to decode on the
                 // host. No `err`/`error` key here: the host would deliver a
@@ -117,26 +126,44 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // A fast child can exit before either pipe-read branch wins
                 // the select. Always drain both pipes before the terminal
                 // frame so output and exit status cannot race on the wire.
-                drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                drain_streams_bounded(
+                    &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                    &mut out_dec, &mut err_dec, writer,
+                )
+                .await?;
                 write_json(writer,json!({"exit_code":status.code(),"timed_out":false})).await?;
                 return Ok(())
             }
             n=out.read(&mut ob), if out_open=>{
                 let n=n?;
-                if n>0 { write_json(writer,json!({"out":String::from_utf8_lossy(&ob[..n])})).await?; }
-                else { out_open = false; }
+                if n>0 {
+                    // Withhold an incomplete trailing multi-byte sequence so a
+                    // character straddling the chunk boundary is not split.
+                    emit_chunk(writer, "out", out_dec.decode(&ob[..n])).await?;
+                } else {
+                    emit_chunk(writer, "out", out_dec.flush()).await?;
+                    out_open = false;
+                }
             }
             n=err.read(&mut eb), if err_open=>{
                 let n=n?;
-                if n>0 { write_json(writer,json!({"err":String::from_utf8_lossy(&eb[..n])})).await?; }
-                else { err_open = false; }
+                if n>0 {
+                    emit_chunk(writer, "err", err_dec.decode(&eb[..n])).await?;
+                } else {
+                    emit_chunk(writer, "err", err_dec.flush()).await?;
+                    err_open = false;
+                }
             }
             outcome = read_line_bounded(reader, &mut input, MAX_LINE) => {
                 match outcome? {
                     LineReadOutcome::Eof => {
                         terminate(&mut child).await;
                         let _ = child.wait().await;
-                        drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        drain_streams_bounded(
+                            &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                            &mut out_dec, &mut err_dec, writer,
+                        )
+                        .await?;
                         // A client-side stdin EOF ends the session with a clean
                         // terminal frame (no `error` key: the host turns any
                         // string `error` into a fatal Remote failure).
@@ -149,7 +176,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         // until its read timeout.
                         terminate(&mut child).await;
                         let _ = child.wait().await;
-                        drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                        drain_streams_bounded(
+                            &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                            &mut out_dec, &mut err_dec, writer,
+                        )
+                        .await?;
                         write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                         return Ok(());
                     }
@@ -159,7 +190,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 if v.get("action").and_then(Value::as_str)==Some("stop") {
                     terminate(&mut child).await;
                     let _ = child.wait().await;
-                    drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                    drain_streams_bounded(
+                        &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                        &mut out_dec, &mut err_dec, writer,
+                    )
+                    .await?;
                     // `done` lets the host decode this null-exit_code terminal
                     // frame instead of failing with "invalid guest stream
                     // event".
@@ -184,7 +219,11 @@ pub async fn stream_process<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         Err(_) => {
                             terminate(&mut child).await;
                             let _ = child.wait().await;
-                            drain_streams_bounded(&mut child, &mut out, &mut err, &mut ob, &mut eb, writer).await?;
+                            drain_streams_bounded(
+                                &mut child, &mut out, &mut err, &mut ob, &mut eb,
+                                &mut out_dec, &mut err_dec, writer,
+                            )
+                            .await?;
                             write_json(writer, json!({"exit_code":null,"timed_out":false,"done":true})).await?;
                             return Ok(());
                         }
@@ -257,16 +296,27 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
 /// post-kill drains finish in milliseconds.
 const DRAIN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 
+// All six call sites thread the same (child, out, err, buffers, decoders)
+// tuple; splitting it into an aggregate struct would add a borrow of borrows
+// through every select arm without clarifying anything.
+#[allow(clippy::too_many_arguments)]
 async fn drain_streams_bounded(
     child: &mut tokio::process::Child,
     out: &mut (impl AsyncRead + Unpin),
     err: &mut (impl AsyncRead + Unpin),
     ob: &mut [u8],
     eb: &mut [u8],
+    out_dec: &mut Utf8ChunkDecoder,
+    err_dec: &mut Utf8ChunkDecoder,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> io::Result<()> {
     for _ in 0..2 {
-        match tokio::time::timeout(DRAIN_CAP, drain_streams(out, err, ob, eb, writer)).await {
+        match tokio::time::timeout(
+            DRAIN_CAP,
+            drain_streams(out, err, ob, eb, out_dec, err_dec, writer),
+        )
+        .await
+        {
             Ok(result) => return result,
             Err(_) => terminate(child).await, // grandchild holds the pipes
         }
@@ -274,11 +324,27 @@ async fn drain_streams_bounded(
     Ok(())
 }
 
+/// Emit one decoded chunk on `key` ("out"/"err"), skipping empty text.
+async fn emit_chunk<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    key: &str,
+    text: String,
+) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut object = serde_json::Map::new();
+    object.insert(key.to_owned(), Value::String(text));
+    write_json(writer, Value::Object(object)).await
+}
+
 async fn drain_streams<R1: AsyncRead + Unpin, R2: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     out: &mut R1,
     err: &mut R2,
     ob: &mut [u8],
     eb: &mut [u8],
+    out_dec: &mut Utf8ChunkDecoder,
+    err_dec: &mut Utf8ChunkDecoder,
     writer: &mut W,
 ) -> io::Result<()> {
     // Drain stdout and stderr concurrently. Reading one pipe to EOF before
@@ -292,17 +358,19 @@ async fn drain_streams<R1: AsyncRead + Unpin, R2: AsyncRead + Unpin, W: AsyncWri
             result = out.read(ob), if out_open => {
                 let n = result?;
                 if n == 0 {
+                    emit_chunk(writer, "out", out_dec.flush()).await?;
                     out_open = false;
                 } else {
-                    write_json(writer, json!({"out":String::from_utf8_lossy(&ob[..n])})).await?;
+                    emit_chunk(writer, "out", out_dec.decode(&ob[..n])).await?;
                 }
             }
             result = err.read(eb), if err_open => {
                 let n = result?;
                 if n == 0 {
+                    emit_chunk(writer, "err", err_dec.flush()).await?;
                     err_open = false;
                 } else {
-                    write_json(writer, json!({"err":String::from_utf8_lossy(&eb[..n])})).await?;
+                    emit_chunk(writer, "err", err_dec.decode(&eb[..n])).await?;
                 }
             }
         }

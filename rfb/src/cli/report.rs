@@ -1,6 +1,9 @@
 //! Sanitized aggregate reporting: quantiles and compact summaries.
 
+use crate::cli::error::{validation, CliError};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 /// Compute the p-th percentile (0..=1) over a sorted slice of nanoseconds.
 /// Returns `None` when the slice is empty.
@@ -70,4 +73,83 @@ pub fn outcome_json(outcome: &Outcome) -> Value {
         "total": outcome.total(),
         "success_rate_pct": outcome.success_rate(),
     })
+}
+
+/// Per-op sample stats (`{samples, p50_ns, p95_ns, p99_ns}`) shared by the
+/// forkd and zeroboot benchmarks; `rate_denominator` adds the forkd shape's
+/// `success_rate_pct` (samples collected vs iterations attempted).
+pub fn samples_stats_json(
+    samples: &std::collections::HashMap<String, Vec<u64>>,
+    rate_denominator: Option<usize>,
+) -> serde_json::Map<String, Value> {
+    let mut stats = serde_json::Map::new();
+    for (name, values) in samples {
+        let mut sorted = values.clone();
+        sorted.sort_unstable();
+        let mut entry = json!({
+            "samples": values.len(),
+            "p50_ns": quantile_ns(&sorted, 0.50),
+            "p95_ns": quantile_ns(&sorted, 0.95),
+            "p99_ns": quantile_ns(&sorted, 0.99),
+        });
+        if let Some(denominator) = rate_denominator {
+            if let Value::Object(ref mut map) = entry {
+                map.insert(
+                    "success_rate_pct".into(),
+                    json!(100.0 * values.len() as f64 / denominator as f64),
+                );
+            }
+        }
+        stats.insert(name.clone(), entry);
+    }
+    stats
+}
+
+/// Count one named op into the workload counters shared by the forkd and
+/// zeroboot workload gates.
+pub(crate) fn count_op(op_count: &mut std::collections::BTreeMap<String, usize>, op: &str) {
+    *op_count.entry(op.to_owned()).or_default() += 1;
+}
+
+/// Push one named latency sample (nanoseconds elapsed since `started`) into
+/// the benchmark sample map shared by the forkd and zeroboot benchmarks.
+pub fn record_sample(samples: &mut HashMap<String, Vec<u64>>, name: &str, started: Instant) {
+    samples
+        .entry(name.to_owned())
+        .or_default()
+        .push(started.elapsed().as_nanos() as u64);
+}
+
+/// Record one benchmark op: sample + success when `ok`, failure count
+/// otherwise (no sample is kept for a failed op).
+pub fn record(
+    samples: &mut HashMap<String, Vec<u64>>,
+    outcome: &mut Outcome,
+    name: &str,
+    started: Instant,
+    ok: bool,
+) {
+    if ok {
+        record_sample(samples, name, started);
+        outcome.success += 1;
+    } else {
+        outcome.failure += 1;
+    }
+}
+
+/// Workload-gate bookkeeping shared by the forkd and zeroboot backends:
+/// count the named op when `ok`, otherwise fail the gate with the exact
+/// per-call-site validation message.
+pub fn checked(
+    op_count: &mut BTreeMap<String, usize>,
+    ok: bool,
+    name: &str,
+    msg: &str,
+) -> Result<(), CliError> {
+    if ok {
+        count_op(op_count, name);
+        Ok(())
+    } else {
+        Err(validation(msg))
+    }
 }

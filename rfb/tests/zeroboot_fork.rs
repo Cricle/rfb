@@ -12,45 +12,12 @@
 //! - chained forks work (fork of a fork);
 //! - fork dirs are cleaned up when the forked sandboxes drop.
 
+mod common;
+
+use common::realvm::{provider, require_real_hot, ProviderOpts};
 use rfb::guest::{ReadRequest, WriteRequest};
-use rfb::zeroboot::ZeroBootProvider;
 use rfb::{Capability, Sandbox, SandboxSpec};
-use std::path::{Path, PathBuf};
-
-fn resx(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("resx")
-        .join(relative)
-}
-
-fn require_real() {
-    if std::env::var("RFB_REAL_E2E").as_deref() != Ok("1") {
-        panic!("skip: RFB_REAL_E2E=1 required (real-VM test; use tests/run-real.sh)");
-    }
-    if std::env::var("RFB_ZBRT_SNAPSHOT_DIR").is_err() {
-        panic!("skip: fork requires RFB_ZBRT_SNAPSHOT_DIR (hot mode)");
-    }
-}
-
-fn provider() -> ZeroBootProvider {
-    let kernel = std::env::var_os("RFB_E2E_KERNEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resx("kernel/vmlinux-5.10.225"));
-    let rootfs = std::env::var_os("RFB_E2E_ZBRT_ROOTFS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resx("rootfs/zeroboot-zbrt-e2e.ext4"));
-    ZeroBootProvider::new(rfb::zeroboot::Config {
-        kernel: Some(kernel),
-        rootfs: Some(rootfs),
-        firecracker: Some(
-            std::env::var_os("RFB_E2E_FIRECRACKER")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("firecracker")),
-        ),
-        ..Default::default()
-    })
-}
+use std::path::Path;
 
 fn spec() -> SandboxSpec {
     SandboxSpec {
@@ -66,8 +33,8 @@ fn spec() -> SandboxSpec {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots real Firecracker VMs; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
 async fn fork_inherits_live_state_and_original_survives() {
-    require_real();
-    let provider = provider();
+    require_real_hot();
+    let provider = provider(ProviderOpts::hot());
     let base = std::env::var("RFB_ZBRT_SNAPSHOT_DIR").unwrap();
     let baseline_dirs = count_fork_dirs(&base);
 

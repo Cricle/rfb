@@ -6,11 +6,15 @@ concurrency:
   cancel-in-progress: true
 
 # 触发约定：main 推送同时跑本工作流与 e2e.yml（真机 E2E 只在 e2e.yml 里跑）；
-# 本工作流跑所有分支的推送（含 main）与所有 PR 的 Rust 门禁
+# 分支改动经 PR 进入（push 只挂 main）：否则同一 PR 提交会在 branch-ref 与
+# merge-ref 两个 runner 上各跑一遍全量 CI（双倍时间与资源，且两组并发组互不
+# 取消）。本工作流跑 main 推送与所有 PR 的 Rust 门禁
 # （fmt/clippy/test/doc，全部 --all-features），以及
 # SDK 全量 build + 四套件测试（Python / C# / Java / Node.js，debian:12 干净容器）。
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 

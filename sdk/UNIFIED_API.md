@@ -29,7 +29,9 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 | `token` | env `FORKD_TOKEN`；**非空才带** `Authorization: Bearer` 头 |
 | `timeout_s` | 10 秒；必须 `> 0`（Java/C# 另拒绝 NaN/Inf），否则 Validation 错误 |
 
-超时覆盖一次 HTTP 请求（连接 + 读）全程。环境变量总表见 §10。guest 侧可选的 agent 认证
+超时覆盖一次 HTTP 请求（连接 + 读）全程。线程安全：`RfbClient` 的 controller 请求共用一条
+keep-alive 连接，Python 实现以内部锁把请求串行化（同一 client 并发调用是安全的，但不并行）；
+guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 agent 认证
 （`FORKD_AGENT_TOKEN`：配置后每条 guest 连接必须先发 auth 首帧）见 §10 与 `PROTOCOL.md §2.6`。
 
 ## 3. controller 生命周期（快照 / 沙箱）
@@ -96,7 +98,7 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 | controller URL / 端口 | env `FORKD_URL` → `http://127.0.0.1:8889`（未设或空白都回退默认） |
 | controller 超时 | 10 s（每请求；超时属 Transport 类） |
 | `wait_snapshot` 预算 / 轮询间隔 | 60 s / 100 ms |
-| `exec` 超时 / cwd | 60 s / `"/"`（Java NDJSON 缺省 cwd 为 `/workspace`，见 §11） |
+| `exec` 超时 / cwd | 60 s / `/workspace`（四语言缺省一致；`/` 会被 agent 拒绝） |
 | guest 端口 | NDJSON agent TCP **8888**；ZBRT vsock **5000**（→ TCP relay） |
 | 工作区根 | `/workspace`（agent 侧可用 `RFB_AGENT_WORKSPACE` 覆盖） |
 | 单帧 / 单行上限 | ZBRT payload ≤ **16 MiB**；NDJSON 行 ≤ **1 MiB** |
@@ -127,7 +129,7 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 |---|---|---|
 | `FORKD_URL` | 四语言 `RfbClient` 缺省构造；`rfb-cli forkd *` | controller 地址（默认 `http://127.0.0.1:8889`；未设或空白都回退默认） |
 | `FORKD_TOKEN` | 四语言 `RfbClient` 缺省构造 | controller Bearer token（非空才发头） |
-| `FORKD_AGENT_TOKEN` | forkd agent（guest 侧，启用连接认证）；Python/Node.js SDK guest 客户端（配置后每连接先发 auth 首帧）；Rust/C#/Java 客户端尚未接入 | guest NDJSON 连接认证；非空 = 强制首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
+| `FORKD_AGENT_TOKEN` | forkd agent（guest 侧，启用连接认证）；Python/Node.js/Java SDK guest 客户端（配置后每连接先发 auth 首帧）；Rust/C# 客户端尚未接入 | guest NDJSON 连接认证；非空 = 强制首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
 | `FORKD_KERNEL` / `FORKD_ROOTFS` / `FORKD_BIN` | `rfb-cli forkd snapshot-*` | 快照创建的内核 / rootfs / 官方 forkd 二进制路径覆盖 |
 | `RFB_RUNTIME_BIN` | 部署流水线（约定注入点，仓库内代码不读） | 预编译静态 rfb-runtime 二进制路径 |
 | `RFB_AGENT_WORKSPACE` | rfb-runtime agent | guest 工作区根覆盖（默认 `/workspace`，供宿主侧契约测试用） |
@@ -136,12 +138,16 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 
 ## 11. 已知的有意分歧（documented divergences）
 
-- **旧键回退顺序**：响应同时含新旧键时，Java/Python 优先当前键（`stdout`/`output`），C# 优先旧键
-  （`out`）；两者只在“同一响应同时携带两套不同值”这种病态场景下不同。
-- **exec 缺省 cwd**：Python/C# 为 `"/"`；Java 的 `exec(args, null, …)` 在 NDJSON 上 wire 为
-  `/workspace`（agent 会拒绝 `/` 作为 cwd）。建议显式传 cwd。
+- **旧键回退顺序**：~~C# 优先旧键~~（已过时）——实测四语言（Python/Node/Java/C#）与 Rust 基准
+  一致，都是**当前键优先**（`stdout`/`output`，见 `GuestResults.cs` 的
+  `Prop(v, "stdout") ?? Prop(v, "out")`）。分歧清单保留此条以记录勘误。
+- **exec 缺省 cwd**：~~Python/C# 为 `"/"`~~（已过时）——实测四语言的缺省 cwd 都是
+  `/workspace`（代码为准；agent 拒绝 `/` 作为 cwd）。建议显式传 cwd。
 - **stream `done` 事件**：C#/Java 把 `{"done":true}` 映射为无码 Exit；Python 目前忽略该行
   （依赖其 `done` 终结键语义在请求路径终止）。
+- **stream 信号终结行**：guest 对被信号杀死的子进程发出 `{"exit_code":null}`（无 `done`）。
+  Python/Node/Rust 视为 Exit(null) 终结；Java/C# 历史上抛 Decode——已统一为
+  “键存在即终结，null 值 → Exit(null)”。
 - **agent 认证接入**：`FORKD_AGENT_TOKEN` 的 agent 侧门禁已强制（`PROTOCOL.md §2.6`）；客户端侧
-  Python/Node.js 已发送 auth 首帧，当前 Rust/C#/Java 尚未接入——agent 配置了 token 时这些语言的
+  Python/Node.js/Java 已发送 auth 首帧，当前 Rust/C# 尚未接入——agent 配置了 token 时这些语言的
   guest 连接会被 `{"error":"authentication required"}` 拒绝（§10）。

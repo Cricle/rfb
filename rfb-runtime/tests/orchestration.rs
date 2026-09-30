@@ -2,7 +2,10 @@
 //! success/failure/timeout lifecycle paths, and cleanup retry semantics. All
 //! tests inject fake adapters so no real runtime or VM is required.
 
+mod common;
+
 use async_trait::async_trait;
+use common::FakeWorkerAdapter;
 use rfb_runtime::orchestration::{
     cleanup_with_retry, RuntimeBackend, RuntimeError, RuntimeManager, RuntimeSpec, RuntimeStatus,
     RuntimeWorkerAdapter, WorkerHandle,
@@ -30,36 +33,9 @@ fn runtime_spec_is_public_contract() {
     assert_eq!(spec.provision_timeout_seconds, 30);
 }
 
-#[derive(Default)]
-struct NoopAdapter {
-    provisions: AtomicUsize,
-    cancels: AtomicUsize,
-    destroys: AtomicUsize,
-}
-
-#[async_trait]
-impl RuntimeWorkerAdapter for NoopAdapter {
-    async fn provision(
-        &self,
-        _spec: RuntimeSpec,
-        worker_id: String,
-    ) -> Result<WorkerHandle, RuntimeError> {
-        self.provisions.fetch_add(1, Ordering::SeqCst);
-        Ok(worker(worker_id))
-    }
-    async fn cancel(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        self.cancels.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    async fn destroy(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        self.destroys.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn success_lifecycle_provisions_runs_and_cleans_up() {
-    let adapter = Arc::new(NoopAdapter::default());
+    let adapter = Arc::new(FakeWorkerAdapter::new());
     let manager = RuntimeManager::with_adapter(RuntimeSpec::default(), adapter.clone());
 
     let handle = manager.create_for_session("s1").await;
@@ -74,29 +50,29 @@ async fn success_lifecycle_provisions_runs_and_cleans_up() {
     let cancelled = manager.cancel_for_session("s1").await.unwrap();
     assert_eq!(cancelled.status, RuntimeStatus::Stopped);
     assert!(cancelled.error.is_none());
-    assert_eq!(adapter.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.cancels().load(Ordering::SeqCst), 1);
     // The cancelled worker is retained for inspection, then destroyed.
     assert!(manager.get("s1").await.is_some());
 
     let destroyed = manager.destroy_for_session("s1").await.unwrap();
     assert_eq!(destroyed.status, RuntimeStatus::Stopped);
     assert!(manager.get("s1").await.is_none());
-    assert_eq!(adapter.destroys.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.destroys().load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn create_is_idempotent_without_reprovisioning() {
-    let adapter = Arc::new(NoopAdapter::default());
+    let adapter = Arc::new(FakeWorkerAdapter::new());
     let manager = RuntimeManager::with_adapter(RuntimeSpec::default(), adapter.clone());
     let first = manager.create_for_session("same").await;
     let second = manager.create_for_session("same").await;
     assert_eq!(first.vm_id, second.vm_id);
-    assert_eq!(adapter.provisions.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.provisions().load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn concurrent_create_globally_deduplicates_provisioning() {
-    let adapter = Arc::new(NoopAdapter::default());
+    let adapter = Arc::new(FakeWorkerAdapter::new());
     let manager = RuntimeManager::with_adapter(RuntimeSpec::default(), adapter.clone());
     let mut tasks = Vec::new();
     for _ in 0..8 {
@@ -117,7 +93,7 @@ async fn concurrent_create_globally_deduplicates_provisioning() {
         1,
         "all callers must share one worker for a session"
     );
-    assert_eq!(adapter.provisions.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.provisions().load(Ordering::SeqCst), 1);
     assert_eq!(
         manager.get("dedup").await.unwrap().status,
         RuntimeStatus::Running
@@ -179,7 +155,9 @@ async fn interleaved_sessions_isolate_provisioning_generations() {
         manager.get("session-a").await.unwrap().status,
         RuntimeStatus::Running
     );
-    assert_eq!(b_handle.status, RuntimeStatus::Running);
+    // The returned handle must AGREE with the table: a cancel-while-
+    // provisioning returns the current (Stopped) state, not a stale Running.
+    assert_eq!(b_handle.status, RuntimeStatus::Stopped);
     assert_eq!(
         manager.get("session-b").await.unwrap().status,
         RuntimeStatus::Stopped
@@ -190,32 +168,16 @@ async fn interleaved_sessions_isolate_provisioning_generations() {
 #[tokio::test]
 async fn get_returns_none_before_any_provisioning() {
     let manager =
-        RuntimeManager::with_adapter(RuntimeSpec::default(), Arc::new(NoopAdapter::default()));
+        RuntimeManager::with_adapter(RuntimeSpec::default(), Arc::new(FakeWorkerAdapter::new()));
     assert!(manager.get("ghost").await.is_none());
-}
-
-struct FailingProvision;
-
-#[async_trait]
-impl RuntimeWorkerAdapter for FailingProvision {
-    async fn provision(
-        &self,
-        _spec: RuntimeSpec,
-        _worker_id: String,
-    ) -> Result<WorkerHandle, RuntimeError> {
-        Err(RuntimeError::Provisioning("no capacity".into()))
-    }
-    async fn cancel(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-    async fn destroy(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        Ok(())
-    }
 }
 
 #[tokio::test]
 async fn provision_failure_is_recorded_and_not_retried() {
-    let manager = RuntimeManager::with_adapter(RuntimeSpec::default(), Arc::new(FailingProvision));
+    let manager = RuntimeManager::with_adapter(
+        RuntimeSpec::default(),
+        Arc::new(FakeWorkerAdapter::new().provision_fails("no capacity")),
+    );
     let handle = manager.create_for_session("fail").await;
     assert_eq!(handle.status, RuntimeStatus::Failed);
     assert!(handle.error.unwrap().contains("no capacity"));
@@ -257,38 +219,9 @@ async fn provision_timeout_fails_closed_within_the_deadline() {
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 
-struct FlakyCancel {
-    attempts: AtomicUsize,
-    fail_first: usize,
-}
-
-#[async_trait]
-impl RuntimeWorkerAdapter for FlakyCancel {
-    async fn provision(
-        &self,
-        _spec: RuntimeSpec,
-        worker_id: String,
-    ) -> Result<WorkerHandle, RuntimeError> {
-        Ok(worker(worker_id))
-    }
-    async fn cancel(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_first {
-            Err(RuntimeError::Adapter("transient cancel failure".into()))
-        } else {
-            Ok(())
-        }
-    }
-    async fn destroy(&self, _worker: &WorkerHandle) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn cancel_retries_transient_failures_until_success() {
-    let adapter = Arc::new(FlakyCancel {
-        attempts: AtomicUsize::new(0),
-        fail_first: 2,
-    });
+    let adapter = Arc::new(FakeWorkerAdapter::new().cancel_fails(2, "transient cancel failure"));
     let spec = RuntimeSpec {
         cleanup_timeout_seconds: 5,
         cleanup_max_retries: 5,
@@ -301,7 +234,7 @@ async fn cancel_retries_transient_failures_until_success() {
     let cancelled = manager.cancel_for_session("flaky").await.unwrap();
     assert_eq!(cancelled.status, RuntimeStatus::Stopped);
     assert!(cancelled.error.is_none());
-    assert_eq!(adapter.attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(adapter.cancels().load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

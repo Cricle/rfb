@@ -276,57 +276,60 @@ export class Sandbox {
   /** List directory entries (default path "."). */
   async ls(path = '.'): Promise<DirEntry[]> {
     validation.fsPath(path);
+    if (this.transport === TRANSPORT_ZBRT) {
+      const conn = await this.#zbrt();
+      try {
+        const payload = await conn.fs(1, path, Buffer.from(JSON.stringify({ max_results: validation.MAX_GUEST_RESULTS }), 'utf8'));
+        return this.#parseLs(this.#fsResultJson(payload));
+      } finally {
+        conn.close();
+      }
+    }
     const { last } = await this.#fsRequest(1, path, {
       max_results: validation.MAX_GUEST_RESULTS,
     });
-    this.#checkResultSize(last);
-    const entries = last.entries;
-    if (!Array.isArray(entries)) {
-      throw new DecodeError('guest response is missing entries');
-    }
-    return entries.map((entry: Record<string, unknown>) => ({
-      name: String(entry.name ?? ''),
-      isDir: entry.is_dir === true,
-      size: typeof entry.size === 'number' ? entry.size : null,
-    }));
+    return this.#parseLs(last);
   }
 
   /** Find workspace paths matching a glob-ish pattern. */
   async find(path: string, pattern: string): Promise<string[]> {
     validation.fsPath(path);
     validation.pattern(pattern);
+    if (this.transport === TRANSPORT_ZBRT) {
+      const conn = await this.#zbrt();
+      try {
+        const payload = await conn.fs(2, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS }), 'utf8'));
+        return this.#parseFind(this.#fsResultJson(payload));
+      } finally {
+        conn.close();
+      }
+    }
     const { last } = await this.#fsRequest(2, path, {
       max_results: validation.MAX_GUEST_RESULTS,
       pattern,
     });
-    this.#checkResultSize(last);
-    const matches = last.matches;
-    if (!Array.isArray(matches)) {
-      throw new DecodeError('guest response is missing matches');
-    }
-    return matches.map((match: unknown) => String(match));
+    return this.#parseFind(last);
   }
 
   /** Grep file contents; matches carry path/line/column/text. */
   async grep(path: string, pattern: string): Promise<GrepMatch[]> {
     validation.fsPath(path);
     validation.pattern(pattern);
+    if (this.transport === TRANSPORT_ZBRT) {
+      const conn = await this.#zbrt();
+      try {
+        const payload = await conn.fs(3, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS, max_bytes: validation.MAX_GUEST_RESULT_BYTES }), 'utf8'));
+        return this.#parseGrep(this.#fsResultJson(payload));
+      } finally {
+        conn.close();
+      }
+    }
     const { last } = await this.#fsRequest(3, path, {
       max_results: validation.MAX_GUEST_RESULTS,
       pattern,
       max_bytes: validation.MAX_GUEST_RESULT_BYTES,
     });
-    this.#checkResultSize(last);
-    const matches = last.matches;
-    if (!Array.isArray(matches)) {
-      throw new DecodeError('guest response is missing matches');
-    }
-    return matches.map((match: Record<string, unknown>) => ({
-      path: String(match.path ?? ''),
-      line: typeof match.line === 'number' ? match.line : null,
-      column: typeof match.column === 'number' ? match.column : null,
-      text: String(match.text ?? ''),
-    }));
+    return this.#parseGrep(last);
   }
 
   /** Read a guest file: `{data, truncated, totalBytes}`. */
@@ -438,6 +441,47 @@ export class Sandbox {
   async #fsRequest(op: number, path: string, args: Record<string, unknown>): Promise<NdjsonExchange> {
     const action = { action: FS_ACTIONS[op], path, ...args };
     return this.#guestRequest(action);
+  }
+
+  /** ZBRT FsResult JSON — identical payload shape to the NDJSON tools (§2.4). */
+  #fsResultJson(payload: Buffer): Record<string, unknown> {
+    return JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
+  }
+
+  #parseLs(last: Record<string, unknown>): DirEntry[] {
+    this.#checkResultSize(last);
+    const entries = last.entries;
+    if (!Array.isArray(entries)) {
+      throw new DecodeError('guest response is missing entries');
+    }
+    return entries.map((entry: Record<string, unknown>) => ({
+      name: String(entry.name ?? ''),
+      isDir: entry.is_dir === true,
+      size: typeof entry.size === 'number' ? entry.size : null,
+    }));
+  }
+
+  #parseFind(last: Record<string, unknown>): string[] {
+    this.#checkResultSize(last);
+    const matches = last.matches;
+    if (!Array.isArray(matches)) {
+      throw new DecodeError('guest response is missing matches');
+    }
+    return matches.map((match: unknown) => String(match));
+  }
+
+  #parseGrep(last: Record<string, unknown>): GrepMatch[] {
+    this.#checkResultSize(last);
+    const matches = last.matches;
+    if (!Array.isArray(matches)) {
+      throw new DecodeError('guest response is missing matches');
+    }
+    return matches.map((match: Record<string, unknown>) => ({
+      path: String(match.path ?? ''),
+      line: typeof match.line === 'number' ? match.line : null,
+      column: typeof match.column === 'number' ? match.column : null,
+      text: String(match.text ?? ''),
+    }));
   }
 
   #checkResultSize(last: Record<string, unknown>): void {

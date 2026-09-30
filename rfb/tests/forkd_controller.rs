@@ -1,7 +1,14 @@
 #![cfg(feature = "forkd")]
 
+mod common;
+
+use common::http::mock_once::mock_http;
 use rfb::forkd::{ForkdClient, ForkdClientError, ForkdConfig};
 use std::time::Duration;
+// The three snapshot_info servers below assert the exact request line, so
+// they keep hand-rolled tokio servers instead of `mock_http`.
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 #[test]
 fn validation_rejects_bad_sandbox_ids_and_accepts_valid_ids() {
@@ -46,27 +53,12 @@ fn new_rejects_invalid_urls_and_accepts_http_urls() {
     assert!(ForkdClient::new(config("http://localhost///", Some("token".into()))).is_ok());
 }
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
 async fn mock_response(
     status: &str,
     body: &str,
     delay: Duration,
 ) -> Result<bool, ForkdClientError> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        tokio::time::sleep(delay).await;
-        let _ = stream.write_all(response.as_bytes()).await;
-    });
+    let (address, server) = mock_http(status, body.to_owned(), Some(delay), None).await;
     let client = ForkdClient::new(ForkdConfig {
         base_url: format!("http://{address}"),
         token: None,

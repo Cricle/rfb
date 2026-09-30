@@ -162,97 +162,99 @@ fn reject_vsock_rootfs(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Resolve the kernel: `--kernel`, `FORKD_KERNEL`, or `resx/kernel` (preferring
-/// `vmlinux-arcbox-0.0.24`, else the first `vmlinux*` file).
-fn resolve_kernel(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
+/// Resolve one asset the way every snapshot wrapper does: `--flag` explicit,
+/// else the env var, else `resx/<subdir>` (preferring `preferred`, else the
+/// first entry passing `filter`, sorted). Each candidate passes `require_asset`
+/// (`label`), `filter` (name-based, directory listings only), and the `accept`
+/// callback (rootfs uses it for [`reject_vsock_rootfs`]) before being returned.
+/// `err_msg` is the exact failure when nothing resolves.
+// 8 args: one shared resolver standing in for five near-identical wrappers;
+// splitting them into structs would obscure the 1:1 mapping to the CLI knobs.
+#[allow(clippy::too_many_arguments)]
+fn resolve_asset(
+    explicit: Option<&Path>,
+    env_var: &str,
+    label: &str,
+    subdir: &str,
+    preferred: &str,
+    filter: impl Fn(&Path) -> bool,
+    accept: impl Fn(&Path) -> Result<(), CliError>,
+    err_msg: &str,
+) -> Result<PathBuf, CliError> {
     if let Some(path) = explicit {
-        require_asset(path, "kernel")?;
+        require_asset(path, label)?;
+        accept(path)?;
         return Ok(path.to_path_buf());
     }
-    if let Ok(value) = std::env::var("FORKD_KERNEL") {
+    if let Ok(value) = std::env::var(env_var) {
         if !value.trim().is_empty() {
             let path = PathBuf::from(&value);
-            require_asset(&path, "kernel")?;
+            require_asset(&path, label)?;
+            accept(&path)?;
             return Ok(path);
         }
     }
     if let Some(resx) = find_resx() {
-        let kernel_dir = resx.join("kernel");
-        let preferred = kernel_dir.join("vmlinux-arcbox-0.0.24");
-        if preferred.is_file() {
-            verify_resx_checksum(&preferred, "kernel")?;
-            return Ok(preferred);
+        let dir = resx.join(subdir);
+        let preferred_path = dir.join(preferred);
+        if preferred_path.is_file() {
+            verify_resx_checksum(&preferred_path, label)?;
+            accept(&preferred_path)?;
+            return Ok(preferred_path);
         }
-        if let Ok(entries) = fs::read_dir(&kernel_dir) {
+        if let Ok(entries) = fs::read_dir(&dir) {
             let mut files: Vec<PathBuf> = entries
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
-                .filter(|path| {
-                    path.is_file()
-                        && path
-                            .file_name()
-                            .is_some_and(|n| n.to_string_lossy().starts_with("vmlinux"))
-                })
+                .filter(|path| path.is_file() && filter(path))
                 .collect();
             files.sort();
             if let Some(path) = files.into_iter().next() {
-                verify_resx_checksum(&path, "kernel")?;
+                verify_resx_checksum(&path, label)?;
+                accept(path.as_path())?;
                 return Ok(path);
             }
         }
     }
-    Err(validation(
+    Err(validation(err_msg))
+}
+
+/// Resolve the kernel: `--kernel`, `FORKD_KERNEL`, or `resx/kernel` (preferring
+/// `vmlinux-arcbox-0.0.24`, else the first `vmlinux*` file).
+fn resolve_kernel(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
+    resolve_asset(
+        explicit,
+        "FORKD_KERNEL",
+        "kernel",
+        "kernel",
+        "vmlinux-arcbox-0.0.24",
+        |path| {
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("vmlinux"))
+        },
+        |_| Ok(()),
         "kernel not found; pass --kernel, set FORKD_KERNEL, or place a vmlinux under resx/kernel",
-    ))
+    )
 }
 
 /// Resolve the rootfs: `--rootfs`, `FORKD_ROOTFS`, or `resx/rootfs` (preferring
 /// `forkd-agent.ext4`). Rejects rfb-runtime vsock images.
 fn resolve_rootfs(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
-    if let Some(path) = explicit {
-        require_asset(path, "rootfs")?;
-        reject_vsock_rootfs(path)?;
-        return Ok(path.to_path_buf());
-    }
-    if let Ok(value) = std::env::var("FORKD_ROOTFS") {
-        if !value.trim().is_empty() {
-            let path = PathBuf::from(&value);
-            require_asset(&path, "rootfs")?;
-            reject_vsock_rootfs(&path)?;
-            return Ok(path);
-        }
-    }
-    if let Some(resx) = find_resx() {
-        let rootfs_dir = resx.join("rootfs");
-        let preferred = rootfs_dir.join("forkd-agent.ext4");
-        if preferred.is_file() {
-            verify_resx_checksum(&preferred, "rootfs")?;
-            reject_vsock_rootfs(&preferred)?;
-            return Ok(preferred);
-        }
-        if let Ok(entries) = fs::read_dir(&rootfs_dir) {
-            let mut files: Vec<PathBuf> = entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.is_file()
-                        && !path.file_name().is_some_and(|n| {
-                            let name = n.to_string_lossy();
-                            name.contains("rfb-runtime") || name.contains("zeroboot")
-                        })
-                })
-                .collect();
-            files.sort();
-            if let Some(path) = files.into_iter().next() {
-                verify_resx_checksum(&path, "rootfs")?;
-                reject_vsock_rootfs(&path)?;
-                return Ok(path);
-            }
-        }
-    }
-    Err(validation(
+    resolve_asset(
+        explicit,
+        "FORKD_ROOTFS",
+        "rootfs",
+        "rootfs",
+        "forkd-agent.ext4",
+        |path| {
+            !path.file_name().is_some_and(|n| {
+                let name = n.to_string_lossy();
+                name.contains("rfb-runtime") || name.contains("zeroboot")
+            })
+        },
+        reject_vsock_rootfs,
         "forkd-agent rootfs not found; pass --rootfs, set FORKD_ROOTFS, or place forkd-agent.ext4 under resx/rootfs",
-    ))
+    )
 }
 
 /// Resolve the host tap device: `--tap`, `FORKD_TAP`, or `forkd-tap0`.
@@ -368,6 +370,30 @@ pub fn sanitize_snapshot_info(raw: Value) -> Value {
     Value::Object(out)
 }
 
+/// Run a delegated forkd subcommand and fail closed on its non-zero status
+/// (stderr sanitized).
+fn run_forkd_checked(bin: &Path, argv: &[String], label: &str) -> Result<Output, CliError> {
+    let output = run_forkd(bin, argv)?;
+    if !output.status.success() {
+        return Err(external(format!(
+            "forkd {label} failed: {}",
+            sanitize_output(&output.stderr)
+        )));
+    }
+    Ok(output)
+}
+
+/// argv for `forkd snapshot-info --json --daemon-url <url> <tag>`.
+fn snapshot_info_argv(url: &str, tag: &str) -> Vec<String> {
+    vec![
+        "snapshot-info".into(),
+        "--json".into(),
+        "--daemon-url".into(),
+        url.to_owned(),
+        tag.to_owned(),
+    ]
+}
+
 /// `rfb-cli forkd snapshot-info`: fetch the daemon info record via the official
 /// `forkd snapshot-info --json` and render a sanitized summary. With
 /// `--require-provenance` the command fails closed unless provenance is
@@ -377,23 +403,11 @@ pub fn sanitize_snapshot_info(raw: Value) -> Value {
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_info(args: &ForkdSnapshotInfoArgs) -> Result<SnapshotOutput, CliError> {
-    let url = require_localhost(&args.url)?;
+    let url = require_localhost(&args.url.url)?;
     let tag = require_snapshot_tag(&args.tag)?;
     let bin = resolve_forkd_bin(args.forkd_bin.as_deref())?;
-    let argv: Vec<String> = vec![
-        "snapshot-info".into(),
-        "--json".into(),
-        "--daemon-url".into(),
-        url.clone(),
-        tag.to_owned(),
-    ];
-    let output = run_forkd(&bin, &argv)?;
-    if !output.status.success() {
-        return Err(external(format!(
-            "forkd snapshot-info failed: {}",
-            sanitize_output(&output.stderr)
-        )));
-    }
+    let argv = snapshot_info_argv(&url, tag);
+    let output = run_forkd_checked(&bin, &argv, "snapshot-info")?;
     let raw: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         external(format!(
             "forkd snapshot-info returned invalid JSON: {error}"
@@ -430,7 +444,7 @@ pub fn snapshot_info(args: &ForkdSnapshotInfoArgs) -> Result<SnapshotOutput, Cli
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput, CliError> {
-    let url = require_localhost(&args.url)?;
+    let url = require_localhost(&args.url.url)?;
     let tag = require_snapshot_tag(&args.tag)?;
     if args.boot_wait_secs == 0 {
         return Err(validation("--boot-wait-secs must be a positive integer"));
@@ -469,13 +483,7 @@ pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput,
     argv.push("--daemon-url".into());
     argv.push(url.clone());
 
-    let output = run_forkd(&bin, &argv)?;
-    if !output.status.success() {
-        return Err(external(format!(
-            "forkd snapshot failed: {}",
-            sanitize_output(&output.stderr)
-        )));
-    }
+    run_forkd_checked(&bin, &argv, "snapshot")?;
 
     let mut value = json!({
         "ok": true,
@@ -490,13 +498,7 @@ pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput,
     // Post-create info per operations guide. If the daemon is unavailable the
     // snapshot still exists; provenance then cannot be confirmed, which is a
     // fail-closed state only when --require-provenance was requested.
-    let info_argv: Vec<String> = vec![
-        "snapshot-info".into(),
-        "--json".into(),
-        "--daemon-url".into(),
-        url.clone(),
-        tag.to_owned(),
-    ];
+    let info_argv = snapshot_info_argv(&url, tag);
     match run_forkd(&bin, &info_argv) {
         Ok(info_output) if info_output.status.success() => {
             let raw: Value = serde_json::from_slice(&info_output.stdout)
@@ -551,7 +553,7 @@ pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput,
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn snapshot_delete(args: &ForkdSnapshotDeleteArgs) -> Result<SnapshotOutput, CliError> {
-    let url = require_localhost(&args.url)?;
+    let url = require_localhost(&args.url.url)?;
     let tag = require_snapshot_tag(&args.tag)?;
     if args.force && args.cascade {
         return Err(validation("--force and --cascade are mutually exclusive"));
@@ -565,13 +567,7 @@ pub fn snapshot_delete(args: &ForkdSnapshotDeleteArgs) -> Result<SnapshotOutput,
         argv.push("--force".into());
     }
     argv.push(tag.to_owned());
-    let output = run_forkd(&bin, &argv)?;
-    if !output.status.success() {
-        return Err(external(format!(
-            "forkd rmi failed: {}",
-            sanitize_output(&output.stderr)
-        )));
-    }
+    run_forkd_checked(&bin, &argv, "rmi")?;
     Ok(SnapshotOutput {
         value: json!({"ok": true, "tag": tag, "deleted": true}),
         text: format!("snapshot {tag} deleted"),

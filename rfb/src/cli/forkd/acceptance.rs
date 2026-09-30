@@ -1,14 +1,13 @@
 //! Full forkd acceptance gate: create a sandbox, exercise ping/stream/exec and
 //! the structured filesystem RPCs, validate negative paths, then destroy.
 
-use crate::cli::error::{external, no_vm, validation, CliError};
+use crate::cli::error::{no_vm, validation, CliError};
 use crate::cli::forkd::preflight::snapshot_ready;
 use crate::cli::forkd::sandbox::{
-    create_sandbox, destroy_sandbox, guest_call, ping_sandbox, wait_for_guest_ready,
+    create_ready_sandbox, destroy_sandbox, guest_call, ping_sandbox, stream_to_exit,
     GUEST_READY_DEADLINE,
 };
 use crate::controller::ForkdClient;
-use crate::forkd_guest::ForkdGuestClient;
 use serde_json::{json, Value};
 
 /// Full acceptance gate: create a sandbox, exercise ping/stream/exec plus the
@@ -45,17 +44,9 @@ pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value,
         return Ok(json!({"status": "skipped", "reason": "snapshot unavailable"}));
     }
 
-    let sandbox = create_sandbox(url, tag, 1, Some(32), false)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| validation("sandbox create returned no sandbox"))?;
+    let sandbox = create_ready_sandbox(url, tag, "sandbox create returned no sandbox").await?;
     let sid = sandbox.id.clone();
     let address = sandbox.guest_addr.clone();
-    if let Err(error) = wait_for_guest_ready(&address, GUEST_READY_DEADLINE).await {
-        let _ = destroy_sandbox(url, &sid).await;
-        return Err(error);
-    }
 
     let result: Result<Value, CliError> = async {
         let mut outcomes = Vec::new();
@@ -78,37 +69,13 @@ pub async fn acceptance(url: &str, tag: &str, require_vm: bool) -> Result<Value,
     }
 
     // Stream with terminal frame collection.
-    let stream_ok = async {
-        let mut stream = ForkdGuestClient::new(address.clone())
-            .stream(
-                vec!["/bin/echo".into(), "rfb-cli-acceptance".into()],
-                None,
-                Some(false),
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| external(e.to_string()))?;
-        loop {
-            match stream
-                .next_event()
-                .await
-                .map_err(|e| external(e.to_string()))?
-            {
-                Some(value) => {
-                    if let Some(code) = value.get("exit_code") {
-                        if code.as_i64() != Some(0) {
-                            return Err(validation("guest stream exit code != 0"));
-                        }
-                        break;
-                    }
-                }
-                None => return Err(validation("guest stream closed before exit")),
-            }
-        }
-        Ok::<_, CliError>(json!({}))
-    }
-    .await;
+    let stream_ok = stream_to_exit(
+        &address,
+        vec!["/bin/echo".into(), "rfb-cli-acceptance".into()],
+        true,
+    )
+    .await
+    .map(|_| json!({}));
     run("guest_stream", stream_ok)?;
 
     // Exec in the opaque workspace.

@@ -113,6 +113,18 @@ impl WorkspaceGuestExecutor {
             .get("path")
             .and_then(Value::as_str)
             .ok_or("path is required")?;
+        // PROTOCOL.md §2.2: the write contract carries `append` and `mode`.
+        // `mode` has no implementation over this transport — fail closed
+        // instead of silently dropping a permission-tightening request.
+        if a.get("mode").is_some_and(|m| !m.is_null()) {
+            return Err("mode is not supported over this transport".into());
+        }
+        let append = a.get("append").and_then(Value::as_bool).unwrap_or(false);
+        if a.get("append")
+            .is_some_and(|v| !v.is_null() && v.as_bool().is_none())
+        {
+            return Err("append must be a boolean".into());
+        }
         let data = a
             .get("data")
             .and_then(Value::as_array)
@@ -131,6 +143,7 @@ impl WorkspaceGuestExecutor {
             request_id: "fs".into(),
             path: path.into(),
             content: data,
+            append,
         })?;
         Ok(json!({"bytes_written": n}))
     }
@@ -178,9 +191,12 @@ impl WorkspaceGuestExecutor {
             .ok_or("pattern is required")?;
         let max = a.get("max_results").and_then(Value::as_u64).unwrap_or(100) as usize;
         let mut out = Vec::new();
-        walk(&root, &root, pattern, max, &mut out)?;
-        // Host `FindResult` expects {matches, truncated}.
-        Ok(json!({"matches": out, "truncated": false}))
+        let truncated = walk(&root, pattern, max, &mut out)?;
+        // Host `FindResult` expects {matches, truncated}; the bounded walk's
+        // real truncation flag is surfaced so hosts can tell "no more
+        // matches" from "results were dropped" (a max_results cap silently
+        // losing entries is P1-3).
+        Ok(json!({"matches": out, "truncated": truncated}))
     }
 
     fn grep(&self, value: &Value) -> Result<Value, String> {
@@ -287,37 +303,12 @@ impl WorkspaceGuestExecutor {
     }
 }
 
-fn walk(
-    root: &Path,
-    base: &Path,
-    pattern: &str,
-    max: usize,
-    out: &mut Vec<String>,
-) -> Result<(), String> {
-    if out.len() >= max {
-        return Ok(());
-    }
-    for e in fs::read_dir(root).map_err(|e| e.to_string())? {
-        let e = e.map_err(|e| e.to_string())?;
-        let p = e.path();
-        // Skip symlinks to prevent cycle hangs
-        if e.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-            continue;
-        }
-        if e.file_name().to_string_lossy().contains(pattern) {
-            out.push(
-                p.strip_prefix(base)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            if out.len() >= max {
-                return Ok(());
-            }
-        }
-        if p.is_dir() {
-            walk(&p, base, pattern, max, out)?;
-        }
-    }
-    Ok(())
+/// The ZBRT walk: glob-name matching (PROTOCOL.md find contract — a substring
+/// `contains` would over-match ("note" hitting note.txt) and never honor `*`)
+/// over the shared bounded walk, with symlink skipping as the cycle guard.
+/// The walk's truncation flag is surfaced verbatim into the find result's
+/// `truncated` field.
+fn walk(root: &Path, pattern: &str, max: usize, out: &mut Vec<String>) -> Result<bool, String> {
+    let matcher = |name: &str| crate::glob::glob_matches(pattern, name);
+    crate::glob::bounded_name_walk(root, root, &matcher, max, true, out).map_err(|e| e.to_string())
 }

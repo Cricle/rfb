@@ -107,6 +107,38 @@ fn redirection_creates_and_appends_files() {
 }
 
 #[test]
+fn inline_hash_comment_is_stripped() {
+    // POSIX: `#` after whitespace starts a comment; inside a word it is a
+    // literal character.
+    assert_eq!(stdout_of("echo hi # comment"), "hi\n");
+    assert_eq!(stdout_of("echo a#b"), "a#b\n");
+}
+
+#[test]
+fn devnull_redirect_discards_instead_of_inheriting() {
+    // `> /dev/null` must give the child a real null fd. The old sentinel
+    // conflated "/dev/null" with "no redirection" and inherited the captured
+    // stdout — the discarded text leaked into the command's output.
+    let out = sh("echo secret > /dev/null");
+    assert!(
+        out.stdout.is_empty(),
+        "devnull-redirected stdout must be discarded, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The classic discard idiom: both streams must vanish.
+    let out = sh("echo leaked > /dev/null 2>&1");
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "devnull+dup must discard both streams, got {:?}/{:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `< /dev/null` gives an immediate EOF, so `cat` terminates.
+    let out = sh("cat < /dev/null; echo done-$?");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done-0\n");
+}
+
+#[test]
 fn pipelines_connect_stages() {
     let out = sh("echo piped | cat");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "piped\n");

@@ -3,7 +3,8 @@
 
 // Forkd snapshot path-helper tests. The helpers stay private to the CLI, so
 // this file includes them through a seam module whose nested `tests` module
-// can see them (same pattern as `tests/zeroboot_firecracker.rs`). Seam
+// can see them (same pattern as
+// `rfb-runtime/tests/firecracker_controller.rs`). Seam
 // contract: `snapshot_paths.rs` must only reference `crate::cli::error` and
 // std; `error.rs` is included for it.
 

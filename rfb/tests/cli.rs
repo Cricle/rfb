@@ -1,31 +1,14 @@
 #![cfg(feature = "cli")]
 
+mod common;
+
+use common::cli::{cli, run};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rfb-cli"))
-}
-
-fn run(args: &[&str]) -> Output {
-    cli().args(args).output().expect("run rfb-cli")
-}
+use std::process::Command;
 
 fn write_manifest(path: &Path, image: Option<serde_json::Value>, files: serde_json::Value) {
-    let manifest = serde_json::json!({
-        "format": "rfb-cli-staging/v1",
-        "image_size_bytes": 4096,
-        "block_size": 4096,
-        "staging": "staging",
-        "files": files,
-        "image": image,
-    });
-    fs::write(
-        path,
-        serde_json::to_vec(&manifest).expect("serialize manifest"),
-    )
-    .expect("write manifest");
+    common::cli::write_staging_manifest_at(path, files, image.unwrap_or(serde_json::Value::Null));
 }
 
 #[test]

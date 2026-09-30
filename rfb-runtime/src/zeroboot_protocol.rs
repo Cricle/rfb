@@ -37,6 +37,25 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
     Frame::decode(&mut bytes.as_slice())
 }
 
+/// Blocking twin of [`read_frame_async`] for std transports (CLI verify/health
+/// probes run on a synchronous `UnixStream`).
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
+pub fn read_frame_sync<R: Read>(reader: &mut R) -> io::Result<Frame> {
+    let mut header = [0u8; HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    let n = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
+    if n > MAX_PAYLOAD {
+        return Err(err("payload too large"));
+    }
+    let mut bytes = vec![0u8; HEADER_LEN + n];
+    bytes[..HEADER_LEN].copy_from_slice(&header);
+    reader.read_exact(&mut bytes[HEADER_LEN..])?;
+    Frame::decode(&mut bytes.as_slice())
+}
+
 /// Write one complete ZBRT frame to an async transport.
 ///
 /// # Errors
@@ -55,6 +74,31 @@ pub const MAGIC: [u8; 4] = *b"ZBRT";
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Build the mandatory ZBRT Hello frame (PROTOCOL.md §3.4) advertising the
+/// full V1 capability set under `client`. Shared by every host-side client
+/// (SDK, provider, CLI verify).
+///
+/// # Errors
+///
+/// Returns `Err` when the Hello payload fails to encode (never in practice —
+/// the capability set is static).
+pub fn hello_frame(client: &str, request_id: [u8; 16]) -> io::Result<Frame> {
+    let payload = Hello {
+        client: client.to_owned(),
+        capabilities: ZBRT_V1_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect(),
+    }
+    .encode()?;
+    Ok(Frame {
+        kind: Kind::Hello,
+        flags: 0,
+        request_id,
+        payload,
+    })
+}
 
 /// ZeroBoot V1 wire capability vocabulary — the single source of truth shared
 /// by the host Hello (`rfb::zeroboot`), the guest HelloAck

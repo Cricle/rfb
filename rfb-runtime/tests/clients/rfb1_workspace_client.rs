@@ -166,6 +166,7 @@ fn main() -> io::Result<()> {
             request_id: "write-1".into(),
             path: "nested/result.txt".into(),
             content: content.clone(),
+            append: false,
         }),
     );
     expect(

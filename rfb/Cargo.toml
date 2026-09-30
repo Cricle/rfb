@@ -22,7 +22,7 @@ forkd = ["dep:reqwest", "dep:tokio", "dep:url"]
 # The ZBRT V1 protocol types live in rfb-runtime (`zeroboot_protocol`); `rfb`
 # re-exports them so host/provider consumers share one wire implementation
 # without a `rfb` <-> `rfb-runtime` dependency cycle.
-zeroboot = ["dep:anyhow", "dep:tokio", "dep:tokio-vsock", "dep:uuid", "dep:rfb-runtime", "dep:tempfile", "dep:sha2", "dep:libc"]
+zeroboot = ["dep:anyhow", "dep:tokio", "dep:tokio-vsock", "dep:uuid", "dep:rfb-runtime", "rfb-runtime/firecracker", "dep:tempfile", "dep:sha2", "dep:libc"]
 # The CLI reuses the runtime's RFB1 framed codec and session contract for its
 # rfb1 acceptance/verify commands instead of reimplementing the wire format.
 cli = ["dep:clap", "dep:sha2", "dep:toml", "dep:rfb-runtime", "rfb-runtime/host-vsock", "forkd", "zeroboot"]
@@ -57,3 +57,4 @@ required-features = ["cli"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time"] }
 futures-lite = "2"
 tempfile = "3"
+libc = "0.2"

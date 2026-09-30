@@ -311,6 +311,13 @@ impl RuntimeManager {
             if stale_placeholder {
                 s.remove(id);
             }
+            // The RETURNED handle must tell the truth: a cancel (or a new
+            // owner) replaced this entry while provisioning ran, so report
+            // the table's current state instead of the local Running/Failed
+            // guess.
+            if let Some(current) = s.get(id) {
+                h = current.clone();
+            }
             let adapter = self.adapter.clone();
             tokio::spawn(async move {
                 let _ = cleanup_with_retry(10, 2, 100, || adapter.destroy(&w)).await;

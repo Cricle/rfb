@@ -281,84 +281,53 @@ impl ClusterSandbox {
     }
 }
 
+/// Expand the [`Sandbox`] methods that are pure delegation to the wrapped
+/// [`ForkdSandbox`]. `sync` methods return the value directly; plain methods
+/// are async and return `BoxFuture<'a, Result<$ret, SandboxError>>`. Methods
+/// whose return type mentions `'a` (only `stream`) stay handwritten.
+macro_rules! delegate_sandbox {
+    (sync: $($name:ident ($($arg:ident : $ty:ty),*) -> $ret:ty;)*) => {
+        $(
+            fn $name(&self $(, $arg: $ty)*) -> $ret {
+                self.inner.$name($($arg),*)
+            }
+        )*
+    };
+    ($($name:ident ($($arg:ident : $ty:ty),*) -> $ret:ty;)*) => {
+        $(
+            fn $name<'a>(&'a self $(, $arg: $ty)*) -> BoxFuture<'a, Result<$ret, SandboxError>> {
+                self.inner.$name($($arg),*)
+            }
+        )*
+    };
+}
+
 impl Sandbox for ClusterSandbox {
-    fn backend(&self) -> BackendKind {
-        self.inner.backend()
+    delegate_sandbox! {
+        sync:
+        backend() -> BackendKind;
+        transport() -> TransportKind;
+        capabilities() -> &[Capability];
     }
-    fn transport(&self) -> TransportKind {
-        self.inner.transport()
-    }
-    fn capabilities(&self) -> &[Capability] {
-        self.inner.capabilities()
-    }
-    fn exec<'a>(&'a self, spec: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
-        self.inner.exec(spec)
-    }
-    fn health<'a>(&'a self) -> BoxFuture<'a, Result<guest::Health, SandboxError>> {
-        self.inner.health()
-    }
-    fn ping<'a>(&'a self) -> BoxFuture<'a, Result<guest::Health, SandboxError>> {
-        self.inner.ping()
+    delegate_sandbox! {
+        exec(spec: ExecSpec) -> ExecResult;
+        health() -> guest::Health;
+        ping() -> guest::Health;
+        ls(request: guest::LsRequest) -> guest::LsResult;
+        find(request: guest::FindRequest) -> guest::FindResult;
+        grep(request: guest::GrepRequest) -> guest::GrepResult;
+        read(request: guest::ReadRequest) -> guest::ReadResult;
+        read_file(request: guest::ReadRequest) -> guest::ReadResult;
+        write(request: guest::WriteRequest) -> guest::WriteResult;
+        write_file(request: guest::WriteRequest) -> guest::WriteResult;
+        eval(request: guest::EvalRequest) -> guest::EvalResult;
+        cancel(request: guest::CancelRequest) -> guest::CancelResult;
     }
     fn stream<'a>(
         &'a self,
         spec: guest::StreamSpec,
     ) -> BoxFuture<'a, Result<Box<dyn guest::GuestStream + 'a>, SandboxError>> {
         self.inner.stream(spec)
-    }
-    fn ls<'a>(
-        &'a self,
-        request: guest::LsRequest,
-    ) -> BoxFuture<'a, Result<guest::LsResult, SandboxError>> {
-        self.inner.ls(request)
-    }
-    fn find<'a>(
-        &'a self,
-        request: guest::FindRequest,
-    ) -> BoxFuture<'a, Result<guest::FindResult, SandboxError>> {
-        self.inner.find(request)
-    }
-    fn grep<'a>(
-        &'a self,
-        request: guest::GrepRequest,
-    ) -> BoxFuture<'a, Result<guest::GrepResult, SandboxError>> {
-        self.inner.grep(request)
-    }
-    fn read<'a>(
-        &'a self,
-        request: guest::ReadRequest,
-    ) -> BoxFuture<'a, Result<guest::ReadResult, SandboxError>> {
-        self.inner.read(request)
-    }
-    fn read_file<'a>(
-        &'a self,
-        request: guest::ReadRequest,
-    ) -> BoxFuture<'a, Result<guest::ReadResult, SandboxError>> {
-        self.inner.read_file(request)
-    }
-    fn write<'a>(
-        &'a self,
-        request: guest::WriteRequest,
-    ) -> BoxFuture<'a, Result<guest::WriteResult, SandboxError>> {
-        self.inner.write(request)
-    }
-    fn write_file<'a>(
-        &'a self,
-        request: guest::WriteRequest,
-    ) -> BoxFuture<'a, Result<guest::WriteResult, SandboxError>> {
-        self.inner.write_file(request)
-    }
-    fn eval<'a>(
-        &'a self,
-        request: guest::EvalRequest,
-    ) -> BoxFuture<'a, Result<guest::EvalResult, SandboxError>> {
-        self.inner.eval(request)
-    }
-    fn cancel<'a>(
-        &'a self,
-        request: guest::CancelRequest,
-    ) -> BoxFuture<'a, Result<guest::CancelResult, SandboxError>> {
-        self.inner.cancel(request)
     }
 }
 

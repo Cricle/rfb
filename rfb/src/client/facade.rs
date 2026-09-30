@@ -781,7 +781,14 @@ impl GuestOps {
     ) -> Result<GuestStream, RfbError> {
         match self {
             GuestOps::Ndjson(client) => {
-                let inner = client.stream(argv, cwd, pty, env, None).await?;
+                // The per-event read budget must exceed the guest's own exec
+                // deadline (mirrors the trait path in `forkd/provider.rs`).
+                // The facade surface carries no per-stream exec timeout, so
+                // the budget is the trait path's no-deadline shape: base
+                // timeout + EXEC_READ_MARGIN, not the bare base timeout that
+                // would kill long silent turns client-side.
+                let budget = client.timeout + crate::forkd_guest::EXEC_READ_MARGIN;
+                let inner = client.stream(argv, cwd, pty, env, Some(budget)).await?;
                 Ok(GuestStream {
                     inner: StreamInner::Ndjson(inner),
                     exited: false,

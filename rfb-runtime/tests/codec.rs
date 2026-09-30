@@ -106,7 +106,9 @@ fn decode_rejects_declared_length_over_max_payload() {
     bytes.extend_from_slice(&1u64.to_le_bytes());
     bytes.extend_from_slice(&65u32.to_le_bytes()); // len > max_payload, no payload present
     let error = codec.decode::<String>(&bytes).unwrap_err();
-    assert!(matches!(error, CodecError::Truncated));
+    // Oversized DECLARED length is TooLarge (a limit violation), not
+    // Truncated — the two need different handling upstream.
+    assert!(matches!(error, CodecError::TooLarge));
 }
 
 #[test]

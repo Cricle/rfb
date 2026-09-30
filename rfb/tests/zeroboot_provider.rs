@@ -136,3 +136,56 @@ fn v1_negotiation_and_contract_mapping() {
 fn provider_is_constructible() {
     let _ = ZeroBootProvider::default();
 }
+
+#[test]
+fn scavenge_never_touches_directories_outside_its_namespace() {
+    // Ownership = name prefix + lock-content magic + a free flock, TOGETHER.
+    // A third-party directory using the generic `work.lock` name must
+    // survive even when its lock happens to be free at probe time.
+    let root = tempfile::tempdir().unwrap();
+
+    // 1. Foreign dir, generic name, EMPTY (claimable-looking) work.lock.
+    let foreign = root.path().join("someone-elses-build");
+    std::fs::create_dir_all(foreign.join("deep/nested")).unwrap();
+    std::fs::write(foreign.join("work.lock"), b"").unwrap();
+    std::fs::write(foreign.join("deep/nested/precious.txt"), b"data").unwrap();
+
+    // 2. OUR prefix, but the lock content is not our magic.
+    let forged = root.path().join("rfb-zeroboot-forged");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(forged.join("work.lock"), b"not-ours\n").unwrap();
+
+    // 3. OUR prefix, our magic, free lock → the one legitimate target.
+    let stale = root.path().join("rfb-zeroboot-stale");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("work.lock"), b"rfb-work-lock\n").unwrap();
+
+    // 4. OUR prefix, our magic, but currently locked (live holder).
+    let live = root.path().join("rfb-zeroboot-live");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("work.lock"), b"rfb-work-lock\n").unwrap();
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(live.join("work.lock"))
+        .unwrap();
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    }
+
+    let removed = rfb::zeroboot::scavenge_stale_in(root.path(), "work.lock", "rfb-zeroboot-");
+    assert_eq!(removed, 1, "only the stale own-prefix dir may be removed");
+    assert!(
+        foreign.join("deep/nested/precious.txt").is_file(),
+        "foreign namespace must be untouched"
+    );
+    assert!(
+        forged.join("work.lock").is_file(),
+        "foreign lock content must be untouched"
+    );
+    assert!(
+        live.join("work.lock").is_file(),
+        "live lock must be untouched"
+    );
+}

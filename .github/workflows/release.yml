@@ -162,7 +162,7 @@ jobs:
             exit "$rc"
           fi
       - name: Build CLI
-        run: cargo build -p rfb-sdk --features cli --release
+        run: cargo build --locked -p rfb-sdk --features cli --release
       # 沙箱 pid1：**python 和 lua 各打一个变体**（musl 多调用二进制）。
       # SDK 使用者的 "pid1 模式"——拿到变体 + rfb-busybox +
       # `rfb-cli image build-rootfs --with-python/--with-lua` 即可现场做出
@@ -172,14 +172,15 @@ jobs:
       - name: "Build sandbox pid1 variants (musl: python / lua)"
         run: |
           set -euo pipefail
+          mkdir -p dist
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release -p rfb-runtime \
+          cargo build --locked --release -p rfb-runtime \
             --target x86_64-unknown-linux-musl \
             --features cli,rustpython
           gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-runtime \
             > dist/rfb-runtime-python.gz
-          cargo build --release -p rfb-runtime \
+          cargo build --locked --release -p rfb-runtime \
             --target x86_64-unknown-linux-musl \
             --features cli,mlua
           gzip -9 -c target/x86_64-unknown-linux-musl/release/rfb-runtime \

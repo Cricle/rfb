@@ -4,47 +4,33 @@
 //! frames driven through the RuntimeService + WorkspaceGuestExecutor without
 //! a real VM or vsock. These are the testable seams of the guest service.
 
+mod common;
+
 use rfb_runtime::resources::RuntimeLimits;
-use rfb_runtime::runtime_service::RuntimeService;
+use rfb_runtime::runtime_service::{GuestEvent, GuestExecutor, RuntimeService};
+use rfb_runtime::session::SessionRequest;
 use rfb_runtime::workspace_executor::WorkspaceGuestExecutor;
 use rfb_runtime::zeroboot_connection::serve;
-use rfb_runtime::zeroboot_protocol::{
-    read_frame_async, write_frame_async, Cancel, Error as ZbrtError, Frame, Fs, Hello, HelloAck,
-    Kind,
-};
 #[cfg(unix)]
-use rfb_runtime::zeroboot_protocol::{Execute, Exit, Health};
+use rfb_runtime::zeroboot_protocol::Exit;
+use rfb_runtime::zeroboot_protocol::{
+    read_frame_async, write_frame_async, Cancel, Error as ZbrtError, Execute, Frame, Fs, Health,
+    Hello, HelloAck, Kind,
+};
 use std::fs;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
 use tokio::sync::Mutex;
 
 fn workspace() -> std::path::PathBuf {
-    static NEXT_WORKSPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = NEXT_WORKSPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "rfb-zb-conn-{}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        sequence
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
+    common::unique_temp_dir("rfb-zb-conn")
 }
 
 fn new_frame(kind: Kind, payload: Vec<u8>) -> Frame {
-    Frame {
-        kind,
-        flags: 0,
-        request_id: [7; 16],
-        payload,
-    }
+    // The suite's fixed wire request id ([7;16]) over the shared constructor.
+    common::frame(kind, [7; 16], payload)
 }
 
 #[cfg(unix)]
@@ -480,6 +466,141 @@ async fn cancelled_turn_output_does_not_leak_into_next_request() {
         "cancelled turn output leaked into next request"
     );
     assert!(stderr.is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Executor whose worker panics mid-turn: the panic kills the spawned
+/// blocking task WITHOUT ever delivering a Terminal on the worker channel, so
+/// only the serve loop's join-handle detector can notice it.
+struct PanickingExecutor;
+
+impl GuestExecutor for PanickingExecutor {
+    fn start_turn(&mut self, _request: &SessionRequest) -> Result<Vec<GuestEvent>, String> {
+        panic!("simulated workspace worker panic");
+    }
+
+    fn cancel(&mut self, _session_id: &str, _request_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn worker_panic_fails_closed_and_connection_stays_servable() {
+    let root = workspace();
+    // A panicking worker must not wedge the connection (and, through the
+    // never-cleared active turn, every later FS RPC) forever: the serve loop
+    // must detect the join error, reclaim the turn, and answer this request
+    // with a fail-closed Error frame.
+    let service = Arc::new(Mutex::new(RuntimeService::with_executor_impl(
+        RuntimeLimits::default(),
+        PanickingExecutor,
+    )));
+    let (mut host, guest) = duplex(16 * 1024);
+    let (guest_read, guest_write) = tokio::io::split(guest);
+    tokio::spawn(async move {
+        let _ = serve(guest_read, guest_write, service).await;
+    });
+    handshake(&mut host).await;
+
+    write_frame_async(
+        &mut host,
+        &new_frame(
+            Kind::Execute,
+            Execute {
+                argv: vec!["echo".into(), "boom".into()],
+                cwd: None,
+                stdin: Vec::new(),
+                timeout_ms: 5000,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // The panicked request is answered with exactly one Error frame.
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_frame_async(&mut host),
+    )
+    .await
+    .expect("panic must be detected promptly")
+    .unwrap();
+    assert_eq!(frame.kind, Kind::Error);
+    assert_eq!(frame.request_id, [7; 16]);
+    let error = ZbrtError::decode(&frame.payload).unwrap();
+    assert!(
+        error.message.contains("turn worker died"),
+        "panic must reclaim the turn via abandon_active_turn, got: {}",
+        error.message
+    );
+
+    // The connection itself is not wedged: Health is still served.
+    write_frame_async(
+        &mut host,
+        &new_frame(
+            Kind::Health,
+            Health {
+                healthy: true,
+                message: None,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_frame_async(&mut host),
+    )
+    .await
+    .expect("connection must stay servable after a worker panic")
+    .unwrap();
+    assert_eq!(frame.kind, Kind::HealthAck);
+
+    // And the runtime no longer lies about a turn in progress: a follow-up
+    // Execute (fresh wire id — the panicked one stays occupied) gets an
+    // explicit, actionable rejection instead of hanging forever.
+    write_frame_async(
+        &mut host,
+        &Frame {
+            kind: Kind::Execute,
+            flags: 0,
+            request_id: [9; 16],
+            payload: Execute {
+                argv: vec!["echo".into(), "again".into()],
+                cwd: None,
+                stdin: Vec::new(),
+                timeout_ms: 5000,
+            }
+            .encode()
+            .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_frame_async(&mut host),
+    )
+    .await
+    .expect("follow-up Execute must be answered, not hang")
+    .unwrap();
+    assert_eq!(frame.kind, Kind::Error);
+    assert_eq!(frame.request_id, [9; 16]);
+    let error = ZbrtError::decode(&frame.payload).unwrap();
+    assert!(
+        error.message.contains("still finishing"),
+        "executor lost to the panic must surface as an actionable error, got: {}",
+        error.message
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

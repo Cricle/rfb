@@ -14,7 +14,7 @@ use uuid::Uuid;
 #[cfg(unix)]
 use crate::codec::{read_frame, write_frame, Frame, FrameCodec, MessageType};
 #[cfg(unix)]
-use crate::session::{ControlMessage, RuntimeMessage};
+use crate::session::{control_type, ControlMessage, RuntimeMessage};
 
 /// A validated host-side vsock endpoint for one guest.
 ///
@@ -603,6 +603,7 @@ impl SharedHostSession {
                     request_id: request_id.clone(),
                     path: path.into(),
                     content,
+                    append: false,
                 }),
                 sequence,
             )
@@ -831,20 +832,6 @@ impl HostSession {
             )));
         }
         Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn control_type(message: &ControlMessage) -> MessageType {
-    match message {
-        ControlMessage::Hello { .. } => MessageType::Hello,
-        ControlMessage::Capabilities { .. } => MessageType::Capabilities,
-        ControlMessage::StartTurn(_) => MessageType::StartTurn,
-        ControlMessage::Cancel { .. } => MessageType::CancelTurn,
-        ControlMessage::ReadWorkspaceFile(_) => MessageType::ReadWorkspaceFile,
-        ControlMessage::ReadHostFile(_) => MessageType::ReadHostFile,
-        ControlMessage::WriteWorkspaceFile(_) => MessageType::WriteWorkspaceFile,
-        ControlMessage::Shutdown => MessageType::Shutdown,
     }
 }
 
@@ -1174,6 +1161,7 @@ impl VsockGuestClient {
                         request_id: request_id.clone(),
                         path: path.into(),
                         content,
+                        append: false,
                     }),
                     2,
                 )

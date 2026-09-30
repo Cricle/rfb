@@ -13,6 +13,37 @@ use serde_json::{json, Value};
 use std::{fs, io::Write, path::Path, process::Command};
 use tempfile::NamedTempFile;
 
+/// Whether `path` is an existing, openable regular file.
+pub(crate) fn readable_file(path: &Path) -> bool {
+    path.is_file() && fs::File::open(path).is_ok()
+}
+
+/// Require `path` to be a readable file; `label` names it in the error.
+pub(crate) fn require_readable(path: &Path, label: &str) -> Result<(), CliError> {
+    if readable_file(path) {
+        Ok(())
+    } else {
+        Err(validation(format!("{label} missing: {}", path.display())))
+    }
+}
+
+/// Resolve the rootfs source shared by the backend `up` commands: `--rootfs`
+/// provided as-is, or built from a pid1 dir via `build_from_pid1`. The
+/// mutual-exclusion/required validation is KVM- and permission-free by design
+/// so non-root environments (CI) exercise the same contract.
+pub(crate) fn resolve_rootfs_source(
+    rootfs: Option<&Path>,
+    pid1_dir: Option<&Path>,
+    build_from_pid1: impl FnOnce(&Path) -> Result<std::path::PathBuf, CliError>,
+) -> Result<(std::path::PathBuf, String), CliError> {
+    match (rootfs, pid1_dir) {
+        (Some(rootfs), None) => Ok((rootfs.to_path_buf(), "provided".to_owned())),
+        (None, Some(dir)) => Ok((build_from_pid1(dir)?, "built from pid1".to_owned())),
+        (Some(_), Some(_)) => Err(validation("--rootfs and --pid1-dir are mutually exclusive")),
+        (None, None) => Err(validation("one of --rootfs or --pid1-dir is required")),
+    }
+}
+
 /// Initialize a new staging directory + manifest.
 ///
 /// # Errors
@@ -467,17 +498,7 @@ pub fn build_rootfs(
     if let Some(busybox_src) = busybox_src.filter(|path| path.is_file()) {
         // Clear any pre-created /bin/sh first — debugfs write fails closed on
         // an existing inode (same pattern as the applet writes below).
-        let _ = run_debugfs(&image_path, "unlink /bin/sh", false);
-        let _ = run_debugfs(&image_path, "rm /bin/sh", false);
-        run_debugfs(
-            &image_path,
-            &format!(
-                "write {} /bin/sh",
-                debugfs_quote(&busybox_src.to_string_lossy())
-            ),
-            false,
-        )?;
-        run_debugfs(&image_path, "set_inode_field /bin/sh mode 0100755", false)?;
+        force_write(&image_path, &busybox_src, "/bin/sh")?;
         // Hardlinked multi-call entry points (same inode, zero extra image
         // bytes): `bash` is the same shell under its alternative name and
         // `sleep` the one coreutil the timeout/eval contracts exercise.
@@ -487,119 +508,46 @@ pub fn build_rootfs(
             run_debugfs(&image_path, &format!("ln /bin/sh /bin/{applet}"), false)?;
         }
     }
-    run_debugfs(
-        &image_path,
-        &format!(
-            "write {} {install_path}",
-            debugfs_quote(&runtime_bin.to_string_lossy())
-        ),
-        false,
-    )?;
-    run_debugfs(
-        &image_path,
-        &format!("set_inode_field {install_path} mode 0100755"),
-        false,
-    )?;
+    force_write(&image_path, runtime_bin, install_path)?;
     if mode == "forkd-agent" {
         // /forkd-init.sh is a HARDLINK to the installed runtime binary (same
         // inode, zero image bytes): the multi-call dispatch keys on the
         // argv[0] basename, which a hardlink preserves. Writing the binary a
         // second time doubled every forkd image by the runtime size.
-        run_debugfs(
-            &image_path,
-            &format!("ln {install_path} {entrypoint}"),
-            false,
-        )?;
-        run_debugfs(
-            &image_path,
-            &format!("set_inode_field {entrypoint} mode 0100755"),
-            false,
-        )?;
+        install_hardlink(&image_path, install_path, entrypoint)?;
     }
     if mode == "zeroboot-zbrt" {
-        let marker = NamedTempFile::new().map_err(|error| io(error.to_string()))?;
-        fs::write(marker.path(), "zbrt\n").map_err(|error| io(error.to_string()))?;
-        run_debugfs(
-            &image_path,
-            &format!(
-                "write {} /etc/zeroboot-protocol",
-                debugfs_quote(&marker.path().to_string_lossy())
-            ),
-            false,
-        )?;
-        fs::write(marker.path(), "1\n").map_err(|error| io(error.to_string()))?;
-        run_debugfs(
-            &image_path,
-            &format!(
-                "write {} /etc/zeroboot-protocol-version",
-                debugfs_quote(&marker.path().to_string_lossy())
-            ),
-            false,
-        )?;
+        write_marker(&image_path, "/etc/zeroboot-protocol", "zbrt\n")?;
+        write_marker(&image_path, "/etc/zeroboot-protocol-version", "1\n")?;
         // Single source of truth: same vocabulary the guest HelloAck and
         // `rfb-cli zeroboot verify` use (crate::protocol re-exports the
         // canonical const from rfb-runtime).
-        fs::write(
-            marker.path(),
-            format!("{}\n", crate::protocol::ZBRT_V1_CAPABILITIES.join(",")),
-        )
-        .map_err(|error| io(error.to_string()))?;
-        run_debugfs(
+        write_marker(
             &image_path,
-            &format!(
-                "write {} /etc/zeroboot-capabilities",
-                debugfs_quote(&marker.path().to_string_lossy())
-            ),
-            false,
+            "/etc/zeroboot-capabilities",
+            &format!("{}\n", crate::protocol::ZBRT_V1_CAPABILITIES.join(",")),
         )?;
-        fs::write(marker.path(), "5000\n").map_err(|error| io(error.to_string()))?;
-        run_debugfs(
-            &image_path,
-            &format!(
-                "write {} /etc/zeroboot-guest-port",
-                debugfs_quote(&marker.path().to_string_lossy())
-            ),
-            false,
-        )?;
+        write_marker(&image_path, "/etc/zeroboot-guest-port", "5000\n")?;
     }
     if mode == "rfb-vsock" {
         // Write protocol-version and environment markers via debugfs `write`
         // from temp files (debugfs cannot inline stdin).
-        let work = NamedTempFile::new().map_err(|error| io(error.to_string()))?;
-        fs::write(work.path(), "1\n").map_err(|error| io(error.to_string()))?;
-        run_debugfs(
+        write_marker(&image_path, "/etc/rfb-runtime/protocol-version", "1\n")?;
+        write_marker(
             &image_path,
-            &format!(
-                "write {} /etc/rfb-runtime/protocol-version",
-                debugfs_quote(&work.path().to_string_lossy())
-            ),
-            false,
-        )?;
-        fs::write(
-            work.path(),
+            "/etc/rfb-runtime/environment",
             "RFB_RUNTIME_EXECUTOR=workspace\nRFB_RUNTIME_WORKSPACE=/workspace\n",
-        )
-        .map_err(|error| io(error.to_string()))?;
-        run_debugfs(
-            &image_path,
-            &format!(
-                "write {} /etc/rfb-runtime/environment",
-                debugfs_quote(&work.path().to_string_lossy())
-            ),
-            false,
         )?;
     }
 
     // Verify every published contract artifact before reporting success.
     let entry_stat = run_debugfs(&image_path, &format!("stat {entrypoint}"), true)?;
-    let entry_stat = String::from_utf8_lossy(&entry_stat);
-    if !entry_stat.contains("Type:")
-        || !entry_stat.contains("regular")
-        || !(entry_stat.contains("0755") || entry_stat.contains("-rwxr-xr-x"))
-    {
+    if !crate::cli::image_build::stat_is_executable_regular(&String::from_utf8_lossy(&entry_stat)) {
         return Err(external(format!(
             "entrypoint verification failed: {entrypoint}; debugfs stat: {}",
-            entry_stat.trim().replace('\n', " | ")
+            String::from_utf8_lossy(&entry_stat)
+                .trim()
+                .replace('\n', " | ")
         )));
     }
     crate::cli::image_build::verify_installed_file(&image_path, runtime_bin, install_path)?;
@@ -617,14 +565,11 @@ pub fn build_rootfs(
         }
     }
     if mode == "zeroboot-zbrt" {
-        let marker = run_debugfs(&image_path, "cat /etc/zeroboot-protocol", true)?;
-        let marker = String::from_utf8_lossy(&marker).trim().to_owned();
-        let version = run_debugfs(&image_path, "cat /etc/zeroboot-protocol-version", true)?;
-        let version = String::from_utf8_lossy(&version).trim().to_owned();
-        let capabilities = run_debugfs(&image_path, "cat /etc/zeroboot-capabilities", true)?;
-        let capabilities = String::from_utf8_lossy(&capabilities).trim().to_owned();
-        let guest_port = run_debugfs(&image_path, "cat /etc/zeroboot-guest-port", true)?;
-        let guest_port = String::from_utf8_lossy(&guest_port).trim().to_owned();
+        let [protocol, version, capabilities, guest_port] = read_zbrt_markers(&image_path);
+        let marker = protocol?;
+        let version = version?;
+        let capabilities = capabilities?;
+        let guest_port = guest_port?;
         if marker != "zbrt" || version != "1" {
             return Err(external(
                 "ZeroBoot zbrt protocol/version marker verification failed",
@@ -679,33 +624,13 @@ pub fn build_rootfs(
         // inode and debugfs fails the whole build.
         for applet in ["echo", "true", "false", "netprobe"] {
             let target = format!("/bin/{applet}");
-            // Clear any pre-created applet before writing the mini-tools binary.
-            if run_debugfs(&image_path, &format!("stat {target}"), false).is_ok() {
-                let _ = run_debugfs(&image_path, &format!("unlink {target}"), false);
-                let _ = run_debugfs(&image_path, &format!("rm {target}"), false);
-            }
-            run_debugfs(
-                &image_path,
-                &format!(
-                    "write {} {target}",
-                    debugfs_quote(&mini_tools.to_string_lossy())
-                ),
-                false,
-            )?;
-            run_debugfs(
-                &image_path,
-                &format!("set_inode_field {target} mode 0100755"),
-                false,
-            )?;
+            force_write(&image_path, &mini_tools, &target)?;
         }
         // `nproc` is that same multi-call binary under another name, so link
         // it instead of paying another copy: capacity runs use it to report
         // the CPU count the guest actually brought up.
         let nproc = "/bin/nproc";
-        if run_debugfs(&image_path, &format!("stat {nproc}"), false).is_ok() {
-            let _ = run_debugfs(&image_path, &format!("unlink {nproc}"), false);
-            let _ = run_debugfs(&image_path, &format!("rm {nproc}"), false);
-        }
+        clear_inode(&image_path, nproc);
         run_debugfs(&image_path, &format!("ln /bin/echo {nproc}"), false)?;
     }
     // Interpreter multi-call hardlinks: /bin/python3 and /bin/lua point
@@ -841,6 +766,67 @@ fn install_hardlink(image_path: &Path, source: &str, link: &str) -> Result<(), C
         )));
     }
     Ok(())
+}
+
+/// Remove a pre-created inode from the image if present: debugfs `write`
+/// fails closed on an existing inode, so rewrite targets are cleared first.
+fn clear_inode(image_path: &Path, target: &str) {
+    if run_debugfs(image_path, &format!("stat {target}"), false).is_ok() {
+        let _ = run_debugfs(image_path, &format!("unlink {target}"), false);
+        let _ = run_debugfs(image_path, &format!("rm {target}"), false);
+    }
+}
+
+/// Write a host file into the image at `target`, clearing any pre-created
+/// inode first and forcing the regular-file 0755 mode.
+fn force_write(image_path: &Path, source: &Path, target: &str) -> Result<(), CliError> {
+    clear_inode(image_path, target);
+    run_debugfs(
+        image_path,
+        &format!(
+            "write {} {target}",
+            debugfs_quote(&source.to_string_lossy())
+        ),
+        false,
+    )?;
+    run_debugfs(
+        image_path,
+        &format!("set_inode_field {target} mode 0100755"),
+        false,
+    )?;
+    Ok(())
+}
+
+/// Write marker `content` to `guest_path` via a temp file + debugfs `write`
+/// (debugfs cannot inline stdin).
+fn write_marker(image_path: &Path, guest_path: &str, content: &str) -> Result<(), CliError> {
+    let marker = NamedTempFile::new().map_err(|error| io(error.to_string()))?;
+    fs::write(marker.path(), content).map_err(|error| io(error.to_string()))?;
+    run_debugfs(
+        image_path,
+        &format!(
+            "write {} {guest_path}",
+            debugfs_quote(&marker.path().to_string_lossy())
+        ),
+        false,
+    )?;
+    Ok(())
+}
+
+/// Read the four ZeroBoot contract markers from an ext4 image via debugfs,
+/// trimmed. Each read fails separately so every caller keeps its own missing
+/// marker wording.
+pub(crate) fn read_zbrt_markers(image_path: &Path) -> [Result<String, CliError>; 4] {
+    let cat = |path: &str| {
+        run_debugfs(image_path, &format!("cat {path}"), true)
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+    };
+    [
+        cat("/etc/zeroboot-protocol"),
+        cat("/etc/zeroboot-protocol-version"),
+        cat("/etc/zeroboot-capabilities"),
+        cat("/etc/zeroboot-guest-port"),
+    ]
 }
 
 /// Recursively collect regular files under `dir` as (relative path, source).

@@ -3,16 +3,10 @@
 // ZBRT V1 wire contract tests, moved out of `src/zeroboot_protocol.rs` to keep
 // the crate free of `#[cfg(test)]` modules (rfb/scripts/check-tests-folder.sh).
 
-use rfb_runtime::zeroboot_protocol::*;
+mod common;
 
-fn frame(kind: Kind, request_id: [u8; 16], payload: Vec<u8>) -> Frame {
-    Frame {
-        kind,
-        flags: 0,
-        request_id,
-        payload,
-    }
-}
+use common::frame;
+use rfb_runtime::zeroboot_protocol::*;
 
 #[test]
 fn frame_round_trips_header_and_payload() {

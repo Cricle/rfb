@@ -10,18 +10,12 @@
 //! - `RFB_ZBRT_SNAPSHOT_DIR` / `RFB_ZBRT_SNAPSHOT_SHARDS` — hot path config
 //! - `RFB_ZBRT_VM_MEM_MIB` — per-VM memory (default 512 is too big for 100)
 
-use rfb::zeroboot::ZeroBootProvider;
+mod common;
+
+use common::realvm::{provider, ProviderOpts};
 use rfb::{Capability, ExecSpec, SandboxProvider, SandboxSpec};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-
-fn resx(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("resx")
-        .join(relative)
-}
 
 fn concurrency() -> usize {
     std::env::var("RFB_E2E_CONCURRENCY")
@@ -31,31 +25,10 @@ fn concurrency() -> usize {
         .unwrap_or(25)
 }
 
-fn provider() -> ZeroBootProvider {
-    // Hot restore needs a virtio-net-capable kernel (arcbox panics on
-    // snapshot-restored vsock): RFB_E2E_KERNEL overrides, else the
-    // 5.10.225 kernel the e2e workflow downloads into resx.
-    let kernel = std::env::var_os("RFB_E2E_KERNEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resx("kernel/vmlinux-5.10.225"));
-    let rootfs = std::env::var_os("RFB_E2E_ZBRT_ROOTFS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resx("rootfs/zeroboot-zbrt-e2e.ext4"));
-    let firecracker = std::env::var_os("RFB_E2E_FIRECRACKER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("firecracker"));
-    ZeroBootProvider::new(rfb::zeroboot::Config {
-        kernel: Some(kernel),
-        rootfs: Some(rootfs),
-        firecracker: Some(firecracker),
-        ..Default::default()
-    })
-}
-
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots real Firecracker VMs; run via tests/run-real.sh (RFB_REAL_E2E=1)"]
 async fn concurrent_hot_creates_scale_to_the_requested_count() {
-    let provider = Arc::new(provider());
+    let provider = Arc::new(provider(ProviderOpts::hot()));
     let spec = || SandboxSpec {
         capabilities: vec![Capability::Execute],
         ..SandboxSpec::default()

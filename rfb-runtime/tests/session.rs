@@ -182,6 +182,7 @@ fn file_request_types_round_trip() {
         request_id: "write-1".into(),
         path: "out/build.bin".into(),
         content: vec![0u8, 1, 2, 255],
+        append: false,
     };
     assert_eq!(round_trips(&write), write);
 }
@@ -222,6 +223,7 @@ fn control_messages_round_trip_through_postcard() {
             request_id: "w".into(),
             path: "c.txt".into(),
             content: b"data".to_vec(),
+            append: false,
         }),
         ControlMessage::Shutdown,
     ];

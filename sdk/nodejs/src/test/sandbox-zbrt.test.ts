@@ -235,4 +235,78 @@ describe('Sandbox over ZBRT (fake guest)', () => {
     await sandboxOn(port).exec(['cat'], { stdin: Buffer.from('abc') });
     assert.deepEqual(rec.executes[0]?.stdin, Buffer.from('abc'));
   });
+
+  it('ls over ZBRT sends op 1 and decodes entries', { timeout: 10_000 }, async () => {
+    const { port, rec } = await startGuest((frame, socket) => {
+      if (frame.kind === KIND_FS) {
+        socket.write(
+          frameBytes(
+            KIND_FS_RESULT,
+            frame.requestId,
+            Buffer.from(
+              JSON.stringify({
+                entries: [
+                  { name: 'a.txt', is_dir: false, size: 2 },
+                  { name: 'sub', is_dir: true, size: null },
+                ],
+              }),
+            ),
+          ),
+        );
+      }
+    });
+    const entries = await sandboxOn(port).ls('docs');
+    assert.deepEqual(entries, [
+      { name: 'a.txt', isDir: false, size: 2 },
+      { name: 'sub', isDir: true, size: null },
+    ]);
+    assert.equal(rec.fs[0]?.op, 1);
+    assert.equal(rec.fs[0]?.path, 'docs');
+    assert.equal(rec.fs[0]?.args.max_results, 1000);
+  });
+
+  it('find over ZBRT sends op 2 and decodes string matches', { timeout: 10_000 }, async () => {
+    const { port, rec } = await startGuest((frame, socket) => {
+      if (frame.kind === KIND_FS) {
+        socket.write(
+          frameBytes(
+            KIND_FS_RESULT,
+            frame.requestId,
+            Buffer.from(JSON.stringify({ matches: ['a.txt', 'sub/b.txt'] })),
+          ),
+        );
+      }
+    });
+    const matches = await sandboxOn(port).find('.', '*.txt');
+    assert.deepEqual(matches, ['a.txt', 'sub/b.txt']);
+    assert.equal(rec.fs[0]?.op, 2);
+    assert.equal(rec.fs[0]?.path, '.');
+    assert.equal(rec.fs[0]?.args.pattern, '*.txt');
+    assert.equal(rec.fs[0]?.args.max_results, 1000);
+  });
+
+  it('grep over ZBRT sends op 3 and decodes match objects', { timeout: 10_000 }, async () => {
+    const { port, rec } = await startGuest((frame, socket) => {
+      if (frame.kind === KIND_FS) {
+        socket.write(
+          frameBytes(
+            KIND_FS_RESULT,
+            frame.requestId,
+            Buffer.from(
+              JSON.stringify({
+                matches: [{ path: 'a.txt', line: 3, column: 1, text: 'needle' }],
+              }),
+            ),
+          ),
+        );
+      }
+    });
+    const matches = await sandboxOn(port).grep('.', 'needle');
+    assert.deepEqual(matches, [{ path: 'a.txt', line: 3, column: 1, text: 'needle' }]);
+    assert.equal(rec.fs[0]?.op, 3);
+    assert.equal(rec.fs[0]?.path, '.');
+    assert.equal(rec.fs[0]?.args.pattern, 'needle');
+    assert.equal(rec.fs[0]?.args.max_results, 1000);
+    assert.equal(rec.fs[0]?.args.max_bytes, 50 * 1024);
+  });
 });

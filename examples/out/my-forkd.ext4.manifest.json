@@ -1,0 +1,15 @@
+{
+  "digest": "sha256:bacb3a161f301e5acf027c8353be4d1728025bf2aec056394a47e7c079a36b74",
+  "entrypoint": "/forkd-init.sh",
+  "image": "my-forkd.ext4",
+  "interpreters": [],
+  "linkage": "static",
+  "logical_bytes": 11534336,
+  "protocol": "forkd",
+  "runtime": "/sbin/forkd-agent",
+  "site_dirs": {
+    "lua": null,
+    "python": null
+  },
+  "size_mb": 11
+}

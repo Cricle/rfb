@@ -3,6 +3,8 @@
 //! ZeroBoot V1 full-sandbox contract coverage using the fake/serial runtime.
 //! These tests intentionally exercise RFB1 only; no V2 wire is involved.
 
+mod common;
+
 use rfb_runtime::resources::RuntimeLimits;
 use rfb_runtime::runtime_service::RuntimeService;
 use rfb_runtime::session::{
@@ -11,40 +13,12 @@ use rfb_runtime::session::{
 };
 use rfb_runtime::workspace_executor::WorkspaceGuestExecutor;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn workspace() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rfb-zb-v1-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
+    common::unique_temp_dir("rfb-zb-v1")
 }
 fn hello(s: &mut RuntimeService) {
-    assert!(matches!(
-        s.handle(ControlMessage::Hello {
-            protocol_version: 1
-        })
-        .as_slice(),
-        [RuntimeMessage::HelloAck {
-            protocol_version: 1
-        }]
-    ));
-    assert!(matches!(
-        s.handle(ControlMessage::Capabilities {
-            session_per_vm: true,
-            writable_workspace: true
-        })
-        .as_slice(),
-        [RuntimeMessage::Capabilities {
-            session_per_vm: true,
-            writable_workspace: true
-        }]
-    ));
+    common::ready_strict(s);
 }
 fn exec(args: &[&str], cwd: &str) -> String {
     serde_json::json!({"op":"exec", "args":args, "cwd":cwd}).to_string()
@@ -146,7 +120,8 @@ fn v1_files_and_path_limits_are_confined() {
         s.handle(ControlMessage::WriteWorkspaceFile(FileWriteRequest {
             request_id: "w".into(),
             path: "../escape".into(),
-            content: b"x".to_vec()
+            content: b"x".to_vec(),
+            append: false,
         }))
         .as_slice(),
         [RuntimeMessage::Error { .. }]
@@ -158,7 +133,8 @@ fn v1_files_and_path_limits_are_confined() {
         s.handle(ControlMessage::WriteWorkspaceFile(FileWriteRequest {
             request_id: "w2".into(),
             path: "ok".into(),
-            content: vec![b'x'; 50 * 1024 + 1]
+            content: vec![b'x'; 50 * 1024 + 1],
+            append: false,
         }))
         .as_slice(),
         [RuntimeMessage::Error { .. }]

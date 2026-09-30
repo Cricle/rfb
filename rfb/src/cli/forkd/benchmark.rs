@@ -1,10 +1,12 @@
 //! Real forkd microbenchmark with sanitized p50/p95/p99 quantiles. Guest
 //! payloads are never logged.
 
-use crate::cli::error::{external, validation, CliError};
+use crate::cli::error::{validation, CliError};
 use crate::cli::forkd::preflight::snapshot_ready;
-use crate::cli::forkd::sandbox::{destroy_sandbox, wait_for_guest_ready, GUEST_READY_DEADLINE};
-use crate::cli::report::{quantile_ns, Outcome};
+use crate::cli::forkd::sandbox::{
+    destroy_sandbox, stream_to_exit, wait_for_guest_ready, GUEST_READY_DEADLINE,
+};
+use crate::cli::report::{record, record_sample, Outcome};
 use crate::controller::{CreateSandboxRequest, ForkdClient};
 use crate::forkd_guest::ForkdGuestClient;
 use serde_json::{json, Value};
@@ -59,22 +61,17 @@ pub async fn benchmark(
         };
         let sid = sandbox.id.clone();
         let address = sandbox.guest_addr.clone();
-        samples
-            .entry("create".into())
-            .or_default()
-            .push(started.elapsed().as_nanos() as u64);
+        record_sample(&mut samples, "create", started);
 
         // controller ping
         let t = Instant::now();
-        if client.ping(&sid).await.is_ok() {
-            samples
-                .entry("controller_ping".into())
-                .or_default()
-                .push(t.elapsed().as_nanos() as u64);
-            outcome.success += 1;
-        } else {
-            outcome.failure += 1;
-        }
+        record(
+            &mut samples,
+            &mut outcome,
+            "controller_ping",
+            t,
+            client.ping(&sid).await.is_ok(),
+        );
 
         // Wait for the guest listener before measuring RPC latency; the wait
         // is itself part of the start path users feel, so record it.
@@ -87,89 +84,39 @@ pub async fn benchmark(
             let _ = destroy_sandbox(url, &sid).await;
             continue;
         }
-        samples
-            .entry("ready".into())
-            .or_default()
-            .push(ready_started.elapsed().as_nanos() as u64);
+        record_sample(&mut samples, "ready", ready_started);
         // guest ping (health)
         let t = Instant::now();
         let ping = ForkdGuestClient::new(address.clone()).ping().await;
-        if let Ok(value) = ping {
-            if value.get("pong").is_some() {
-                samples
-                    .entry("health".into())
-                    .or_default()
-                    .push(t.elapsed().as_nanos() as u64);
-                outcome.success += 1;
-            } else {
-                outcome.failure += 1;
-            }
-        } else {
-            outcome.failure += 1;
-        }
+        record(
+            &mut samples,
+            &mut outcome,
+            "health",
+            t,
+            ping.is_ok_and(|value| value.get("pong").is_some()),
+        );
 
         // stream + exec (short-lived, terminal frames)
         let t = Instant::now();
-        let stream_ok = async {
-            let mut stream = ForkdGuestClient::new(address.clone())
-                .stream(vec!["/bin/true".into()], None, Some(false), None, None)
-                .await
-                .map_err(|e| external(e.to_string()))?;
-            loop {
-                match stream
-                    .next_event()
-                    .await
-                    .map_err(|e| external(e.to_string()))?
-                {
-                    Some(value) => {
-                        if value.get("exit_code").is_some() {
-                            break;
-                        }
-                    }
-                    None => return Err(validation("stream closed")),
-                }
-            }
-            Ok::<_, CliError>(())
-        }
-        .await;
-        if stream_ok.is_ok() {
-            samples
-                .entry("stream".into())
-                .or_default()
-                .push(t.elapsed().as_nanos() as u64);
-            outcome.success += 1;
-        } else {
-            outcome.failure += 1;
-        }
+        let stream_ok = stream_to_exit(&address, vec!["/bin/true".into()], false).await;
+        record(&mut samples, &mut outcome, "stream", t, stream_ok.is_ok());
 
         let t = Instant::now();
         let exec = ForkdGuestClient::new(address.clone())
             .exec_in("/workspace", vec!["/bin/true".into()], timeout.as_secs())
             .await;
-        if let Ok(value) = exec {
-            if value.get("exit_code").and_then(Value::as_i64) == Some(0) {
-                samples
-                    .entry("exec".into())
-                    .or_default()
-                    .push(t.elapsed().as_nanos() as u64);
-                outcome.success += 1;
-            } else {
-                outcome.failure += 1;
-            }
-        } else {
-            outcome.failure += 1;
-        }
+        record(
+            &mut samples,
+            &mut outcome,
+            "exec",
+            t,
+            exec.is_ok_and(|value| value.get("exit_code").and_then(Value::as_i64) == Some(0)),
+        );
 
         // cleanup with reconciliation
         let t = Instant::now();
         match destroy_sandbox(url, &sid).await {
-            Ok(()) => {
-                samples
-                    .entry("cleanup".into())
-                    .or_default()
-                    .push(t.elapsed().as_nanos() as u64);
-                outcome.success += 1;
-            }
+            Ok(()) => record(&mut samples, &mut outcome, "cleanup", t, true),
             Err(_) => {
                 failures += 1;
                 outcome.failure += 1;
@@ -177,21 +124,7 @@ pub async fn benchmark(
         }
     }
 
-    let mut stats = serde_json::Map::new();
-    for (name, values) in &samples {
-        let mut sorted = values.clone();
-        sorted.sort_unstable();
-        stats.insert(
-            name.clone(),
-            json!({
-                "samples": values.len(),
-                "success_rate_pct": 100.0 * values.len() as f64 / n as f64,
-                "p50_ns": quantile_ns(&sorted, 0.50),
-                "p95_ns": quantile_ns(&sorted, 0.95),
-                "p99_ns": quantile_ns(&sorted, 0.99),
-            }),
-        );
-    }
+    let stats = crate::cli::report::samples_stats_json(&samples, Some(n));
     Ok(json!({
         "result": if failures == 0 && outcome.success == n * 5 { "PASS" } else { "FAIL" },
         "snapshot_tag": tag,

@@ -1,45 +1,28 @@
 #![cfg(feature = "forkd")]
 
+mod common;
+
+use common::http::mock_once::mock_http_base;
+use common::ndjson::mock_once::mock_ndjson_once;
 use rfb::forkd::{ForkdClient, ForkdConfig, ForkdGuestProfile};
 use rfb::{
     BackendKind, Capability, ExecSpec, ProviderError, SandboxProvider, SandboxSpec, TransportKind,
 };
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-async fn http_mock(body: &'static str, status: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = [0u8; 4096];
-        let _ = socket.read(&mut request).await;
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-    });
-    format!("http://{addr}")
+/// `common::http::mock_once::mock_http_base` pinned to this file's
+/// `&'static str` body style (the old `Box::leak` dance is gone — the body
+/// is owned now).
+async fn http_mock(body: &str, status: &str) -> String {
+    mock_http_base(status, body.to_owned()).await
 }
 
+/// `common::ndjson::mock_once::mock_ndjson_once` with the byte-wise
+/// read-until-newline this file's `guest_mock` used (same wire behavior).
 async fn guest_mock(response: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut byte = [0; 1];
-        while socket.read_exact(&mut byte).await.is_ok() {
-            request.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        socket.write_all(response.as_bytes()).await.unwrap();
-    });
-    addr.to_string()
+    let (addr, _task) = mock_ndjson_once(response.to_owned()).await;
+    addr
 }
 
 #[test]
@@ -63,10 +46,7 @@ fn profile_capabilities_are_stable() {
 async fn provider_connects_and_creates_sandbox_with_guest_lifecycle() {
     let guest = guest_mock(concat!(r#"{"pong":true}"#, "\n")).await;
     let base = http_mock(
-        Box::leak(
-            format!(r#"[{{"id":"sb-1","snapshot_tag":"snap","guest_addr":"{guest}"}}]"#)
-                .into_boxed_str(),
-        ),
+        &format!(r#"[{{"id":"sb-1","snapshot_tag":"snap","guest_addr":"{guest}"}}]"#),
         "200 OK",
     )
     .await;
@@ -133,10 +113,7 @@ async fn provider_rejects_invalid_capability_and_missing_snapshot() {
 async fn sandbox_exec_validates_and_maps_guest_errors() {
     let guest = guest_mock(concat!(r#"{"exit_code":0,"out":"ok","err":""}"#, "\n")).await;
     let base = http_mock(
-        Box::leak(
-            format!(r#"[{{"id":"sb-2","snapshot_tag":"snap","guest_addr":"{guest}"}}]"#)
-                .into_boxed_str(),
-        ),
+        &format!(r#"[{{"id":"sb-2","snapshot_tag":"snap","guest_addr":"{guest}"}}]"#),
         "200 OK",
     )
     .await;

@@ -96,9 +96,12 @@ public final class GuestStream implements AutoCloseable {
         if (isStarted(value)) {
             return StreamEvent.started();
         }
-        JsonNode code = value.get("exit_code");
-        if (code != null && code.isNumber()) {
-            return StreamEvent.exit(code.intValue());
+        // A terminal exit line is any line CARRYING an `exit_code` key — the
+        // guest emits `{"exit_code":null}` when the child died by signal, and
+        // that is a terminal Exit(null), not a protocol error.
+        if (value.has("exit_code")) {
+            JsonNode code = value.get("exit_code");
+            return StreamEvent.exit(code != null && code.isIntegralNumber() ? code.intValue() : null);
         }
         if (value.path("done").asBoolean(false)) {
             return StreamEvent.exit(null);

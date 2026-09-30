@@ -51,12 +51,15 @@ pub(super) fn exec_result(value: &Value) -> Result<GuestExecResult, RfbError> {
 /// forkd/provider.rs so both surfaces agree on a guest that sends both.
 pub(super) fn eval_result(value: &Value) -> Result<GuestExecResult, RfbError> {
     Ok(GuestExecResult {
+        // Fail closed like exec: a missing or non-integer status must not be
+        // bleached into 0 ("success"); it maps to -1 (also UNIFIED_API §2.4:
+        // non-integer exit codes are -1).
         exit_code: value
             .get("status")
             .or_else(|| value.get("exit_code"))
             .and_then(Value::as_i64)
-            .map(|code| i32::try_from(code).unwrap_or(0))
-            .unwrap_or(0),
+            .map(|code| i32::try_from(code).unwrap_or(-1))
+            .unwrap_or(-1),
         stdout: value_bytes(value.get("output").or_else(|| value.get("out")))?,
         stderr: Vec::new(),
         timed_out: value

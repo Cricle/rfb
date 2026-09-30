@@ -368,6 +368,15 @@ pub fn verify_installed_file(
     Ok(())
 }
 
+/// Whether a debugfs `stat` dump describes an executable regular file —
+/// the entrypoint contract shared by image build verification and zeroboot
+/// rootfs validation.
+pub(crate) fn stat_is_executable_regular(stat_text: &str) -> bool {
+    stat_text.contains("Type:")
+        && stat_text.contains("regular")
+        && (stat_text.contains("0755") || stat_text.contains("-rwxr-xr-x"))
+}
+
 /// Run a debugfs request against an image, optionally capturing stdout.
 ///
 /// # Errors

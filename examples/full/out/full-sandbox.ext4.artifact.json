@@ -1,0 +1,18 @@
+{
+  "schema": "rfb-artifact/v1",
+  "backend": "zeroboot",
+  "profile": "zeroboot-zbrt",
+  "arch": "x86_64",
+  "transport": "virtio-vsock",
+  "protocol": "zbrt",
+  "entrypoint": "/init",
+  "guest_port": 5000,
+  "rootfs": {
+    "path": "examples/full/out/full-sandbox.ext4",
+    "sha256": "6e5fd65bce763df91f26717f65814c9e6b99b275b0be53e0c0119f342b41ab48"
+  },
+  "vm": {
+    "cpus": 1,
+    "memory_bytes": 0
+  }
+}

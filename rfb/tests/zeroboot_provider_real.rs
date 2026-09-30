@@ -11,40 +11,24 @@
 // whole lifecycle — create, operations, drop — inside ONE `futures_block_on`.
 // Embedders must do the same: never move a live sandbox across runtimes.
 
+mod common;
+
+use common::realvm::{self, ProviderOpts};
+use common::{block_on as futures_block_on, require_real, resx};
 use futures_lite::future;
 use rfb::core::{Capability, ExecSpec, Sandbox, SandboxProvider, SandboxSpec, TransportKind};
 use rfb::guest::{
     CancelRequest, FindRequest, GrepRequest, LsRequest, ReadRequest, StreamEvent, StreamSpec,
     WriteRequest,
 };
-use rfb::zeroboot::{Config, ZeroBootProvider};
+use rfb::zeroboot::ZeroBootProvider;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn resx(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("resx")
-        .join(relative)
-}
-
-fn require_real() {
-    if std::env::var("RFB_REAL_E2E").as_deref() != Ok("1") {
-        panic!("skip: RFB_REAL_E2E=1 required (real-VM test; use tests/run-real.sh)");
-    }
-}
-
 fn provider() -> ZeroBootProvider {
-    let rootfs = std::env::var_os("RFB_E2E_ZBRT_ROOTFS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| resx("rootfs/zeroboot-zbrt-e2e.ext4"));
-    ZeroBootProvider::new(Config {
-        kernel: Some(resx("kernel/vmlinux-arcbox-0.0.24")),
-        rootfs: Some(rootfs),
-        firecracker: Some(PathBuf::from("/usr/local/bin/firecracker")),
-        guest_port: 5000,
-        timeout: Duration::from_secs(30),
-    })
+    // The suite's pinned stack (arcbox kernel, installed firecracker, port
+    // 5000, 30 s) is `ProviderOpts`' default; see `common::realvm`.
+    realvm::provider(ProviderOpts::default())
 }
 
 fn spec_with_all() -> SandboxSpec {
@@ -89,14 +73,6 @@ fn fnv1a_file(path: &Path) -> u64 {
         }
     }
     hash
-}
-
-fn futures_block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
 }
 
 #[test]
@@ -189,11 +165,13 @@ fn filesystem_roundtrip_and_escape_rejection() {
             .expect("ls");
         assert!(ls.entries.iter().any(|e| e.name.contains("e2e-probe.txt")));
 
-        // find matches it.
+        // find matches it. Pattern semantics are glob name matching
+        // (PROTOCOL.md §2.5a): a literal pattern is a full-name exact match,
+        // so the wildcard form is what matches e2e-probe.txt.
         let find = sandbox
             .find(FindRequest {
                 path: "/workspace".into(),
-                pattern: "e2e-probe".into(),
+                pattern: "e2e-probe*".into(),
                 max_results: 100,
             })
             .await

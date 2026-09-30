@@ -159,4 +159,14 @@ internal static class GuestValidation
             }
         }
     }
+
+    /// <summary>Guest transport name (PROTOCOL.md §1.2): "ndjson" (default) or "zbrt".</summary>
+    public static void Transport(string? transport)
+    {
+        if (transport is null || transport == "ndjson" || transport == "zbrt")
+        {
+            return;
+        }
+        throw new ValidationException("transport must be \"ndjson\" or \"zbrt\"");
+    }
 }

@@ -17,9 +17,21 @@ use tokio::net::TcpStream;
 
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Absolute ceiling on the JSON-encoded form of one guest tool response. The
+/// contract limit (`MAX_GUEST_RESULT_BYTES`, 50 KiB) is enforced on raw
+/// payload bytes; this 1 MiB encoded ceiling is the backstop against a
+/// genuinely malformed or hostile response, not the contract limit.
+const MAX_GUEST_RESULT_ENCODED_BYTES: usize = 1024 * 1024;
+
 /// Extra client read budget beyond an exec's guest-side deadline, so the
 /// guest's own timeout error (not the client's) is what surfaces.
 pub(crate) const EXEC_READ_MARGIN: Duration = Duration::from_secs(5);
+
+/// Environment variable carrying the forkd agent token. When set to a
+/// non-empty value, every new TCP connection must start with one auth frame
+/// before any business frame (same contract as the Python SDK's
+/// `AGENT_TOKEN_ENV` and the agent side in rfb-runtime `agent/mod.rs`).
+pub const AGENT_TOKEN_ENV: &str = "FORKD_AGENT_TOKEN";
 
 #[derive(Debug, thiserror::Error)]
 /// Errors returned by the forkd guest client.
@@ -103,8 +115,12 @@ impl ForkdGuestClient {
             .await
             .map_err(|_| timed_out("guest connect timeout"))??;
         let (read, mut write) = stream.into_split();
-        write_json(&mut write, &action, self.timeout).await?;
         let mut reader = BufReader::new(read);
+        // The auth frame must be the first frame on a fresh connection, before
+        // the business frame, or a token-gated agent answers
+        // {"error":"authentication required"} and closes the connection.
+        authenticate(&mut reader, &mut write, self.timeout).await?;
+        write_json(&mut write, &action, self.timeout).await?;
         let mut responses = Vec::new();
         let mut collected_bytes = 0usize;
         loop {
@@ -163,6 +179,12 @@ impl ForkdGuestClient {
             .await
             .map_err(|_| timed_out("guest connect timeout"))??;
         let (read, mut writer) = tcp.into_split();
+        // Same per-connection handshake as the request path; the reader is
+        // created before the handshake so bytes read ahead of the auth
+        // exchange cannot be lost, and the buffered reader is moved into the
+        // stream below.
+        let mut reader = BufReader::new(read);
+        authenticate(&mut reader, &mut writer, self.timeout).await?;
         let mut action = serde_json::json!({"action": "stream", "args": args});
         if let Some(cwd) = cwd {
             action["cwd"] = Value::String(cwd.to_owned());
@@ -178,7 +200,7 @@ impl ForkdGuestClient {
         // (mirrors the exec read budget): without it a long silent command
         // dies client-side before the guest's deadline fires.
         Ok(ForkdGuestStream {
-            reader: BufReader::new(read),
+            reader,
             writer,
             timeout: event_deadline.unwrap_or(self.timeout),
             stopped: false,
@@ -251,7 +273,15 @@ impl ForkdGuestClient {
             .pop()
             .ok_or_else(|| ForkdGuestError::Remote("empty tool response".into()))?;
         let encoded = serde_json::to_vec(&value)?;
-        if encoded.len() > MAX_GUEST_RESULT_BYTES {
+        // P1-6: the wire budget is on the *raw* payload bytes, not the JSON
+        // encoding — a `data: Vec<u8>` byte array inflates 3-4x when encoded
+        // as numbers, so a guest's legal 50 KiB (truncated) read used to be
+        // rejected here while ZBRT accepted the same payload. The encoded
+        // length is still checked against a larger absolute ceiling as
+        // protection against genuinely malformed/huge responses.
+        if raw_response_bytes(&value) > MAX_GUEST_RESULT_BYTES
+            || encoded.len() > MAX_GUEST_RESULT_ENCODED_BYTES
+        {
             return Err(ForkdGuestError::TooLarge);
         }
         if let Some(results) = value.get("results").and_then(Value::as_array) {
@@ -402,13 +432,17 @@ impl ForkdGuestStream {
         if self.terminal || self.stopped {
             return Ok(());
         }
-        self.stopped = true;
+        // Latch `stopped` only after the write succeeds (mirrors
+        // ZbrtStream::stop): a failed write must leave the stream retryable,
+        // not report a stop that never went out.
         write_json(
             &mut self.writer,
             &serde_json::json!({"action": "stop"}),
             self.timeout,
         )
-        .await
+        .await?;
+        self.stopped = true;
+        Ok(())
     }
 }
 
@@ -463,4 +497,104 @@ fn check_remote_error(value: &Value) -> Result<(), ForkdGuestError> {
         return Err(ForkdGuestError::Remote(error.to_owned()));
     }
     Ok(())
+}
+
+/// The configured agent token, or `None` when auth is disabled. Blank values
+/// are ignored, exactly like the agent side (`agent_token_from_env`) and the
+/// Python SDK; the value is re-read per connection so a rotated token applies
+/// to the next connection without dropping the client.
+fn agent_token() -> Option<String> {
+    std::env::var(AGENT_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Run the agent-token handshake on a freshly connected stream: with a token
+/// configured, `{"action":"auth","token":...}` is the first frame on the wire
+/// and the agent must answer `{"action":"auth","ok":true}`. Anything else (a
+/// rejection frame, a plain `{"error":...}`, a silent close) is a
+/// [`ForkdGuestError::Remote`] so callers see the same classification as any
+/// guest-reported failure. With no token configured the wire behavior is
+/// unchanged; blank keepalive lines before the reply are skipped by
+/// [`read_json_line`].
+async fn authenticate<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    timeout: Duration,
+) -> Result<(), ForkdGuestError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(token) = agent_token() else {
+        return Ok(());
+    };
+    write_json(
+        writer,
+        &serde_json::json!({"action": "auth", "token": token}),
+        timeout,
+    )
+    .await?;
+    let value = read_json_line(reader, timeout)
+        .await?
+        .ok_or_else(|| ForkdGuestError::Remote("guest closed before auth response".into()))?;
+    if value.get("action").and_then(Value::as_str) == Some("auth")
+        && value.get("ok").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(());
+    }
+    let detail = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|error| format!(": {error}"))
+        .unwrap_or_default();
+    Err(ForkdGuestError::Remote(format!(
+        "guest agent auth failed{detail}"
+    )))
+}
+
+/// Estimate the raw payload size of a guest tool response (P1-6): a `data`
+/// byte array counts one byte per element, string fields count their UTF-8
+/// bytes, and each array item carries a small JSON-syntax allowance. This is
+/// the same question ZBRT's 50 KiB guest-side cap answers for the identical
+/// contract, so both transports accept/reject the same payloads.
+fn raw_response_bytes(value: &Value) -> usize {
+    /// JSON syntax + non-string field allowance per array item
+    /// (`{"line":N,"is_dir":true,...}` shells around the counted strings).
+    const PER_ITEM_ALLOWANCE: usize = 32;
+    let mut total = 0usize;
+    if let Some(object) = value.as_object() {
+        for (key, field) in object {
+            match field {
+                // read: `data` is the raw payload; `total_bytes`/`truncated`
+                // are negligible scalars.
+                Value::Array(items) if key == "data" => {
+                    total = total.saturating_add(items.len());
+                }
+                // ls `entries` ({name,is_dir,size}), find `matches`
+                // (strings), grep `matches` ({path,line,text}): count the
+                // string contents plus a fixed per-item allowance.
+                Value::Array(items) => {
+                    for item in items {
+                        total = total.saturating_add(PER_ITEM_ALLOWANCE);
+                        match item {
+                            Value::String(text) => total = total.saturating_add(text.len()),
+                            Value::Object(fields) => {
+                                for field in fields.values() {
+                                    if let Value::String(text) = field {
+                                        total = total.saturating_add(text.len());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Stdout/stderr-style string fields (e.g. eval `output`).
+                Value::String(text) => total = total.saturating_add(text.len()),
+                _ => {}
+            }
+        }
+    }
+    total
 }

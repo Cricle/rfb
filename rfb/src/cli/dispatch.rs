@@ -115,8 +115,8 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
             let options = image_build::RootfsOptions {
                 with_python: args.with_python,
                 with_lua: args.with_lua,
-                py_site_dir: args.py_site_dir.clone(),
-                lua_lib_dir: args.lua_lib_dir.clone(),
+                py_site_dir: args.bake_dirs.py_site_dir.clone(),
+                lua_lib_dir: args.bake_dirs.lua_lib_dir.clone(),
                 extra_files: Vec::new(),
             };
             let value = image_build::build_rootfs(
@@ -160,19 +160,81 @@ fn image(json_out: bool, command: ImageCommand) -> Result<(), CliError> {
     }
 }
 
+/// Validate the url+tag pair shared by every forkd-targeted command.
+fn forkd_target<'a>(url: &'a str, tag: &'a str) -> Result<(String, &'a str), CliError> {
+    Ok((require_localhost(url)?, require_snapshot_tag(tag)?))
+}
+
+/// Load an artifact manifest and require it to target the forkd backend
+/// (shared by the preflight and acceptance provenance gates).
+fn load_forkd_artifact(path: &std::path::Path) -> Result<image_build::ArtifactManifest, CliError> {
+    let artifact = image_build::ArtifactManifest::load(path)?;
+    if artifact.backend != "forkd" {
+        return Err(validation("artifact manifest backend must be forkd"));
+    }
+    Ok(artifact)
+}
+
+/// Shared core of `forkd preflight` and `run preflight`.
+fn run_preflight(json_out: bool, url: &str, tag: &str, require_vm: bool) -> Result<(), CliError> {
+    let (url, tag) = forkd_target(url, tag)?;
+    let value = block_on(forkd::preflight(&url, tag, require_vm))?;
+    let text = if json_out {
+        String::new()
+    } else {
+        forkd::preflight_text(&value)
+    };
+    render_output(json_out, value, text);
+    Ok(())
+}
+
+/// Shared core of `forkd acceptance` and `run forkd` (after each entry's own
+/// provenance gate).
+fn run_acceptance(json_out: bool, url: &str, tag: &str, require_vm: bool) -> Result<(), CliError> {
+    let (url, tag) = forkd_target(url, tag)?;
+    let value = block_on(forkd::acceptance(&url, tag, require_vm))?;
+    render_output(json_out, value, "acceptance".to_owned());
+    Ok(())
+}
+
+/// Shared core of `forkd benchmark`, `bench forkd`, and `run benchmark`.
+/// The n==0 gate lives here (not per entry) so no entry can spin an empty
+/// benchmark into a PASS.
+fn run_benchmark(json_out: bool, url: &str, tag: &str, n: usize) -> Result<(), CliError> {
+    let (url, tag) = forkd_target(url, tag)?;
+    if n == 0 {
+        return Err(validation("--n must be a positive integer"));
+    }
+    // Sandbox create restores a snapshot and waits out the guest clock
+    // sync (10s alone), so the controller client needs far more than
+    // one HTTP timeout of 10s or every iteration fails at "create".
+    let value = block_on(forkd::benchmark(&url, tag, n, BENCHMARK_TIMEOUT))?;
+    render_output(json_out, value, "benchmark".to_owned());
+    Ok(())
+}
+
+/// Shared core of `forkd workload` and `run workload`.
+fn run_workload(
+    json_out: bool,
+    url: &str,
+    tag: &str,
+    sandboxes: usize,
+    rounds: usize,
+    reuse_execs: usize,
+) -> Result<(), CliError> {
+    let (url, tag) = forkd_target(url, tag)?;
+    let value = block_on(forkd::workload(&url, tag, sandboxes, rounds, reuse_execs))?;
+    render_output(json_out, value, "workload".to_owned());
+    Ok(())
+}
+
 fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
     match command {
         ForkdCommand::Preflight(args) => {
-            let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
-            let artifact = if let Some(path) = args.artifact_manifest.as_deref() {
-                let artifact = image_build::ArtifactManifest::load(path)?;
-                if artifact.backend != "forkd" {
-                    return Err(validation("artifact manifest backend must be forkd"));
-                }
-                Some(artifact)
-            } else {
-                None
+            let artifact = match args.artifact_manifest.as_deref() {
+                Some(path) => Some(load_forkd_artifact(path)?),
+                None => None,
             };
             if let Some(path) = args.snapshot_binding.as_deref() {
                 // Strict snapshot-binding validation: schema, tag, ready/bootable,
@@ -181,18 +243,10 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
                 let artifact = artifact.as_ref();
                 forkd::load_snapshot_binding(path, tag, artifact)?;
             }
-            let value = block_on(forkd::preflight(&url, tag, args.require_vm))?;
-            let text = if json_out {
-                String::new()
-            } else {
-                forkd::preflight_text(&value)
-            };
-            render_output(json_out, value, text);
-            Ok(())
+            run_preflight(json_out, &args.url.url, tag, args.require_vm)
         }
         ForkdCommand::SnapshotBind(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
+            let (url, tag) = forkd_target(&args.url.url, &args.tag)?;
             let binding = block_on(forkd::snapshot_bind(
                 &url,
                 tag,
@@ -204,7 +258,6 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
             Ok(())
         }
         ForkdCommand::Acceptance(args) => {
-            let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
             // Provenance gate: with --require-provenance a verified snapshot
             // binding (paired with its artifact manifest) must validate before
@@ -215,52 +268,29 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
                         "--require-provenance requires --snapshot-binding (run forkd snapshot-bind first)",
                     ));
                 };
-                let artifact = if let Some(path) = args.artifact_manifest.as_deref() {
-                    let artifact = image_build::ArtifactManifest::load(path)?;
-                    if artifact.backend != "forkd" {
-                        return Err(validation("artifact manifest backend must be forkd"));
+                let artifact = match args.artifact_manifest.as_deref() {
+                    Some(path) => Some(load_forkd_artifact(path)?),
+                    None => {
+                        return Err(validation(
+                            "--require-provenance requires --artifact-manifest to validate artifact identity",
+                        ))
                     }
-                    Some(artifact)
-                } else {
-                    return Err(validation(
-                        "--require-provenance requires --artifact-manifest to validate artifact identity",
-                    ));
                 };
                 forkd::load_snapshot_binding(binding_path, tag, artifact.as_ref())?;
             }
-            let value = block_on(forkd::acceptance(&url, tag, args.require_vm))?;
-            render_output(json_out, value, "acceptance".to_owned());
-            Ok(())
+            run_acceptance(json_out, &args.url.url, tag, args.require_vm)
         }
-        ForkdCommand::Benchmark(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            if args.n == 0 {
-                return Err(validation("--n must be a positive integer"));
-            }
-            // Sandbox create restores a snapshot and waits out the guest clock
-            // sync (10s alone), so the controller client needs far more than
-            // one HTTP timeout of 10s or every iteration fails at "create".
-            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
-            render_output(json_out, value, "benchmark".to_owned());
-            Ok(())
-        }
-        ForkdCommand::Workload(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::workload(
-                &url,
-                tag,
-                args.sandboxes,
-                args.rounds,
-                args.reuse_execs,
-            ))?;
-            render_output(json_out, value, "workload".to_owned());
-            Ok(())
-        }
+        ForkdCommand::Benchmark(args) => run_benchmark(json_out, &args.url.url, &args.tag, args.n),
+        ForkdCommand::Workload(args) => run_workload(
+            json_out,
+            &args.url.url,
+            &args.tag,
+            args.sandboxes,
+            args.rounds,
+            args.reuse_execs,
+        ),
         ForkdCommand::SandboxCreate(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
+            let (url, tag) = forkd_target(&args.url.url, &args.tag)?;
             let value = block_on(forkd::create_sandbox(
                 &url,
                 tag,
@@ -272,7 +302,7 @@ fn forkd(json_out: bool, command: ForkdCommand) -> Result<(), CliError> {
             Ok(())
         }
         ForkdCommand::SandboxDestroy(args) => {
-            let url = require_localhost(&args.url)?;
+            let url = require_localhost(&args.url.url)?;
             block_on(forkd::destroy_sandbox(&url, &args.id))?;
             render_output(
                 json_out,
@@ -323,13 +353,7 @@ fn rfb1(json_out: bool, command: Rfb1Command) -> Result<(), CliError> {
 
 fn bench(json_out: bool, command: BenchCommand) -> Result<(), CliError> {
     match command {
-        BenchCommand::Forkd(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
-            render_output(json_out, value, "benchmark".to_owned());
-            Ok(())
-        }
+        BenchCommand::Forkd(args) => run_benchmark(json_out, &args.url.url, &args.tag, args.n),
         BenchCommand::List => {
             render_output(
                 json_out,
@@ -380,7 +404,6 @@ fn skills(json_out: bool, command: SkillsCommand) -> Result<(), CliError> {
 fn run_target(json_out: bool, target: RunTarget) -> Result<(), CliError> {
     match target {
         RunTarget::Forkd(args) => {
-            let url = require_localhost(&args.url)?;
             let tag = require_snapshot_tag(&args.tag)?;
             if args.require_provenance {
                 // The thin wrapper has no binding inputs; keep it honest.
@@ -388,9 +411,7 @@ fn run_target(json_out: bool, target: RunTarget) -> Result<(), CliError> {
                     "run forkd does not accept --require-provenance; use `forkd acceptance --snapshot-binding <path>`",
                 ));
             }
-            let value = block_on(forkd::acceptance(&url, tag, args.require_vm))?;
-            render_output(json_out, value, "acceptance".to_owned());
-            Ok(())
+            run_acceptance(json_out, &args.url.url, tag, args.require_vm)
         }
         #[cfg(unix)]
         RunTarget::Rfb1(args) => {
@@ -403,37 +424,17 @@ fn run_target(json_out: bool, target: RunTarget) -> Result<(), CliError> {
             render_output(json_out, value, "rfb1 acceptance".to_owned());
             Ok(())
         }
-        RunTarget::Workload(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::workload(
-                &url,
-                tag,
-                args.sandboxes,
-                args.rounds,
-                args.reuse_execs,
-            ))?;
-            render_output(json_out, value, "workload".to_owned());
-            Ok(())
-        }
-        RunTarget::Benchmark(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::benchmark(&url, tag, args.n, BENCHMARK_TIMEOUT))?;
-            render_output(json_out, value, "benchmark".to_owned());
-            Ok(())
-        }
+        RunTarget::Workload(args) => run_workload(
+            json_out,
+            &args.url.url,
+            &args.tag,
+            args.sandboxes,
+            args.rounds,
+            args.reuse_execs,
+        ),
+        RunTarget::Benchmark(args) => run_benchmark(json_out, &args.url.url, &args.tag, args.n),
         RunTarget::Preflight(args) => {
-            let url = require_localhost(&args.url)?;
-            let tag = require_snapshot_tag(&args.tag)?;
-            let value = block_on(forkd::preflight(&url, tag, args.require_vm))?;
-            let text = if json_out {
-                String::new()
-            } else {
-                forkd::preflight_text(&value)
-            };
-            render_output(json_out, value, text);
-            Ok(())
+            run_preflight(json_out, &args.url.url, &args.tag, args.require_vm)
         }
     }
 }

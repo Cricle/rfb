@@ -35,6 +35,9 @@ pub mod firecracker;
 /// Firecracker API/socket internals (Linux only).
 #[cfg(all(feature = "firecracker", target_os = "linux"))]
 pub mod firecracker_core;
+/// Glob name matching: the single find-pattern semantics shared by every
+/// find implementation (forkd agent search, ZBRT workspace executor).
+pub mod glob;
 /// PID-1 guest boot helpers (Linux only).
 #[cfg(feature = "guest")]
 pub mod guest;
@@ -66,6 +69,9 @@ pub mod resources;
 pub mod runtime_service;
 /// RFB1 session/control wire contracts.
 pub mod session;
+/// Incremental UTF-8 boundary handling for chunked byte-oriented output pipes
+/// (shared by the ZBRT workspace executor and the forkd agent stream).
+pub mod utf8_boundary;
 /// Linux guest transport over tokio-vsock.
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod vsock;
@@ -78,6 +84,7 @@ pub mod workspace_executor;
 
 pub use codec::{Frame, FrameCodec, MessageType};
 pub use policy::{PathPolicy, PolicyError};
+pub use utf8_boundary::Utf8ChunkDecoder;
 
 /// The canonical RFB1 wire protocol version. All runtime/host handshakes must
 /// quote this constant; the image marker (`image/protocol-version`) and the

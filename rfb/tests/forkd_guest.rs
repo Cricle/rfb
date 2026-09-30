@@ -8,6 +8,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 async fn server(response: String) -> (String, tokio::task::JoinHandle<Value>) {
+    // These fake servers know nothing about the agent-token handshake, and the
+    // client reads FORKD_AGENT_TOKEN per connection: any ambient value would
+    // make every client inject an auth line as its first frame. Clear it so
+    // the tests below assert the token-free wire behavior only.
+    std::env::remove_var(rfb::forkd_guest::AGENT_TOKEN_ENV);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let task = tokio::spawn(async move {

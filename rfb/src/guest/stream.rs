@@ -84,8 +84,11 @@ impl StreamSpec {
         if let Some(cwd) = &self.cwd {
             validate_guest_cwd(cwd)?;
         }
-        for (name, _value) in &self.env {
-            if name.is_empty() || name.as_bytes().contains(&0) {
+        for (name, value) in &self.env {
+            // Names AND values: the value reaches the guest's set_var, where
+            // an embedded NUL would fail (or truncate) downstream — fail
+            // closed locally instead.
+            if name.is_empty() || name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
                 return Err(ContractError::InvalidEnv);
             }
         }

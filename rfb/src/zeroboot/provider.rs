@@ -21,8 +21,8 @@ use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use crate::protocol::{
-    read_frame_async, write_frame_async, Error as ProtocolError, Exit, Frame, Hello, HelloAck,
-    Kind, Output,
+    read_frame_async, write_frame_async, Error as ProtocolError, Exit, Frame, HelloAck, Kind,
+    Output, HEADER_LEN,
 };
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 use crate::vsock::connect_firecracker_uds;
@@ -250,6 +250,11 @@ pub struct ZeroBootSession {
     turn_lock: Arc<tokio::sync::Mutex<()>>,
     /// Capabilities the guest advertised in its HelloAck.
     negotiated: Vec<String>,
+    /// Cleared by the reader task when the relay connection ends (EOF, I/O,
+    /// or protocol error); never set back to true. Pool routing reads this
+    /// before handing a slot out, so a connection that can no longer carry
+    /// frames is retired instead of failing every request routed to it.
+    alive: Arc<std::sync::atomic::AtomicBool>,
     /// Background frame reader/demultiplexer.
     _reader: Option<tokio::task::JoinHandle<()>>,
     /// VM work directory kept alive for the session's lifetime.
@@ -360,13 +365,15 @@ impl ZeroBootSession {
         let (reader, writer) = tokio::io::split(stream);
         let inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let reader_task = spawn_reader(reader, inflight.clone());
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reader_task = spawn_reader(reader, inflight.clone(), Arc::clone(&alive));
         Self {
             writer: tokio::sync::Mutex::new(writer),
             inflight,
             active_turn: tokio::sync::Mutex::new(None),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             negotiated: Vec::new(),
+            alive,
             _reader: Some(reader_task),
             _work: None,
             _work_lock: None,
@@ -381,20 +388,9 @@ impl ZeroBootSession {
         &self,
         io_timeout: Duration,
     ) -> std::result::Result<HelloAck, SessionError> {
-        let hello = Hello {
-            client: "rfb-host".to_owned(),
-            capabilities: ZBRT_V1_CAPABILITIES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-        };
+        let hello = crate::protocol::hello_frame("rfb-host", [0u8; 16]).map_err(protocol_error)?;
         let frame = self
-            .exchange(
-                Kind::Hello,
-                hello.encode().map_err(protocol_error)?,
-                io_timeout,
-                None,
-            )
+            .exchange(Kind::Hello, hello.payload, io_timeout, None)
             .await?;
         match frame.kind {
             Kind::HelloAck => HelloAck::decode(&frame.payload).map_err(protocol_error),
@@ -431,6 +427,14 @@ impl ZeroBootSession {
         self._vm.as_ref().map(|vm| vm.id())
     }
 
+    /// Test-only: whether the reader task still believes the relay connection
+    /// is alive. Lets tests wait for dead-slot detection deterministically
+    /// instead of racing the reader's exit.
+    #[doc(hidden)]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// The capability set the guest advertised in its HelloAck.
     pub fn negotiated(&self) -> &[String] {
         &self.negotiated
@@ -451,50 +455,9 @@ impl ZeroBootSession {
         self: &Arc<Self>,
         request: Execute,
     ) -> std::result::Result<ExecResult, SessionError> {
-        let request_id = new_request_id();
         let payload = request.encode().map_err(protocol_error)?;
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(u64::from(request.timeout_ms))
-            + EXEC_DEADLINE_MARGIN;
-        // Hold the turn lock for the whole command: a concurrent exec or
-        // stream queues here instead of failing against the guest's
-        // single-turn contract. Owned guard so it can live inside TurnGuard.
-        let turn = self.turn_lock.clone().lock_owned().await;
-        // Bounded demux channel: a stalled (or abandoned) consumer cannot
-        // grow host memory without bound; the reader drops overflow instead.
-        let (tx, mut rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
-        self.inflight.lock().await.insert(request_id, tx);
-        // Publish the turn id only after the inflight registration, so a
-        // racing cancel_active can never target a request that has no channel.
-        *self.active_turn.lock().await = Some(request_id);
-        let turn_guard = TurnGuard {
-            session: Arc::clone(self),
-            _inflight: InflightGuard {
-                inflight: Arc::clone(&self.inflight),
-                request_id,
-            },
-            _turn: turn,
-        };
-        let write_result = {
-            let mut writer = self.writer.lock().await;
-            write_frame_async(
-                &mut *writer,
-                &Frame {
-                    kind: Kind::Execute,
-                    flags: 0,
-                    request_id,
-                    payload,
-                },
-            )
-            .await
-            .map_err(map_io_error)
-        };
-        if let Err(error) = write_result {
-            // The request never reached the wire; TurnGuard's drop removes
-            // both the inflight entry and the active turn registration.
-            drop(turn_guard);
-            return Err(error);
-        }
+        let (turn_guard, mut rx, deadline) = self.begin_turn(payload, request.timeout_ms).await?;
+        let request_id = turn_guard.request_id();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let result = loop {
@@ -699,18 +662,51 @@ impl ZeroBootSession {
                 "guest does not advertise the stream capability".into(),
             ));
         }
-        let request_id = new_request_id();
         let payload = request.encode().map_err(protocol_error)?;
+        let (turn_guard, rx, deadline) = self.begin_turn(payload, request.timeout_ms).await?;
+        Ok(ZeroBootStream {
+            session: self.clone(),
+            request_id: turn_guard.request_id(),
+            rx,
+            deadline,
+            terminated: false,
+            pending: std::collections::VecDeque::new(),
+            guard: Some(turn_guard),
+            _slot: None,
+            output_bytes: 0,
+        })
+    }
+
+    /// Shared head of every turn-occupying request (`exec`/`stream`):
+    /// allocate a fresh request id, derive the absolute deadline, queue on
+    /// the guest's single-turn lock, register the bounded demux channel,
+    /// publish the active-turn id, and write the Execute frame.
+    ///
+    /// Order is load-bearing: the inflight entry is inserted before the
+    /// active-turn id is published, so a racing `cancel_active` can never
+    /// target a request that has no channel. On a write failure the guard
+    /// drops on the way out (`?`), which removes the inflight entry and the
+    /// active-turn registration — the request never reached the wire.
+    async fn begin_turn(
+        self: &Arc<Self>,
+        payload: Vec<u8>,
+        deadline_ms: u32,
+    ) -> std::result::Result<(TurnGuard, mpsc::Receiver<Frame>, tokio::time::Instant), SessionError>
+    {
+        let request_id = new_request_id();
         let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(u64::from(request.timeout_ms))
+            + Duration::from_millis(u64::from(deadline_ms))
             + EXEC_DEADLINE_MARGIN;
-        // The stream occupies the guest's single turn until its terminal
-        // frame; the TurnGuard (turn lock + inflight + active-turn id) is
-        // stored in the returned ZeroBootStream and released when the stream
-        // terminates — or on drop, so an abandoned stream cleans itself up.
+        // Hold the turn lock for the whole command: a concurrent exec or
+        // stream queues here instead of failing against the guest's
+        // single-turn contract. Owned guard so it can live inside TurnGuard.
         let turn = self.turn_lock.clone().lock_owned().await;
+        // Bounded demux channel: a stalled (or abandoned) consumer cannot
+        // grow host memory without bound; the reader drops overflow instead.
         let (tx, rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_CAPACITY);
         self.inflight.lock().await.insert(request_id, tx);
+        // Publish the turn id only after the inflight registration, so a
+        // racing cancel_active can never target a request that has no channel.
         *self.active_turn.lock().await = Some(request_id);
         let turn_guard = TurnGuard {
             session: Arc::clone(self),
@@ -720,37 +716,29 @@ impl ZeroBootSession {
             },
             _turn: turn,
         };
-        let write_result = {
-            let mut writer = self.writer.lock().await;
-            write_frame_async(
-                &mut *writer,
-                &Frame {
-                    kind: Kind::Execute,
-                    flags: 0,
-                    request_id,
-                    payload,
-                },
-            )
+        self.write_request(Kind::Execute, request_id, payload)
+            .await?;
+        Ok((turn_guard, rx, deadline))
+    }
+
+    /// Lock the writer and push one request frame; the writer lock is held
+    /// for exactly the write, never across a wait for the reply.
+    async fn write_request(
+        &self,
+        kind: Kind,
+        request_id: [u8; 16],
+        payload: Vec<u8>,
+    ) -> std::result::Result<(), SessionError> {
+        let mut writer = self.writer.lock().await;
+        let frame = Frame {
+            kind,
+            flags: 0,
+            request_id,
+            payload,
+        };
+        write_frame_async(&mut *writer, &frame)
             .await
             .map_err(map_io_error)
-        };
-        if let Err(error) = write_result {
-            // The stream request never reached the wire; TurnGuard's drop
-            // removes the inflight entry and the active turn registration.
-            drop(turn_guard);
-            return Err(error);
-        }
-        Ok(ZeroBootStream {
-            session: self.clone(),
-            request_id,
-            rx,
-            deadline,
-            terminated: false,
-            pending: std::collections::VecDeque::new(),
-            guard: Some(turn_guard),
-            _slot: None,
-            output_bytes: 0,
-        })
     }
 
     /// Write a `Cancel` frame that explicitly targets a specific request id
@@ -768,18 +756,7 @@ impl ZeroBootSession {
         let payload = cancel_target_request(reason, target)
             .encode()
             .map_err(protocol_error)?;
-        let mut writer = self.writer.lock().await;
-        write_frame_async(
-            &mut *writer,
-            &Frame {
-                kind: Kind::Cancel,
-                flags: 0,
-                request_id: target,
-                payload,
-            },
-        )
-        .await
-        .map_err(map_io_error)
+        self.write_request(Kind::Cancel, target, payload).await
     }
 
     /// Register a fresh request id and perform one request/response exchange.
@@ -803,21 +780,7 @@ impl ZeroBootSession {
             inflight: Arc::clone(&self.inflight),
             request_id,
         };
-        let write_result = {
-            let mut writer = self.writer.lock().await;
-            write_frame_async(
-                &mut *writer,
-                &Frame {
-                    kind,
-                    flags: 0,
-                    request_id,
-                    payload,
-                },
-            )
-            .await
-            .map_err(map_io_error)
-        };
-        let result = match write_result {
+        match self.write_request(kind, request_id, payload).await {
             Err(error) => Err(error),
             Ok(()) => {
                 let mut limit = deadline;
@@ -829,8 +792,7 @@ impl ZeroBootSession {
                     Err(error) => Err(error),
                 }
             }
-        };
-        result
+        }
     }
 }
 
@@ -840,6 +802,20 @@ impl ZeroBootSession {
 /// overflow, rate-limited trace, instead of queueing forever).
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 const FRAME_CHANNEL_CAPACITY: usize = 256;
+
+/// Per-request byte budget for the demux path: the frame-count channel bound
+/// alone caps a request's queued bytes only if frames are small, so a
+/// firehose guest is capped here instead. Must stay above
+/// [`MAX_EXEC_OUTPUT_BYTES`] (the consumer's own cap) so a legitimate
+/// oversized-output command always receives enough frames to trip its own
+/// limit before the reader starts dropping.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const DEMUX_REQUEST_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// How long the reader retries a full demux channel before dropping a
+/// terminal frame (see [`deliver_terminal`]).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+const TERMINAL_DELIVERY_WINDOW: Duration = Duration::from_secs(10);
 
 /// RAII registration of one in-flight request's demux channel. Dropping it
 /// removes the inflight entry: inline when the map lock is uncontended (the
@@ -902,6 +878,15 @@ impl Drop for TurnGuard {
     }
 }
 
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+impl TurnGuard {
+    /// The wire request id this turn registered (copied out so callers can
+    /// match routed frames while the guard itself stays owned elsewhere).
+    fn request_id(&self) -> [u8; 16] {
+        self._inflight.request_id
+    }
+}
+
 /// A pool of negotiated ZBRT sessions against one ZeroBoot guest.
 ///
 /// The V1 contract allows one active turn *per connection*, and the guest
@@ -915,6 +900,12 @@ impl Drop for TurnGuard {
 struct SessionPool {
     sessions: Vec<Arc<ZeroBootSession>>,
     busy: Vec<std::sync::atomic::AtomicBool>,
+    /// Slots whose relay connection the reader task reported dead. A
+    /// condemned slot is never handed out again; its semaphore permit is
+    /// retired, so `free` counts live connections only. The flag is set
+    /// exactly once per slot, by the one acquirer that claimed the slot's
+    /// busy flag when the death was discovered.
+    dead: Vec<std::sync::atomic::AtomicBool>,
     free: Arc<tokio::sync::Semaphore>,
 }
 
@@ -954,20 +945,36 @@ impl SessionPool {
             busy: (0..count)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            dead: (0..count)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             free: Arc::new(tokio::sync::Semaphore::new(count)),
         })
     }
 
-    /// Session for the health probe only. The guest answers Health directly
-    /// off its runtime service (before any turn takes the workspace executor
-    /// out — see rfb-runtime/src/runtime_service/mod.rs `filesystem_rpc`),
-    /// so health interleaves with an active turn on this connection instead
-    /// of claiming a pool slot. Filesystem RPCs run on the guest's workspace
-    /// executor and therefore fail while a turn is active on their
-    /// connection — they must route through [`SessionPool::acquire`] onto a
-    /// free connection, not here.
+    /// The primary session (slot 0) regardless of liveness: the backing VM
+    /// and its work-dir ownership are attached to exactly this session, so
+    /// VM-level lookups must always read here, never a survivor slot.
     fn primary(&self) -> &Arc<ZeroBootSession> {
         &self.sessions[0]
+    }
+
+    /// Session for the health probe only: the first connection the reader
+    /// task has not reported dead. Falls back to the primary when every slot
+    /// is dead, so the probe surfaces the connection's real error instead of
+    /// a synthetic one. The guest answers Health directly off its runtime
+    /// service (before any turn takes the workspace executor out — see
+    /// rfb-runtime/src/runtime_service/mod.rs `filesystem_rpc`), so health
+    /// interleaves with an active turn on this connection instead of claiming
+    /// a pool slot. Filesystem RPCs run on the guest's workspace executor and
+    /// therefore fail while a turn is active on their connection — they must
+    /// route through [`SessionPool::acquire`] onto a free connection, not
+    /// here.
+    fn primary_alive(&self) -> &Arc<ZeroBootSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.alive.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(&self.sessions[0])
     }
 
     /// Every session, for operations that must reach whichever one holds the
@@ -976,34 +983,97 @@ impl SessionPool {
         &self.sessions
     }
 
-    /// Wait for a free slot and claim it.
-    async fn acquire(self: &Arc<Self>) -> PooledSession {
-        let permit = self
-            .free
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("session pool semaphore is never closed");
-        let slot = self
-            .busy
-            .iter()
-            .position(|busy| {
-                busy.compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            })
-            .expect("a free permit guarantees a free slot");
-        PooledSession {
-            session: Arc::clone(&self.sessions[slot]),
-            pool: Arc::clone(self),
-            slot,
-            _permit: permit,
+    /// Wait for a free live slot and claim it.
+    ///
+    /// A slot whose reader task reported the connection dead is never handed
+    /// out: the V1 pool holds no rebuild parameters (the relay UDS lives in
+    /// the session-creation path), so a dead slot is condemned instead — its
+    /// permit is retired from the semaphore, shrinking the pool's usable
+    /// capacity by one, and the scan continues on the remaining live slots.
+    /// When every slot is dead the semaphore is closed, which wakes every
+    /// blocked waiter into the same error; future callers fail here too,
+    /// rather than as a write failure or a timeout hang on a corpse
+    /// connection.
+    ///
+    /// Invariant: an available permit always stands for a free live slot.
+    /// A dead slot's permit is retired (`forget`) the moment the death is
+    /// discovered under the claimer's own busy CAS, and a slot is condemned
+    /// exactly once, so retiring and freeing can never double-count.
+    async fn acquire(self: &Arc<Self>) -> std::result::Result<PooledSession, ProviderError> {
+        loop {
+            let permit = match self.free.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                // The semaphore is closed only when every slot has been
+                // condemned; closing is what wakes everyone blocked on it.
+                Err(_) => {
+                    return Err(ProviderError::Unavailable(
+                        "all pooled guest connections are dead".into(),
+                    ))
+                }
+            };
+            let slot = self.busy.iter().enumerate().position(|(i, busy)| {
+                !self.dead[i].load(std::sync::atomic::Ordering::Relaxed)
+                    && busy
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+            });
+            let Some(slot) = slot else {
+                // Unreachable while the invariant holds (a condemned slot's
+                // permit is retired, never available). Fail closed instead of
+                // spinning if it is ever violated.
+                drop(permit);
+                return Err(ProviderError::Unavailable(
+                    "no live pooled guest connection is free".into(),
+                ));
+            };
+            if self.sessions[slot]
+                .alive
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(PooledSession {
+                    session: Arc::clone(&self.sessions[slot]),
+                    pool: Arc::clone(self),
+                    slot,
+                    _permit: permit,
+                });
+            }
+            // Condemn: the claimer (the only holder of this slot's busy CAS)
+            // marks the slot dead, releases the busy flag, and retires the
+            // permit so the dead slot leaves the capacity pool entirely.
+            self.dead[slot].store(true, std::sync::atomic::Ordering::Release);
+            self.busy[slot].store(false, std::sync::atomic::Ordering::Release);
+            permit.forget();
+            if self
+                .dead
+                .iter()
+                .all(|dead| dead.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                // Retiring a permit never wakes a semaphore waiter, so once
+                // nothing is live, close the semaphore: every blocked (and
+                // every future) waiter surfaces the all-dead error instead
+                // of parking forever.
+                self.free.close();
+                return Err(ProviderError::Unavailable(
+                    "all pooled guest connections are dead".into(),
+                ));
+            }
+            // Live slots remain: scan again. The next claim either proceeds
+            // immediately (another free live slot) or parks until one of
+            // their holders discharges — a retired permit is never handed
+            // back, so this cannot spin on a corpse.
         }
     }
+}
+
+/// Hex-encode a 128-bit wire request id for diagnostics traces.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn rid_hex(request_id: &[u8; 16]) -> String {
+    request_id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Background demultiplexer: reads every inbound ZBRT frame and routes it to
@@ -1013,9 +1083,16 @@ impl SessionPool {
 fn spawn_reader(
     mut reader: tokio::io::ReadHalf<tokio::net::UnixStream>,
     inflight: Arc<tokio::sync::Mutex<HashMap<[u8; 16], mpsc::Sender<Frame>>>>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut overflowed: u64 = 0;
+        let mut budget_dropped: u64 = 0;
+        // Cumulative admitted Output bytes per request id. Bounds host memory
+        // per request to `DEMUX_REQUEST_BYTE_BUDGET` regardless of frame
+        // count; entries are retired when the request's terminal frame is
+        // routed.
+        let mut admitted: HashMap<[u8; 16], u64> = HashMap::new();
         loop {
             // Canonical single-implementation frame decoder shared with the
             // guest (`rfb::protocol` re-exports rfb-runtime's zeroboot
@@ -1026,39 +1103,97 @@ fn spawn_reader(
                 Err(_) => break,
             };
             let sender = inflight.lock().await.get(&frame.request_id).cloned();
-            if let Some(sender) = sender {
-                // Bounded channel: a stalled or abandoned consumer cannot
-                // grow host memory without bound. Overflow is dropped, with
-                // a rate-limited trace (first drop, then every 1024th) so a
-                // firehose guest cannot flood stderr either.
-                if sender.try_send(frame).is_err() {
-                    overflowed += 1;
-                    if overflowed == 1 || overflowed.is_multiple_of(1024) {
-                        eprintln!(
-                            "rfb zeroboot: request channel full, dropped {overflowed} frame(s) so far"
-                        );
-                    }
-                }
-            } else {
+            let Some(sender) = sender else {
                 // Late or unknown frames (e.g. racing a completed request) are
                 // dropped by design — but they are also the classic symptom of
                 // a routing bug, so leave a trace.
                 eprintln!(
                     "rfb zeroboot: dropped frame kind={:?} id={} (no in-flight request)",
                     frame.kind,
-                    frame
-                        .request_id
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
+                    rid_hex(&frame.request_id)
                 );
+                continue;
+            };
+            match frame.kind {
+                // Terminal frames end the consumer's control loop; dropping
+                // one would turn a finished command into a fake Timeout, so
+                // they are delivered even against a full channel.
+                Kind::Exit | Kind::Result | Kind::Error => {
+                    let _ = admitted.remove(&frame.request_id);
+                    if !deliver_terminal(&sender, &frame).await {
+                        eprintln!(
+                            "rfb zeroboot: dropped terminal frame kind={:?} id={} (channel never drained)",
+                            frame.kind,
+                            rid_hex(&frame.request_id)
+                        );
+                    }
+                    continue;
+                }
+                Kind::Output => {
+                    // Byte-budgeted admission: the frame-count channel bound
+                    // alone caps a request's queued bytes only if frames are
+                    // small, so a firehose guest is capped here instead.
+                    let frame_bytes = (HEADER_LEN + frame.payload.len()) as u64;
+                    let admitted_bytes = admitted.entry(frame.request_id).or_insert(0);
+                    if *admitted_bytes + frame_bytes > DEMUX_REQUEST_BYTE_BUDGET as u64 {
+                        budget_dropped += 1;
+                        if budget_dropped == 1 || budget_dropped.is_multiple_of(1024) {
+                            eprintln!(
+                                "rfb zeroboot: request over the demux byte budget, dropped {budget_dropped} frame(s) so far"
+                            );
+                        }
+                        continue;
+                    }
+                    *admitted_bytes += frame_bytes;
+                }
+                // Small control frames (acknowledgements): frame-count bounded
+                // like before.
+                _ => {}
+            }
+            // Bounded channel: a stalled or abandoned consumer cannot
+            // grow host memory without bound. Overflow is dropped, with
+            // a rate-limited trace (first drop, then every 1024th) so a
+            // firehose guest cannot flood stderr either.
+            if sender.try_send(frame).is_err() {
+                overflowed += 1;
+                if overflowed == 1 || overflowed.is_multiple_of(1024) {
+                    eprintln!(
+                        "rfb zeroboot: request channel full, dropped {overflowed} frame(s) so far"
+                    );
+                }
             }
         }
-        // The connection is gone: close every pending request channel so all
+        // The connection is gone: mark the session dead so pool routing
+        // retires the slot, then close every pending request channel so all
         // waiters observe `None` and fail instead of hanging.
+        alive.store(false, std::sync::atomic::Ordering::Release);
         let senders: Vec<_> = inflight.lock().await.drain().map(|(_, tx)| tx).collect();
         drop(senders);
     })
+}
+
+/// Deliver a terminal frame even when its request's demux channel is
+/// momentarily full: the consumer's control loop terminates on exactly this
+/// frame, so dropping it would turn a completed command into a fake Timeout.
+/// Retries with a 1 ms backoff until the consumer drains (the common case),
+/// the consumer disappears (channel closed — nothing left to deliver), or a
+/// generous window passes (degrade to the drop behavior rather than wedging
+/// the demultiplexer for every other request).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+async fn deliver_terminal(sender: &mpsc::Sender<Frame>, frame: &Frame) -> bool {
+    let deadline = tokio::time::Instant::now() + TERMINAL_DELIVERY_WINDOW;
+    loop {
+        match sender.try_send(frame.clone()) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
 }
 
 /// Wait for the next frame of a request, bounded by the remaining exec
@@ -1545,6 +1680,11 @@ fn map_session_error(error: SessionError) -> SandboxError {
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn map_provider_error(error: ProviderError) -> SandboxError {
+    SandboxError::Transport(error.to_string())
+}
+
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn check_supported(
     session: &ZeroBootSession,
     capability: Capability,
@@ -1582,31 +1722,19 @@ pub fn stage_private_rootfs(work_path: &str, source: &str) -> Result<String> {
         .ok_or_else(|| Error::Backend("private rootfs path is not valid UTF-8".into()))
 }
 
-/// Boot one Firecracker VM for a sandbox and return the negotiated session
-/// pool bound to it. The VM keeps running for the pool's lifetime, so every
-/// later exec/control RPC runs without a cold boot. The pool size comes from
-/// `RFB_ZBRT_SESSIONS`; extra sessions pay one connect + Hello handshake at
-/// create time and then serve commands concurrently.
+/// The vsock relay UDS path a booted or restored VM's runtime baked in.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
-    let firecracker = config
-        .firecracker
-        .as_ref()
-        .and_then(|path| path.to_str())
-        .ok_or(Error::InvalidConfiguration("Firecracker path is required"))?;
-    let kernel = config
-        .kernel
-        .as_ref()
-        .and_then(|path| path.to_str())
-        .ok_or(Error::InvalidConfiguration("kernel path is required"))?;
-    let rootfs = config
-        .rootfs
-        .as_ref()
-        .and_then(|path| path.to_str())
-        .ok_or(Error::InvalidConfiguration("rootfs path is required"))?;
-    // Fail closed when the configured Firecracker binary contradicts a
-    // neighboring SHA256SUMS manifest, before any process is spawned.
-    verify_firecracker(config)?;
+fn vm_uds(vm: &crate::firecracker::FirecrackerVm) -> Result<String> {
+    vm.vsock_uds_path()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Backend("missing vsock UDS".into()))
+}
+
+/// Create the per-sandbox work dir, its UTF-8 path, and the flock liveness
+/// marker: the startup scavenger reclaims the dir only if it can take that
+/// flock, which is impossible while the holder is alive.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn create_work_dir() -> Result<(tempfile::TempDir, String, std::fs::File)> {
     let work = tempfile::Builder::new()
         .prefix("rfb-zeroboot-")
         .tempdir()
@@ -1616,47 +1744,94 @@ async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
         .to_str()
         .ok_or_else(|| Error::Backend("invalid work path".into()))?
         .to_owned();
-    // Liveness marker: the scavenger reclaims this dir only if it can take
-    // this flock, which is impossible while we hold it.
     let work_lock = create_work_lock(&work_path)?;
-    let (vm, uds) = tokio::task::spawn_blocking({
-        let firecracker = firecracker.to_owned();
-        let kernel = kernel.to_owned();
-        let rootfs = rootfs.to_owned();
-        move || {
-            let rootfs = stage_private_rootfs(&work_path, &rootfs)?;
-            let vm = crate::firecracker::FirecrackerVm::boot_with_runtime(
-                &firecracker,
-                &kernel,
-                &rootfs,
-                &work_path,
-                crate::firecracker::VmResources::new(vm_mem_mib(), vm_vcpu()),
-                VM_INIT_PATH,
-                GUEST_CID,
-            )
-            .map_err(|e| Error::Backend(e.to_string()))?;
-            let uds = vm
-                .vsock_uds_path()
-                .ok_or_else(|| Error::Backend("missing vsock UDS".into()))?
-                .to_owned();
-            Ok::<_, Error>((vm, uds))
-        }
+    Ok((work, work_path, work_lock))
+}
+
+/// Stage a private rootfs copy into `work_path` and boot one Firecracker VM
+/// with the process-wide shape, on the blocking pool; returns the VM and its
+/// baked vsock relay UDS path. `label` names the worker in join-failure
+/// diagnostics.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+async fn boot_vm_with_staged_rootfs(
+    label: &str,
+    firecracker: String,
+    kernel: String,
+    rootfs: String,
+    work_path: String,
+) -> Result<(crate::firecracker::FirecrackerVm, String)> {
+    tokio::task::spawn_blocking(move || {
+        let rootfs = stage_private_rootfs(&work_path, &rootfs)?;
+        let vm = crate::firecracker::FirecrackerVm::boot_with_runtime(
+            &firecracker,
+            &kernel,
+            &rootfs,
+            &work_path,
+            crate::firecracker::VmResources::new(vm_mem_mib(), vm_vcpu()),
+            VM_INIT_PATH,
+            GUEST_CID,
+        )
+        .map_err(|e| Error::Backend(e.to_string()))?;
+        let uds = vm_uds(&vm)?;
+        Ok::<_, Error>((vm, uds))
     })
     .await
-    .map_err(|e| Error::Backend(format!("ZeroBoot boot worker failed: {e}")))??;
-    let mut primary = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
+    .map_err(|e| Error::Backend(format!("ZeroBoot {label} worker failed: {e}")))?
+}
+
+/// Open the primary pool session, hand it ownership of the VM, its work dir,
+/// and the scavenger lock, and fan out the remaining pool sessions over the
+/// same relay UDS. Dropping the primary session tears the VM down; the work
+/// lock keeps the dir scavenge-proof while the pool lives. `work_path` set
+/// attaches the child's Firecracker log tail to a failed open (restore
+/// diagnostics).
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+async fn open_primary_pool(
+    config: &Config,
+    uds: &str,
+    work_path: Option<&str>,
+    work: tempfile::TempDir,
+    work_lock: std::fs::File,
+    vm: crate::firecracker::FirecrackerVm,
+) -> Result<Vec<Arc<ZeroBootSession>>> {
+    let mut primary = ZeroBootSession::open(uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
         .await
-        .map_err(|e| Error::Backend(format!("ZeroBoot session open failed: {e}")))?;
-    // Ownership of the VM and its work dir stays with the primary session:
-    // dropping it tears the VM down, and the rest of the pool only holds
-    // connections into it. The work lock rides along so the directory cannot
-    // be scavenged while any session of this pool is alive.
+        .map_err(|e| match work_path {
+            // A failed vsock relay restore shows up here as a session-open
+            // failure only; attach the child's Firecracker log tail.
+            Some(work_path) => {
+                let log = std::fs::read_to_string(format!("{work_path}/firecracker.log"))
+                    .unwrap_or_default();
+                let tail: String = log.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
+                Error::Backend(format!(
+                    "ZeroBoot session open failed: {e}; firecracker log tail: {tail}"
+                ))
+            }
+            None => Error::Backend(format!("ZeroBoot session open failed: {e}")),
+        })?;
     primary._work = Some(work);
     primary._work_lock = Some(work_lock);
     primary._vm = Some(vm);
     let mut sessions = vec![Arc::new(primary)];
-    sessions.extend(open_extra_sessions(&uds, config.guest_port).await?);
+    sessions.extend(open_extra_sessions(uds, config.guest_port).await?);
     Ok(sessions)
+}
+
+/// Boot one Firecracker VM for a sandbox and return the negotiated session
+/// pool bound to it. The VM keeps running for the pool's lifetime, so every
+/// later exec/control RPC runs without a cold boot. The pool size comes from
+/// `RFB_ZBRT_SESSIONS`; extra sessions pay one connect + Hello handshake at
+/// create time and then serve commands concurrently.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+async fn boot_and_open(config: &Config) -> Result<Vec<Arc<ZeroBootSession>>> {
+    let (firecracker, kernel, rootfs) = vm_paths(config)?;
+    // Fail closed when the configured Firecracker binary contradicts a
+    // neighboring SHA256SUMS manifest, before any process is spawned.
+    verify_firecracker(config)?;
+    let (work, work_path, work_lock) = create_work_dir()?;
+    let (vm, uds) =
+        boot_vm_with_staged_rootfs("boot", firecracker, kernel, rootfs, work_path).await?;
+    open_primary_pool(config, &uds, None, work, work_lock, vm).await
 }
 
 /// Open the remaining pool sessions concurrently over one connected relay:
@@ -1775,7 +1950,7 @@ fn snapshot_identity(config: &Config) -> String {
     identity.to_string()
 }
 
-/// Serialize the provider's VM configuration for the parent-boot path. All
+/// Serialize the provider's VM configuration for every boot/restore path. All
 /// fields are required by `validate()` before this runs.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn vm_paths(config: &Config) -> Result<(String, String, String)> {
@@ -1846,9 +2021,7 @@ impl SnapshotDirLock {
         // is wedged, and a clean error beats hanging the caller forever.
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
-            // SAFETY: flock(2) on an owned fd.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
+            if flock_exclusive(file.as_raw_fd(), true) {
                 break;
             }
             let error = std::io::Error::last_os_error();
@@ -1881,6 +2054,78 @@ fn create_dir_private(dir: &std::path::Path) -> Result<()> {
         .map_err(|e| Error::Backend(format!("chmod 0700 {}: {e}", dir.display())))
 }
 
+/// Take `LOCK_EX` on an owned fd, blocking or non-blocking. Centralizes this
+/// module's one unsafe flock: for every caller the safety argument is the
+/// same — the fd is owned for the duration of the single `flock(2)` call, and
+/// no close or reuse of it can race the syscall.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn flock_exclusive(fd: i32, nonblocking: bool) -> bool {
+    let flags = if nonblocking {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX
+    };
+    // SAFETY: flock(2) on an fd the caller owns for the duration of the call.
+    let rc = unsafe { libc::flock(fd, flags) };
+    rc == 0
+}
+
+/// Create and LOCK_EX a scavenger-owned lock file with no open→flock window.
+/// The file is created under a unique temporary name (`<path>.tmp-<pid>-<n>`),
+/// flocked, marked, and only then renamed onto `path`: the scavenger probes
+/// the final name, so it can never win a flock on a lock file whose owner has
+/// not taken it yet — the window that let it reclaim a live work directory
+/// mid-create. Callers create these in freshly-made directories, so the final
+/// name must not exist; a collision fails closed rather than silently
+/// replacing another holder's lock. A leftover temporary file from a crashed
+/// create is invisible to the scavenger (wrong name) and harmless.
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+fn create_owned_lock(
+    path: &Path,
+    marker: &[u8],
+) -> std::result::Result<std::fs::File, std::io::Error> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut temp_name = path.as_os_str().to_os_string();
+    temp_name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temp = std::path::PathBuf::from(temp_name);
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+    }?;
+    let result = (|| {
+        if !flock_exclusive(file.as_raw_fd(), false) {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Ownership marker (see create_work_lock): the directory name prefix
+        // plus this content identify the directory as ours to the scavenger.
+        {
+            use std::io::Write;
+            let _ = (&file).write_all(marker);
+        }
+        if path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "lock file already exists",
+            ));
+        }
+        std::fs::rename(&temp, path)
+    })();
+    if let Err(error) = result {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(file)
+}
+
 /// Create and LOCK_EX `<work_path>/work.lock`, returning the owning fd. A live
 /// process holds this flock for the session's lifetime, which is exactly what
 /// makes the process-startup scavenger safe: it only reclaims directories
@@ -1888,27 +2133,8 @@ fn create_dir_private(dir: &std::path::Path) -> Result<()> {
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 fn create_work_lock(work_path: &str) -> Result<std::fs::File> {
     let path = Path::new(work_path).join("work.lock");
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-    }
-    .map_err(|e| Error::Backend(format!("create work lock {}: {e}", path.display())))?;
-    // SAFETY: flock(2) on an owned fd; LOCK_EX blocks only against the
-    // scavenger's non-blocking probe (which is designed to lose).
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(Error::Backend(format!(
-            "flock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(file)
+    create_owned_lock(&path, b"rfb-work-lock\n")
+        .map_err(|e| Error::Backend(format!("create work lock {}: {e}", path.display())))
 }
 
 /// Fail closed when the configured Firecracker binary contradicts a
@@ -1926,16 +2152,19 @@ fn verify_firecracker(config: &Config) -> Result<()> {
     }
 }
 
-/// Reclaim stale directories directly under `root`. Each candidate directory
-/// is probed by taking a NON-BLOCKING `LOCK_EX` flock on its `<lock_name>`
-/// file: success proves no live process owns the directory (the kernel drops
-/// flocks with the owning fd), so it is removed and counted. Busy locks —
-/// and directories with no lock file, e.g. a create interrupted before the
-/// lock landed — are left alone. IO errors are logged, never propagated; the
-/// scavenger runs on the create path and must not fail a sandbox create.
+/// Reclaim stale directories directly under `root`. A candidate directory
+/// must (a) carry the `dir_prefix` name prefix, (b) contain a `<lock_name>`
+/// file whose content is an ownership marker written by our lock creators
+/// (empty files from interrupted creates are tolerated), and (c) take a
+/// NON-BLOCKING `LOCK_EX` flock — together these prove the directory is ours
+/// AND no live process owns it; then it is removed and counted. Anything
+/// else is left alone: the scavenger must never touch directories outside
+/// its own namespace, no matter what they happen to contain. IO errors are
+/// logged, never propagated; the scavenger runs on the create path and must
+/// not fail a sandbox create.
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 #[doc(hidden)]
-pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str) -> usize {
+pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str, dir_prefix: &str) -> usize {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) => {
@@ -1952,6 +2181,11 @@ pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str) -> usize {
         if !dir.is_dir() {
             continue;
         }
+        // Namespace filter first: never even probe directories that are not
+        // ours by name.
+        if !entry.file_name().to_string_lossy().starts_with(dir_prefix) {
+            continue;
+        }
         let lock_path = dir.join(lock_name);
         let file = match std::fs::OpenOptions::new()
             .read(true)
@@ -1962,10 +2196,25 @@ pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str) -> usize {
             // No lock file: not (yet) one of our live directories — keep it.
             Err(_) => continue,
         };
-        // SAFETY: flock(2) on an owned fd; LOCK_NB never blocks.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            // Live holder (or a transient error): leave the directory alone.
+        // Content marker: an empty file is ours (pre-marker create race); a
+        // non-empty file that does not carry our magic is not.
+        {
+            use std::io::Read;
+            let mut magic = String::new();
+            if file
+                .try_clone()
+                .and_then(|mut f| f.read_to_string(&mut magic))
+                .is_ok()
+                && !magic.is_empty()
+                && !magic.starts_with("rfb-work-lock")
+                && !magic.starts_with("rfb-fork-lock")
+            {
+                continue;
+            }
+        }
+        // LOCK_NB never blocks; a live holder (or a transient error) leaves
+        // the directory alone.
+        if !flock_exclusive(file.as_raw_fd(), true) {
             continue;
         }
         match std::fs::remove_dir_all(&dir) {
@@ -1985,16 +2234,16 @@ pub fn scavenge_stale_in(root: &std::path::Path, lock_name: &str) -> usize {
 pub fn scavenge_stale_state(snapshot_base: Option<&std::path::Path>) -> usize {
     static SCAVENGED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SCAVENGED.get_or_init(|| {
-        let mut removed = scavenge_stale_in(&std::env::temp_dir(), "work.lock");
+        let mut removed = scavenge_stale_in(&std::env::temp_dir(), "work.lock", "rfb-zeroboot-");
         if let Some(base) = snapshot_base {
             // Sharded layouts keep their fork dirs under `shard-N/`; the
             // single-shard layout keeps them directly under the base.
-            removed += scavenge_stale_in(base, "fork.lock");
+            removed += scavenge_stale_in(base, "fork.lock", "fork-");
             if let Ok(entries) = std::fs::read_dir(base) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() && entry.file_name().to_string_lossy().starts_with("shard-") {
-                        removed += scavenge_stale_in(&path, "fork.lock");
+                        removed += scavenge_stale_in(&path, "fork.lock", "fork-");
                     }
                 }
             }
@@ -2122,31 +2371,9 @@ async fn ensure_parent_snapshot(
         .ok_or_else(|| Error::Backend("parent work path is not valid UTF-8".into()))?
         .to_owned();
     create_dir_private(std::path::Path::new(&work_path))?;
-    let (mut vm, _uds) = tokio::task::spawn_blocking({
-        let firecracker = firecracker.clone();
-        let kernel = kernel.clone();
-        let rootfs = rootfs.clone();
-        move || {
-            let staged_rootfs = stage_private_rootfs(&work_path, &rootfs)?;
-            let vm = crate::firecracker::FirecrackerVm::boot_with_runtime(
-                &firecracker,
-                &kernel,
-                &staged_rootfs,
-                &work_path,
-                crate::firecracker::VmResources::new(vm_mem_mib(), vm_vcpu()),
-                VM_INIT_PATH,
-                GUEST_CID,
-            )
-            .map_err(|e| Error::Backend(e.to_string()))?;
-            let uds = vm
-                .vsock_uds_path()
-                .ok_or_else(|| Error::Backend("missing vsock UDS".into()))?
-                .to_owned();
-            Ok::<_, Error>((vm, uds))
-        }
-    })
-    .await
-    .map_err(|e| Error::Backend(format!("ZeroBoot parent snapshot worker failed: {e}")))??;
+    let (mut vm, _uds) =
+        boot_vm_with_staged_rootfs("parent snapshot", firecracker, kernel, rootfs, work_path)
+            .await?;
     // The probe session blocks until the guest's vsock listener answers, so
     // the pause below always snapshots a fully booted agent. close() shuts
     // the write half down (FIN), which deterministically ends the guest's
@@ -2219,17 +2446,7 @@ async fn restore_and_open(
     // permissive mode must fail the restore rather than be tolerated.
     harden_snapshot_permissions(&dir.join("parent"))?;
     let (firecracker, _kernel, rootfs) = vm_paths(config)?;
-    let work = tempfile::Builder::new()
-        .prefix("rfb-zeroboot-")
-        .tempdir()
-        .map_err(|e| Error::Backend(e.to_string()))?;
-    let work_path = work
-        .path()
-        .to_str()
-        .ok_or_else(|| Error::Backend("invalid work path".into()))?
-        .to_owned();
-    // Liveness marker for the scavenger, exactly like the cold-boot path.
-    let work_lock = create_work_lock(&work_path)?;
+    let (work, work_path, work_lock) = create_work_dir()?;
     let mode = RESTORE_MODE.load(Ordering::Relaxed);
     // Bare restore (patched build) reuses the parent's baked rootfs — the
     // per-create staging copy would be discarded, so skip it entirely. The
@@ -2262,33 +2479,13 @@ async fn restore_and_open(
             } else {
                 RESTORE_MODE.store(1, Ordering::Relaxed);
             }
-            let uds = vm
-                .vsock_uds_path()
-                .ok_or_else(|| Error::Backend("missing vsock UDS".into()))?
-                .to_owned();
+            let uds = vm_uds(&vm)?;
             Ok::<_, Error>((vm, uds))
         }
     })
     .await
     .map_err(|e| Error::Backend(format!("ZeroBoot restore worker failed: {e}")))??;
-    let mut primary = ZeroBootSession::open(&uds, config.guest_port, SESSION_CONNECT_TIMEOUT)
-        .await
-        .map_err(|e| {
-            // Attach the child's Firecracker log: a failed vsock relay
-            // restore shows up here as a session-open failure only.
-            let log =
-                std::fs::read_to_string(format!("{work_path}/firecracker.log")).unwrap_or_default();
-            let tail: String = log.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
-            Error::Backend(format!(
-                "ZeroBoot session open failed: {e}; firecracker log tail: {tail}"
-            ))
-        })?;
-    primary._work = Some(work);
-    primary._work_lock = Some(work_lock);
-    primary._vm = Some(vm);
-    let mut sessions = vec![Arc::new(primary)];
-    sessions.extend(open_extra_sessions(&uds, config.guest_port).await?);
-    Ok(sessions)
+    open_primary_pool(config, &uds, Some(work_path.as_str()), work, work_lock, vm).await
 }
 
 #[derive(Debug, Clone)]
@@ -2426,14 +2623,12 @@ impl ZeroBootProvider {
                         .await
                         .map_err(|e| ProviderError::Unavailable(e.to_string()))?,
                 };
-                let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
-                Ok(ZeroBootSandbox {
-                    config: self.config.clone(),
-                    pool: SessionPool::new(sessions),
-                    capabilities,
-                    snapshot_dir: shard,
-                    fork_checkpoint: None,
-                })
+                Ok(ZeroBootSandbox::from_pool(
+                    self.config.clone(),
+                    sessions,
+                    shard,
+                    None,
+                ))
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
             {
@@ -2514,7 +2709,7 @@ impl ZeroBootSandbox {
                 // runtime service. Routing through the pool claims a free
                 // connection instead of failing (or queueing) behind the
                 // primary session's active turn.
-                let slot = self.pool.acquire().await;
+                let slot = self.pool.acquire().await.map_err(map_provider_error)?;
                 check_supported(slot.session(), capability)?;
                 let payload = serde_json::to_vec(&request)
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
@@ -2537,6 +2732,26 @@ impl ZeroBootSandbox {
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
 impl ZeroBootSandbox {
+    /// Assemble a sandbox around an already-open session pool; the advertised
+    /// capabilities derive from the primary session's HelloAck. Shared by the
+    /// provider's create path, fork, and the mock-guest test constructors so
+    /// the field wiring cannot drift between them.
+    fn from_pool(
+        config: Arc<Config>,
+        sessions: Vec<Arc<ZeroBootSession>>,
+        snapshot_dir: Option<PathBuf>,
+        fork_checkpoint: Option<Arc<ForkCheckpoint>>,
+    ) -> Self {
+        let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
+        Self {
+            config,
+            pool: SessionPool::new(sessions),
+            capabilities,
+            snapshot_dir,
+            fork_checkpoint,
+        }
+    }
+
     /// Fork this sandbox: checkpoint the VM's full live state (pause → full
     /// snapshot), tear the checkpointed VM down, and restore TWO fresh VMs
     /// from the checkpoint — the returned pair is `(continued original,
@@ -2609,28 +2824,17 @@ impl ZeroBootSandbox {
         // Liveness marker: created before the (possibly slow) checkpoint so a
         // concurrently starting process can never reclaim this dir mid-fork.
         let fork_lock = {
-            use std::os::unix::fs::OpenOptionsExt;
             let path = fork_dir.join("fork.lock");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|e| {
+            match create_owned_lock(&path, b"rfb-fork-lock\n") {
+                Ok(file) => file,
+                Err(error) => {
                     let _ = std::fs::remove_dir_all(&fork_dir);
-                    ProviderError::Unavailable(format!("create fork lock {}: {e}", path.display()))
-                })?;
-            // SAFETY: flock(2) on an owned fd.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = std::fs::remove_dir_all(&fork_dir);
-                return Err(ProviderError::Unavailable(format!(
-                    "flock {}: {error}",
-                    path.display()
-                )));
+                    return Err(ProviderError::Unavailable(format!(
+                        "create fork lock {}: {error}",
+                        path.display()
+                    )));
+                }
             }
-            file
         };
         let vmstate = checkpoint.join("vmstate");
         let mem = checkpoint.join("memory.bin");
@@ -2692,14 +2896,12 @@ impl ZeroBootSandbox {
         for _ in 0..2 {
             match restore_and_open(&config, &fork_dir).await {
                 Ok(sessions) => {
-                    let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
-                    restored.push(ZeroBootSandbox {
-                        config: Arc::clone(&config),
-                        pool: SessionPool::new(sessions),
-                        capabilities,
-                        snapshot_dir: Some(base.clone()),
-                        fork_checkpoint: Some(Arc::clone(&checkpoint_guard)),
-                    });
+                    restored.push(ZeroBootSandbox::from_pool(
+                        Arc::clone(&config),
+                        sessions,
+                        Some(base.clone()),
+                        Some(Arc::clone(&checkpoint_guard)),
+                    ));
                 }
                 Err(error) => {
                     return Err(ProviderError::Unavailable(format!(
@@ -2730,14 +2932,12 @@ impl ZeroBootSandbox {
     #[doc(hidden)]
     pub fn from_sessions_for_test(config: Config, sessions: Vec<ZeroBootSession>) -> Self {
         assert!(!sessions.is_empty(), "a sandbox needs at least one session");
-        let capabilities = capabilities_from_negotiated(sessions[0].negotiated());
-        Self {
-            config: Arc::new(config),
-            pool: SessionPool::new(sessions.into_iter().map(Arc::new).collect()),
-            capabilities,
-            snapshot_dir: None,
-            fork_checkpoint: None,
-        }
+        Self::from_pool(
+            Arc::new(config),
+            sessions.into_iter().map(Arc::new).collect(),
+            None,
+            None,
+        )
     }
 
     /// Test-only: OS process id of the backing Firecracker child.
@@ -2807,7 +3007,7 @@ impl Sandbox for ZeroBootSandbox {
                     .map_err(|e| SandboxError::Execution(e.to_string()))?;
                 // Claim a session for the whole command: concurrent execs run
                 // on separate connections instead of queueing.
-                let slot = self.pool.acquire().await;
+                let slot = self.pool.acquire().await.map_err(map_provider_error)?;
                 slot.session()
                     .exec(request)
                     .await
@@ -2825,19 +3025,16 @@ impl Sandbox for ZeroBootSandbox {
         Box::pin(async move {
             #[cfg(all(feature = "zeroboot", target_os = "linux"))]
             {
-                // Health intentionally stays on the primary session: the guest
+                // Health stays on the first still-alive session: the guest
                 // answers it directly off its runtime service (its workspace
                 // executor is untouched — see
                 // rfb-runtime/src/runtime_service/mod.rs `filesystem_rpc`),
                 // so a probe interleaves with an active turn instead of
                 // claiming a pool slot. Filesystem RPCs do NOT share that
                 // property and route through `SessionPool::acquire` instead.
-                check_supported(self.pool.primary(), Capability::Health)?;
-                self.pool
-                    .primary()
-                    .health()
-                    .await
-                    .map_err(map_session_error)
+                let session = self.pool.primary_alive();
+                check_supported(session, Capability::Health)?;
+                session.health().await.map_err(map_session_error)
             }
             #[cfg(not(all(feature = "zeroboot", target_os = "linux")))]
             {
@@ -2856,7 +3053,7 @@ impl Sandbox for ZeroBootSandbox {
             {
                 check_supported(self.pool.primary(), Capability::Stream)?;
                 let request = stream_to_execute(&spec, self.config.timeout)?;
-                let slot = self.pool.acquire().await;
+                let slot = self.pool.acquire().await.map_err(map_provider_error)?;
                 let session = Arc::clone(slot.session());
                 let mut stream = session.stream(request).await.map_err(map_session_error)?;
                 // The slot is held for as long as the stream occupies the

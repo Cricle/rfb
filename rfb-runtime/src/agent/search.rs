@@ -150,58 +150,19 @@ fn find_walk(
     max: usize,
     out: &mut Vec<String>,
 ) -> io::Result<bool> {
-    for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let p = e.path();
-        if out.len() >= max {
-            return Ok(true);
-        }
-        let name = e.file_name().to_string_lossy().to_string();
-        if if pat.contains('*') {
-            glob_matches(pat, &name)
-        } else {
-            name.contains(pat)
-        } {
-            out.push(
-                p.strip_prefix(root)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-        if e.file_type()?.is_dir() && find_walk(root, &p, pat, max, out)? {
-            return Ok(true);
-        }
-    }
-    Ok(out.len() >= max)
-}
-
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    // Glob matching is intentionally small and deterministic: `*` matches any
-    // sequence (including separators), while all other characters are literal.
-    let (mut pi, mut ti, mut star, mut mark) = (0usize, 0usize, None, 0usize);
-    let p = pattern.as_bytes();
-    let t = text.as_bytes();
-    while ti < t.len() {
-        if pi < p.len() && p[pi] == b'*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == t[ti] {
-            pi += 1;
-            ti += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p.len()
+    // Single find semantics across every transport/backend (PROTOCOL.md
+    // §2.5a): glob name matching — a pattern without `*` is a full-name exact
+    // match, never a substring contains(). The old literal→contains fallback
+    // over-matched ("note" hitting note.txt) and forked from the workspace
+    // executor's walk.
+    crate::glob::bounded_name_walk(
+        root,
+        dir,
+        &|name: &str| crate::glob::glob_matches(pat, name),
+        max,
+        false,
+        out,
+    )
 }
 
 /// Returns whether the walk stopped early because a cap was hit (the caller

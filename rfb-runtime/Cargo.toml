@@ -53,6 +53,12 @@ harness = false
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
+# The agent-token contract tests drive the real Rust guest client
+# (`rfb::forkd_guest::ForkdGuestClient`) against the in-process agent. The
+# feature set stops at "forkd" so this edge stays one-directional (rfb's
+# rfb-runtime dependency lives behind zeroboot/cli only).
+rfb = { workspace = true, features = ["forkd"] }
 
 [features]
 default = ["core"]

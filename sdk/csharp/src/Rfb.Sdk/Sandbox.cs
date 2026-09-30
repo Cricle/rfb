@@ -86,7 +86,8 @@ public sealed class Sandbox
             {
                 throw new ValidationException("stdin is only supported over the ZBRT transport");
             }
-            var v = await Guest.ExecAsync(cwd, args, ForkdGuestNdjson.TimeoutSecs(timeoutS)).ConfigureAwait(false);
+            var v = await Guest.ExecAsync(
+                cwd, args, ForkdGuestNdjson.TimeoutSecs(timeoutS), ExecReadBudget(timeoutS)).ConfigureAwait(false);
             return GuestResults.ParseExec(v);
         }
 
@@ -110,7 +111,9 @@ public sealed class Sandbox
 
         if (Transport == "ndjson")
         {
-            var v = await Guest.EvalAsync(code, cwd, timeoutS).ConfigureAwait(false);
+            var v = await Guest.EvalAsync(
+                code, cwd, timeoutS,
+                timeoutS.HasValue ? ExecReadBudget(timeoutS.Value) : null).ConfigureAwait(false);
             return GuestResults.ParseEval(v);
         }
 
@@ -335,6 +338,17 @@ public sealed class Sandbox
         {
             ["max_results"] = GuestValidation.MaxResults,
         });
+
+    /// <summary>Fixed margin on top of the exec read budget (Python <c>_guest.py</c> baseline).</summary>
+    private static readonly TimeSpan ExecReadMargin = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// NDJSON exec/eval read budget: client timeout + exec deadline + 5 s
+    /// (PROTOCOL.md §2.1, mirroring the Java <c>execReadBudget</c>) so the
+    /// guest's own timeout error surfaces instead of the client's.
+    /// </summary>
+    private TimeSpan ExecReadBudget(double execTimeoutS) =>
+        _timeout + TimeSpan.FromMilliseconds(Math.Ceiling(execTimeoutS * 1000.0)) + ExecReadMargin;
 
     // ZBRT deadlines are whole seconds ceil-ed (like NDJSON TimeoutSecs), then ×1000.
     private static uint TimeoutMs(double timeoutS)

@@ -30,6 +30,9 @@ public final class RfbClient {
     public static final String TRANSPORT_NDJSON = "ndjson";
     public static final String TRANSPORT_ZBRT = "zbrt";
 
+    /** Wait-loop ceiling (24h): nanos-conversion overflow protection. */
+    private static final double MAX_WAIT_TIMEOUT_S = 86_400;
+
     private final ControllerHttp controller;
     private final double timeoutS;
 
@@ -92,7 +95,11 @@ public final class RfbClient {
         if (Double.isNaN(timeoutS) || Double.isInfinite(timeoutS) || timeoutS <= 0) {
             throw new ValidationError("timeoutS must be a positive, finite number of seconds");
         }
-        long deadline = System.nanoTime() + (long) (timeoutS * 1_000_000_000L);
+        // Clamp BEFORE the nanos conversion: `timeoutS * 1e9` overflows long
+        // for huge inputs (unit mix-ups — ms passed as s), which would move
+        // the deadline into the past and fake an instant timeout.
+        long deadline = System.nanoTime()
+                + (long) (Math.min(timeoutS, MAX_WAIT_TIMEOUT_S) * 1_000_000_000L);
         while (true) {
             for (Snapshot s : controller.listSnapshots()) {
                 if (s.getTag().equals(tag)) {

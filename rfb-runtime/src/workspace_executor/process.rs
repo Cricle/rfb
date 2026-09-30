@@ -3,6 +3,7 @@
 use super::WorkspaceGuestExecutor;
 use crate::runtime_service::GuestEvent;
 use crate::session::{TerminalEvent, TerminalStream};
+use crate::utf8_boundary::Utf8ChunkDecoder;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -49,7 +50,7 @@ impl WorkspaceGuestExecutor {
             self.policy.workspace_path(cwd).map_err(|e| e.to_string())?;
             let result = crate::builtin::builtin_result(value, kind);
             let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
-            forward_chunk(&self.event_sink, 0, stdout.as_bytes());
+            forward_chunk(&self.event_sink, 0, stdout.to_owned());
             let exit_code = result.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
             return Ok(json!({
                 "stdout": stdout,
@@ -210,6 +211,9 @@ impl WorkspaceGuestExecutor {
             let mut data: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
             let mut done = [false; 2];
             let mut failure: [Option<String>; 2] = [None, None];
+            // One boundary-aware decoder per stream: a multi-byte character
+            // straddling a READ_CHUNK boundary must not be split into U+FFFD.
+            let mut decoders = [Utf8ChunkDecoder::new(), Utf8ChunkDecoder::new()];
             let mut buf = vec![0u8; READ_CHUNK];
             while !(done[0] && done[1]) {
                 if cancel.load(Ordering::SeqCst) {
@@ -255,6 +259,11 @@ impl WorkspaceGuestExecutor {
                     loop {
                         match pipes[index].read(&mut buf) {
                             Ok(0) => {
+                                // True EOF: emit any withheld partial sequence.
+                                let tail = decoders[index].flush();
+                                if !tail.is_empty() {
+                                    forward_chunk(&sinks[index], index as u8, tail);
+                                }
                                 done[index] = true;
                                 break;
                             }
@@ -264,6 +273,7 @@ impl WorkspaceGuestExecutor {
                                 capture_limit,
                                 &sinks[index],
                                 index as u8,
+                                &mut decoders[index],
                             ),
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -364,11 +374,15 @@ fn capture_with_threads(
     let stdout_sink = sinks[0].clone();
     let stderr_sink = sinks[1].clone();
     std::thread::spawn(move || {
-        let result = read_stream(stdout, 0, capture_limit, stdout_sink);
+        // One boundary-aware decoder per stream so a multi-byte character
+        // straddling a read boundary is not split into U+FFFD replacements.
+        let mut decoder = Utf8ChunkDecoder::new();
+        let result = read_stream(stdout, 0, capture_limit, stdout_sink, &mut decoder);
         let _ = tx.send((0, result));
     });
     std::thread::spawn(move || {
-        let result = read_stream(stderr, 1, capture_limit, stderr_sink);
+        let mut decoder = Utf8ChunkDecoder::new();
+        let result = read_stream(stderr, 1, capture_limit, stderr_sink, &mut decoder);
         let _ = stderr_tx.send((1, result));
     });
     let mut reader_results: [Option<std::io::Result<Vec<u8>>>; 2] = [None, None];
@@ -412,8 +426,9 @@ fn capture_with_threads(
     }
 }
 
-/// Forward one chunk to a live consumer when the transport attached one.
-fn forward_chunk(sink: &Option<Sink>, stream: u8, chunk: &[u8]) {
+/// Forward one decoded chunk to a live consumer when the transport attached
+/// one.
+fn forward_chunk(sink: &Option<Sink>, stream: u8, text: String) {
     if let Some(sink) = sink {
         let terminal = TerminalEvent {
             stream: if stream == 0 {
@@ -421,27 +436,31 @@ fn forward_chunk(sink: &Option<Sink>, stream: u8, chunk: &[u8]) {
             } else {
                 TerminalStream::Stderr
             },
-            data: String::from_utf8_lossy(chunk).into_owned(),
+            data: text,
         };
         let payload = serde_json::to_vec(&terminal).unwrap_or_default();
         sink(GuestEvent::new("terminal.output", payload));
     }
 }
 
-/// One chunk of a child stream: capture it under the byte limit and forward it
-/// to a live consumer.
+/// One chunk of a child stream: capture it under the byte limit and forward
+/// the boundary-safe decoded text to a live consumer.
 fn capture_chunk(
     data: &mut Vec<u8>,
     chunk: &[u8],
     capture_limit: usize,
     sink: &Option<Sink>,
     stream: u8,
+    decoder: &mut Utf8ChunkDecoder,
 ) {
     if data.len() < capture_limit {
         let take = (capture_limit - data.len()).min(chunk.len());
         data.extend_from_slice(&chunk[..take]);
     }
-    forward_chunk(sink, stream, chunk);
+    // A multi-byte character straddling a read boundary must not be split
+    // into U+FFFD replacements: the decoder withholds an incomplete trailing
+    // sequence and joins it with the next chunk.
+    forward_chunk(sink, stream, decoder.decode(chunk));
 }
 
 /// Minimal surface the Unix capture loop needs from a child pipe.
@@ -464,15 +483,21 @@ fn read_stream(
     stream: u8,
     capture_limit: usize,
     sink: Option<Sink>,
+    decoder: &mut Utf8ChunkDecoder,
 ) -> std::io::Result<Vec<u8>> {
     let mut data = Vec::new();
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
+            // True EOF: emit any withheld partial sequence.
+            let tail = decoder.flush();
+            if !tail.is_empty() {
+                forward_chunk(&sink, stream, tail);
+            }
             break;
         }
-        capture_chunk(&mut data, &buf[..n], capture_limit, &sink, stream);
+        capture_chunk(&mut data, &buf[..n], capture_limit, &sink, stream, decoder);
     }
     Ok(data)
 }

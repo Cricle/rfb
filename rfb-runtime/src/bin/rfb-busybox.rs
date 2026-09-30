@@ -126,7 +126,14 @@ mod imp {
                     }
                     i += 1;
                 }
-                '#' if current.trim().is_empty() => {
+                // Inline comment: `#` starts a comment at line start or after
+                // whitespace (POSIX), but never inside a word (`a#b` is a
+                // literal word) and this lexer has no in-word quoting state
+                // here — quoted content is already in `current` verbatim.
+                '#' if current.trim().is_empty()
+                    || current.ends_with(' ')
+                    || current.ends_with('\t') =>
+                {
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
@@ -745,7 +752,17 @@ mod imp {
             return Err("internal: duplicate target is not a path".into());
         };
         if path == "/dev/null" {
-            return Ok(None);
+            // A real /dev/null fd (read+write: reads give EOF, writes
+            // discard). It must NOT be the `None` sentinel — in build_stdio's
+            // slots `None` means "no redirection", and conflating the two
+            // silently inherited the parent fd instead of discarding
+            // (`cmd > /dev/null 2>&1` leaked both streams).
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .map_err(|error| format!("/dev/null: {error}"))?;
+            return Ok(Some(Chan::File(file)));
         }
         let result = match redir.mode {
             RedirMode::Read => File::open(path),

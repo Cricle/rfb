@@ -124,6 +124,11 @@ where
 
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerMessage>(WORKER_CHANNEL_CAPACITY);
     let mut worker_active = false;
+    // The in-flight turn's worker handle: a panic kills the worker WITHOUT
+    // ever sending on the worker channel, so the channel alone cannot detect
+    // it while this connection lives — the join result is the online panic
+    // detector (same design as the RFB1 framed connection).
+    let mut worker_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut active_id: Option<[u8; 16]> = None;
     let mut requests: HashMap<[u8; 16], RequestEntry> = HashMap::new();
     // Insertion order of terminated entries, for oldest-first eviction past
@@ -156,6 +161,7 @@ where
 
     let io_result = loop {
         tokio::select! {
+            biased;
             message = worker_rx.recv(), if worker_active => {
                 match message {
                     Some(WorkerMessage::Output { request_id, event }) => {
@@ -172,6 +178,7 @@ where
                     }
                     Some(WorkerMessage::Terminal((request_id, session_id, request_id_str, result, executor))) => {
                         worker_active = false;
+                        worker_handle = None;
                         active_id = None;
                         let responses = {
                             let mut runtime = service.lock().await;
@@ -193,6 +200,51 @@ where
                         }
                     }
                     None => break Ok(()),
+                }
+            }
+            // Panic detector: the worker died without ever sending its
+            // terminal result. (Biased after the worker branch: a delivery
+            // always wins over the join notification racing it — the worker
+            // sends before it exits, so a finished worker's Terminal is
+            // already queued when this branch is polled.)
+            joined = async {
+                match worker_handle.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            }, if worker_active => {
+                match joined {
+                    // Panic: the executor can never come back, and the worker
+                    // will never send the terminal that clears `worker_active`
+                    // — the connection (and, with the shared workspace
+                    // executor gone, every later FS RPC) would report "turn in
+                    // progress" forever. Abandon the in-flight turn
+                    // bookkeeping and fail THIS request closed with an Error
+                    // frame; the connection itself stays usable.
+                    Err(_) => {
+                        worker_active = false;
+                        worker_handle = None;
+                        let responses = {
+                            let mut runtime = service.lock().await;
+                            runtime.abandon_active_turn()
+                        };
+                        let frame = active_id
+                            .take()
+                            .and_then(|id| terminal_frame(id, &responses));
+                        if let Some(frame) = frame {
+                            if let Err(error) = write_frame_async(&mut writer, &frame).await {
+                                break Err(error);
+                            }
+                        }
+                    }
+                    // The worker finished normally; its Terminal delivery is
+                    // queued (or the delivery already won the race and cleared
+                    // the handle). The receiver lives in this loop, so the
+                    // delivery cannot have failed: the worker branch above
+                    // consumes it. Only retire the join handle.
+                    Ok(()) => {
+                        worker_handle = None;
+                    }
                 }
             }
             frame = frame_rx.recv() => {
@@ -239,7 +291,12 @@ where
                         )
                         .await
                         {
-                            Ok(reply) => reply,
+                            Ok((reply, handle)) => {
+                                if let Some(handle) = handle {
+                                    worker_handle = Some(handle);
+                                }
+                                reply
+                            }
                             Err(error) => break Err(error),
                         }
                     }
@@ -385,27 +442,30 @@ async fn handle_execute(
     worker_active: &mut bool,
     active_id: &mut Option<[u8; 16]>,
     requests: &mut HashMap<[u8; 16], RequestEntry>,
-) -> io::Result<Option<Frame>> {
+) -> io::Result<(Option<Frame>, Option<tokio::task::JoinHandle<()>>)> {
     let exec = match Execute::decode(payload) {
         Ok(exec) => exec,
         Err(_) => {
-            return Ok(Some(fail_closed_error(
-                request_id,
-                "invalid Execute payload",
-            )))
+            return Ok((
+                Some(fail_closed_error(request_id, "invalid Execute payload")),
+                None,
+            ))
         }
     };
     if exec.argv.is_empty() {
-        return Ok(Some(fail_closed_error(request_id, "argv is empty")));
+        return Ok((Some(fail_closed_error(request_id, "argv is empty")), None));
     }
     if *worker_active {
-        return Ok(Some(fail_closed_error(
-            request_id,
-            "a turn is already active",
-        )));
+        return Ok((
+            Some(fail_closed_error(request_id, "a turn is already active")),
+            None,
+        ));
     }
     if requests.contains_key(&request_id) {
-        return Ok(Some(fail_closed_error(request_id, "duplicate request id")));
+        return Ok((
+            Some(fail_closed_error(request_id, "duplicate request id")),
+            None,
+        ));
     }
     let turn = execute_to_turn(request_id, exec);
     let request_id_str = turn.request_id.clone();
@@ -413,7 +473,9 @@ async fn handle_execute(
         let mut runtime = service.lock().await;
         match runtime.spawn_turn(&turn) {
             Ok(executor) => executor,
-            Err(message) => return Ok(Some(runtime_error_to_frame(request_id, message))),
+            Err(message) => {
+                return Ok((Some(runtime_error_to_frame(request_id, message)), None));
+            }
         }
     };
     // Attach a live output sink that queues into the same ordered worker
@@ -452,7 +514,10 @@ async fn handle_execute(
         },
     );
     let tx = worker_tx.clone();
-    tokio::task::spawn_blocking(move || {
+    // Keep the handle in the serve loop: it is the panic detector for this
+    // worker (a panic never delivers a Terminal, so the channel alone cannot
+    // clear `worker_active`).
+    let handle = tokio::task::spawn_blocking(move || {
         let result = executor.start_turn(&turn);
         if tx
             .blocking_send(WorkerMessage::Terminal((
@@ -469,7 +534,7 @@ async fn handle_execute(
     });
     *worker_active = true;
     *active_id = Some(request_id);
-    Ok(None)
+    Ok((None, Some(handle)))
 }
 
 async fn handle_fs(

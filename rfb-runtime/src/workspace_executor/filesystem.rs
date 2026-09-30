@@ -98,18 +98,38 @@ impl WorkspaceGuestExecutor {
                 used
             }
         };
-        let projected = used
-            .saturating_sub(existing)
-            .saturating_add(request.content.len() as u64);
+        // Append grows the file by exactly the written bytes (the previous
+        // content stays), so nothing is subtracted from the shared total.
+        let projected = if request.append {
+            used.saturating_add(request.content.len() as u64)
+        } else {
+            used.saturating_sub(existing)
+                .saturating_add(request.content.len() as u64)
+        };
         if projected > self.limits.max_workspace_bytes {
             return Err("workspace exceeds max_workspace_bytes".into());
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        // Temp file + rename so a crash mid-write leaves the previous content
-        // intact instead of a truncated file (same directory = one filesystem).
-        write_atomic(&path, &request.content).map_err(|e| e.to_string())?;
+        if request.append {
+            // Append in place (create when missing). A crash mid-append may
+            // leave a partial tail — that is the POSIX append semantics the
+            // caller asked for, not the atomic-replace contract of the
+            // truncate path.
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            file.write_all(&request.content)
+                .map_err(|e| e.to_string())?;
+        } else {
+            // Temp file + rename so a crash mid-write leaves the previous
+            // content intact instead of a truncated file (same directory =
+            // one filesystem).
+            write_atomic(&path, &request.content).map_err(|e| e.to_string())?;
+        }
         // The size cache is shared per workspace root and this guard is held
         // across the write, so no other executor (including one on another
         // pooled connection) could have mutated the workspace in between: the

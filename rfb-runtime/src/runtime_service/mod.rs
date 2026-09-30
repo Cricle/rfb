@@ -162,7 +162,9 @@ impl RuntimeService {
         match request {
             ControlMessage::Hello { protocol_version } => {
                 if protocol_version != 1 {
-                    self.protocol_ready = false;
+                    // Error this connection only: one bad Hello (a probe, a
+                    // buggy secondary client) must not demote the shared
+                    // handshake state and strand every healthy connection.
                     vec![RuntimeMessage::Error {
                         request_id: String::new(),
                         message: format!("unsupported protocol version: {protocol_version}"),
@@ -307,8 +309,9 @@ impl RuntimeService {
             None => {
                 return Err(RuntimeMessage::Error {
                     request_id: turn.request_id.clone(),
-                    message: "runtime executor is unavailable: a previous turn was lost and \
-                              could not be restored; restart the runtime"
+                    message: "a previous turn is still finishing (its client \
+                              disconnected); retry shortly, or restart the runtime \
+                              if this message persists"
                         .into(),
                 })
             }
@@ -319,6 +322,37 @@ impl RuntimeService {
         self.active_sessions
             .insert(turn.session_id.clone(), turn.request_id.clone());
         Ok(executor)
+    }
+
+    /// Replay a cached terminal response for a repeated StartTurn (at-least-
+    /// once redelivery after a lost response). Completed turns replay their
+    /// recorded events; cancelled turns replay the cancel terminal; evicted
+    /// results get their explicit rejection. `None` = not a replay, proceed
+    /// with a fresh claim.
+    pub fn replay_cached_turn(&mut self, turn: &SessionRequest) -> Option<Vec<RuntimeMessage>> {
+        if let Some(error) = validate_identity(&turn.session_id, &turn.request_id) {
+            return Some(vec![error]);
+        }
+        let key = (turn.session_id.clone(), turn.request_id.clone());
+        if let Some(previous) = self.completed_requests.get(&key) {
+            return Some(previous.clone());
+        }
+        if self.evicted_requests.contains(&key) {
+            return Some(vec![Self::evicted_replay_error(&turn.request_id)]);
+        }
+        if let Some(previous) = self.cancelled_sessions.get(&key) {
+            return Some(if previous.is_empty() {
+                vec![RuntimeMessage::Event(SessionEvent {
+                    session_id: turn.session_id.clone(),
+                    sequence: self.next(),
+                    kind: "turn.cancelled".into(),
+                    payload: Vec::new(),
+                })]
+            } else {
+                previous.clone()
+            });
+        }
+        None
     }
 
     /// Cancel an in-flight turn from the reader loop. Identity is validated

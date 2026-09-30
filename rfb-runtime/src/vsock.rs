@@ -12,11 +12,22 @@ pub const DEFAULT_PORT: u32 = 5000;
 
 /// Validate the production RFB1 guest endpoint.
 ///
+/// The port is the published wire contract (5000) — EXCEPT under
+/// `cfg(debug_assertions)` with `RFB_RUNTIME_DEV_VSOCK_PORT`, whose whole
+/// purpose is a dev-machine port override; rejecting it here made the knob
+/// self-defeating (set it and the runtime fails to start).
+///
 /// # Errors
 ///
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub fn validate_endpoint(_cid: u32, port: u32) -> io::Result<()> {
-    if port != DEFAULT_PORT {
+    let allowed = port == DEFAULT_PORT
+        || (cfg!(debug_assertions)
+            && std::env::var("RFB_RUNTIME_DEV_VSOCK_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some_and(|dev| dev == port));
+    if !allowed {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("RFB1 vsock port must be {DEFAULT_PORT}"),

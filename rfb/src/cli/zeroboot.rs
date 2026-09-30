@@ -12,13 +12,10 @@ use crate::cli::host::detect;
 use crate::cli::image_build::sha256;
 use crate::cli::rfb1::{boot_firecracker_with, connect_vsock_uds, BootOptions};
 use crate::cli::tool::HostKind;
-use crate::protocol::{
-    Error as ProtocolError, Execute, Frame, Hello, HelloAck, Kind, Output, ZBRT_V1_CAPABILITIES,
-};
+use crate::protocol::{Error as ProtocolError, Execute, Frame, HelloAck, Kind, Output};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Read,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::Child,
@@ -132,10 +129,6 @@ pub struct ZerobootVerifyArgs {
     pub bench: bool,
 }
 
-fn readable_file(path: &Path) -> bool {
-    path.is_file() && fs::File::open(path).is_ok()
-}
-
 /// Top-level dispatch for the zeroboot subcommands. Lives here (not in
 /// `cli/dispatch.rs`) so the whole zeroboot command surface — types, match,
 /// and implementations — is one deletable unit for the forkd-only build.
@@ -202,58 +195,30 @@ fn connect(uds: &Path, port: u16) -> Result<UnixStream, CliError> {
     connect_vsock_uds(uds, port, Duration::from_secs(5))
 }
 
-fn read_exact(stream: &mut UnixStream, n: usize) -> Result<Vec<u8>, CliError> {
-    let mut data = vec![0u8; n];
-    stream
-        .read_exact(&mut data)
-        .map_err(|error| external(format!("vsock EOF after {n} bytes: {error}")))?;
-    Ok(data)
-}
-
-/// Read one response payload after validating its wire-declared length. The
-/// length field is attacker-controlled, so it is capped at the protocol's
-/// `MAX_PAYLOAD` before allocation; anything larger fails closed instead of
-/// materializing up to a 4 GiB buffer.
-fn read_payload(stream: &mut UnixStream, len: usize) -> Result<Vec<u8>, CliError> {
-    if len > crate::protocol::MAX_PAYLOAD {
-        return Err(validation(format!(
-            "ZBRT payload length {len} exceeds MAX_PAYLOAD {}",
-            crate::protocol::MAX_PAYLOAD
-        )));
-    }
-    read_exact(stream, len)
-}
-
-/// Decode a ZBRT response frame header + payload, validating magic/version and
-/// echoing the request_id back (proving no cross-talk between connections).
-fn decode_response(
-    header: &[u8],
-    payload: Vec<u8>,
+/// Read one response frame and validate magic/version (via the shared
+/// single-source decoder) plus the echoed request_id, proving no cross-talk
+/// between connections. The wire-declared payload length is attacker
+/// controlled, so it is capped at the protocol's `MAX_PAYLOAD` by the decoder
+/// before allocation.
+fn read_response(
+    stream: &mut UnixStream,
     request_id: [u8; 16],
+    name: &str,
 ) -> Result<(Kind, Vec<u8>), CliError> {
-    if header.len() < crate::protocol::HEADER_LEN
-        || header[0..4] != crate::protocol::MAGIC
-        || header[4] != crate::protocol::VERSION
-    {
+    let frame = crate::protocol::read_frame_sync(stream).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            validation(format!("{name}: invalid ZBRT frame: {error}"))
+        } else {
+            external(format!("{name}: vsock read: {error}"))
+        }
+    })?;
+    if frame.request_id != request_id {
         return Err(validation(format!(
-            "bad ZBRT magic/version: {:?}",
-            &header[..header.len().min(8)]
+            "{name}: request_id mismatch: got {:?} expected {request_id:?}",
+            frame.request_id
         )));
     }
-    let got_rid: [u8; 16] = header[8..24]
-        .try_into()
-        .map_err(|_| validation("invalid request_id length"))?;
-    if got_rid != request_id {
-        return Err(validation(format!(
-            "request_id mismatch: got {got_rid:?} expected {request_id:?}"
-        )));
-    }
-    let kind_byte = header[5];
-    // Single-sourced kind table (rfb-runtime zeroboot_protocol); unknown
-    // bytes fail closed here.
-    let kind = crate::protocol::Kind::parse(kind_byte)
-        .map_err(|error| validation(format!("unknown ZBRT kind: {kind_byte}: {error}")))?;
-    Ok((kind, payload))
+    Ok((frame.kind, frame.payload))
 }
 
 /// Mandatory ZBRT handshake on a fresh connection (PROTOCOL.md §3.4): the
@@ -261,30 +226,13 @@ fn decode_response(
 /// required")`, so each raw client sends Hello and requires the matching
 /// HelloAck before any business frame.
 fn handshake(stream: &mut UnixStream, name: &str) -> Result<(), CliError> {
-    let mut request_id = [0u8; 16];
-    let label = format!("{name}:hello").into_bytes();
-    request_id[..label.len().min(16)].copy_from_slice(&label[..label.len().min(16)]);
-    let hello = Frame {
-        kind: Kind::Hello,
-        flags: 0,
-        request_id,
-        payload: Hello {
-            client: "rfb-cli".to_owned(),
-            capabilities: ZBRT_V1_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-        }
-        .encode()
-        .map_err(|error| external(format!("{name}: encode Hello: {error}")))?,
-    };
+    let request_id = request_id_from_name(&format!("{name}:hello"));
+    let hello = crate::protocol::hello_frame("rfb-cli", request_id)
+        .map_err(|error| external(format!("{name}: encode Hello: {error}")))?;
     hello
         .encode(&mut *stream)
         .map_err(|error| external(format!("{name}: write Hello: {error}")))?;
-    let header = read_exact(stream, crate::protocol::HEADER_LEN)?;
-    let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-    let payload = read_payload(stream, len)?;
-    let (kind, payload) = decode_response(&header, payload, request_id)?;
+    let (kind, payload) = read_response(stream, request_id, name)?;
     if kind != Kind::HelloAck {
         return Err(validation(format!(
             "{name}: expected HelloAck, got {kind:?}"
@@ -293,6 +241,15 @@ fn handshake(stream: &mut UnixStream, name: &str) -> Result<(), CliError> {
     HelloAck::decode(&payload)
         .map_err(|error| validation(format!("{name}: invalid HelloAck: {error}")))?;
     Ok(())
+}
+
+/// Derive a request_id by padding the check name (or `name`-derived label)
+/// into the 16-byte field — the convention every raw verify client shares.
+fn request_id_from_name(name: &str) -> [u8; 16] {
+    let mut request_id = [0u8; 16];
+    let bytes = name.as_bytes();
+    request_id[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
+    request_id
 }
 
 /// One ZBRT exchange on a fresh vsock connection. `code` is the guest command;
@@ -305,9 +262,7 @@ fn exchange(
     code: &[u8],
     deadline_ms: u32,
 ) -> Result<(Kind, Vec<u8>), CliError> {
-    let mut request_id = [0u8; 16];
-    let name_bytes = name.as_bytes();
-    request_id[..name_bytes.len().min(16)].copy_from_slice(&name_bytes[..name_bytes.len().min(16)]);
+    let request_id = request_id_from_name(name);
 
     let command = std::str::from_utf8(code)
         .map_err(|_| validation(format!("{name}: command is not UTF-8")))?;
@@ -340,10 +295,7 @@ fn exchange(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     loop {
-        let header = read_exact(&mut stream, crate::protocol::HEADER_LEN)?;
-        let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let payload = read_payload(&mut stream, len)?;
-        let (kind, payload) = decode_response(&header, payload, request_id)?;
+        let (kind, payload) = read_response(&mut stream, request_id, name)?;
         match kind {
             Kind::Output => {
                 let output = Output::decode(&payload)
@@ -401,6 +353,24 @@ fn parse_result(payload: &[u8], name: &str) -> Result<(i32, Vec<u8>, Vec<u8>), C
         .map_err(|error| validation(format!("{name}: {error}")))
 }
 
+/// One boilerplate verify exchange: run the exchange, require a `Result`
+/// frame (`{name}: expected Result kind`), and decode the legacy result.
+/// Callers keep their own exit/stdout/stderr assertions and push their
+/// `{name, ok}` entry into `checks` (extra fields like `round_trip_ms` and
+/// custom transports like the concurrent threads stay handwritten).
+fn run_check(
+    uds: &Path,
+    port: u16,
+    name: &str,
+    code: &[u8],
+) -> Result<(i32, Vec<u8>, Vec<u8>), CliError> {
+    let (kind, payload) = exchange(uds, port, name, code, 3000)?;
+    if kind != Kind::Result {
+        return Err(validation(format!("{name}: expected Result kind")));
+    }
+    parse_result(&payload, name)
+}
+
 /// Full ZBRT acceptance: echo/true/false, unsupported error, bounded deadline,
 /// 8 concurrent connections, malformed Execute, and optional 100-sample bench.
 /// Boots a real Firecracker VM (KVM) and never touches external state.
@@ -425,7 +395,9 @@ pub fn verify(
         }
         return Ok(json!({"status": "skipped", "reason": "Linux/KVM unavailable"}));
     }
-    if !readable_file(kernel) || !readable_file(rootfs) {
+    if !crate::cli::image_build::readable_file(kernel)
+        || !crate::cli::image_build::readable_file(rootfs)
+    {
         return Err(validation(
             "kernel and rootfs must be readable files; use image build-rootfs --mode zeroboot-zbrt",
         ));
@@ -437,66 +409,33 @@ pub fn verify(
     }
 
     // Validate the ZeroBoot rootfs contract before starting a VM. This is
-    // deliberately read-only and rejects legacy RFB1/forkd artifacts.
-    let init = std::process::Command::new("debugfs")
-        .args(["-R", "stat /init"])
-        .arg(rootfs)
-        .output()
-        .map_err(|error| external(format!("debugfs preflight failed: {error}")))?;
-    let init_text = String::from_utf8_lossy(&init.stdout);
-    if !init.status.success()
-        || !init_text.contains("Type:")
-        || !init_text.contains("regular")
-        || !(init_text.contains("0755") || init_text.contains("-rwxr-xr-x"))
-    {
+    // deliberately read-only and rejects legacy RFB1/forkd artifacts. All
+    // inspection goes through the shared run_debugfs wrapper (image_build).
+    let debugfs = |request: &str| crate::cli::image_build::run_debugfs(rootfs, request, true);
+    let init_stat = debugfs("stat /init")
+        .map_err(|error| validation(format!("ZeroBoot rootfs /init: {}", error.message)))?;
+    if !crate::cli::image_build::stat_is_executable_regular(&String::from_utf8_lossy(&init_stat)) {
         return Err(validation("ZeroBoot rootfs must contain executable regular /init; use image build-rootfs --mode zeroboot-zbrt"));
     }
-    for marker in [
-        "/etc/zeroboot-protocol",
-        "/etc/zeroboot-protocol-version",
-        "/etc/zeroboot-capabilities",
-        "/etc/zeroboot-guest-port",
-    ] {
-        let check = std::process::Command::new("debugfs")
-            .args(["-R", &format!("stat {marker}")])
-            .arg(rootfs)
-            .output()
-            .map_err(|error| external(format!("debugfs preflight failed: {error}")))?;
-        if !check.status.success() {
-            return Err(validation(format!(
-                "ZeroBoot rootfs is missing {marker}; use image build-rootfs --mode zeroboot-zbrt"
-            )));
-        }
-    }
-    let protocol_marker = std::process::Command::new("debugfs")
-        .args(["-R", "cat /etc/zeroboot-protocol"])
-        .arg(rootfs)
-        .output()
-        .map_err(|error| external(error.to_string()))?;
-    let version_marker = std::process::Command::new("debugfs")
-        .args(["-R", "cat /etc/zeroboot-protocol-version"])
-        .arg(rootfs)
-        .output()
-        .map_err(|error| external(error.to_string()))?;
-    let capabilities_marker = std::process::Command::new("debugfs")
-        .args(["-R", "cat /etc/zeroboot-capabilities"])
-        .arg(rootfs)
-        .output()
-        .map_err(|error| external(error.to_string()))?;
-    let guest_port = std::process::Command::new("debugfs")
-        .args(["-R", "cat /etc/zeroboot-guest-port"])
-        .arg(rootfs)
-        .output()
-        .map_err(|error| external(error.to_string()))?;
-    if !protocol_marker.status.success()
-        || String::from_utf8_lossy(&protocol_marker.stdout).trim() != "zbrt"
-        || !version_marker.status.success()
-        || String::from_utf8_lossy(&version_marker.stdout).trim() != "1"
-        || !capabilities_marker.status.success()
-        || String::from_utf8_lossy(&capabilities_marker.stdout).trim()
-            != crate::protocol::ZBRT_V1_CAPABILITIES.join(",")
-        || !guest_port.status.success()
-        || String::from_utf8_lossy(&guest_port.stdout).trim() != "5000"
+    // Read the four contract markers via the shared debugfs reader; each
+    // call site keeps its own missing-marker wording.
+    let missing = |marker: &str| {
+        validation(format!(
+            "ZeroBoot rootfs is missing {marker}; use image build-rootfs --mode zeroboot-zbrt"
+        ))
+    };
+    let [protocol, version, capabilities, guest_port] =
+        crate::cli::image_build::read_zbrt_markers(rootfs);
+    let markers = [
+        protocol.map_err(|_| missing("/etc/zeroboot-protocol"))?,
+        version.map_err(|_| missing("/etc/zeroboot-protocol-version"))?,
+        capabilities.map_err(|_| missing("/etc/zeroboot-capabilities"))?,
+        guest_port.map_err(|_| missing("/etc/zeroboot-guest-port"))?,
+    ];
+    if markers[0] != "zbrt"
+        || markers[1] != "1"
+        || markers[2] != crate::protocol::ZBRT_V1_CAPABILITIES.join(",")
+        || markers[3] != "5000"
     {
         return Err(validation("ZeroBoot rootfs marker/guest port is invalid; use image build-rootfs --mode zeroboot-zbrt"));
     }
@@ -539,11 +478,7 @@ pub fn verify(
         let mut checks = Vec::new();
 
         // echo hello -> exit 0, stdout "hello\n"
-        let (kind, payload) = exchange(&uds, DEFAULT_PORT, "echo", b"echo hello", 3000)?;
-        if kind != Kind::Result {
-            return Err(validation("echo: expected Result kind"));
-        }
-        let (exit, stdout, stderr) = parse_result(&payload, "echo")?;
+        let (exit, stdout, stderr) = run_check(&uds, DEFAULT_PORT, "echo", b"echo hello")?;
         if exit != 0 || stdout != b"hello\n" || !stderr.is_empty() {
             return Err(validation(format!(
                 "echo: exit={exit} stdout={stdout:?} stderr={stderr:?}"
@@ -556,11 +491,7 @@ pub fn verify(
             ("true", b"true".as_slice(), 0i32),
             ("false", b"false".as_slice(), 1i32),
         ] {
-            let (kind, payload) = exchange(&uds, DEFAULT_PORT, name, code, 3000)?;
-            if kind != Kind::Result {
-                return Err(validation(format!("{name}: expected Result kind")));
-            }
-            let (exit, _, _) = parse_result(&payload, name)?;
+            let (exit, _, _) = run_check(&uds, DEFAULT_PORT, name, code)?;
             if exit != expected {
                 return Err(validation(format!(
                     "{name}: exit={exit} expected {expected}"
@@ -570,11 +501,7 @@ pub fn verify(
         }
 
         // unsupported command -> non-zero exit on the guest runtime
-        let (kind, payload) = exchange(&uds, DEFAULT_PORT, "unsupported", b"not-a-command", 3000)?;
-        if kind != Kind::Result {
-            return Err(validation("unsupported: expected Result kind"));
-        }
-        let (exit, _, _) = parse_result(&payload, "unsupported")?;
+        let (exit, _, _) = run_check(&uds, DEFAULT_PORT, "unsupported", b"not-a-command")?;
         if exit != -1 {
             return Err(validation(format!("unsupported: exit={exit} expected -1")));
         }
@@ -582,11 +509,7 @@ pub fn verify(
 
         // bounded deadline: echo must round-trip within 5s wall clock
         let started = Instant::now();
-        let (kind, _payload) =
-            exchange(&uds, DEFAULT_PORT, "deadline-echo", b"echo bounded", 3000)?;
-        if kind != Kind::Result {
-            return Err(validation("deadline-echo: expected Result kind"));
-        }
+        run_check(&uds, DEFAULT_PORT, "deadline-echo", b"echo bounded")?;
         let elapsed = started.elapsed();
         if elapsed > Duration::from_secs(5) {
             return Err(validation(format!(
@@ -639,8 +562,7 @@ pub fn verify(
         // guest's strict decoder, not the handshake guard, rejects it)
         let mut stream = connect(&uds, DEFAULT_PORT)?;
         handshake(&mut stream, "malformed")?;
-        let mut rid = [0u8; 16];
-        rid[..9].copy_from_slice(b"malformed");
+        let rid = request_id_from_name("malformed");
         let malformed = Frame {
             kind: Kind::Execute,
             flags: 0,
@@ -650,10 +572,8 @@ pub fn verify(
         malformed
             .encode(&mut stream)
             .map_err(|error| external(format!("write malformed frame: {error}")))?;
-        let header = read_exact(&mut stream, crate::protocol::HEADER_LEN)?;
-        let len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let payload = read_payload(&mut stream, len)?;
-        if header[5] != Kind::Error as u8 {
+        let (kind, payload) = read_response(&mut stream, rid, "malformed")?;
+        if kind != Kind::Error {
             return Err(validation("malformed: expected Error frame"));
         }
         checks.push(json!({"name": "malformed_execute", "ok": true, "error_payload": payload}));
@@ -692,20 +612,18 @@ pub fn verify(
                 )));
             }
             samples.sort_unstable();
-            let p = |q: f64| {
-                let idx = (samples.len() as f64 - 1.0) * q;
-                let lo = idx.floor() as usize;
-                let hi = (idx.ceil() as usize).min(samples.len() - 1);
-                samples[lo] as f64 + (samples[hi] as f64 - samples[lo] as f64) * (idx - idx.floor())
+            let ms = |q: f64| {
+                crate::cli::report::quantile_ns(&samples, q)
+                    .map(|ns| (ns / 1e6 * 1000.0).round() / 1000.0)
             };
             bench_stats = json!({
                 "samples": samples.len(),
                 "attempts": attempts,
                 "timeouts": timeouts,
                 "success_rate_pct": 100.0 * samples.len() as f64 / attempts as f64,
-                "p50_ms": (p(0.50) / 1e6 * 1000.0).round() / 1000.0,
-                "p95_ms": (p(0.95) / 1e6 * 1000.0).round() / 1000.0,
-                "p99_ms": (p(0.99) / 1e6 * 1000.0).round() / 1000.0,
+                "p50_ms": ms(0.50),
+                "p95_ms": ms(0.95),
+                "p99_ms": ms(0.99),
                 "max_ms": (samples[samples.len() - 1] as f64 / 1e6 * 1000.0).round() / 1000.0,
             });
         }
@@ -727,7 +645,6 @@ pub fn verify(
     result
 }
 
-/// Keep one ZeroBoot sandbox VM running and bridge its ZBRT guest port to a
 /// Keep ZeroBoot sandbox VMs running and bridge each guest's ZBRT port to its
 /// own local TCP listener (`--n N`: N VMs, cid and TCP port increment per
 /// instance). Every TCP connection is proxied to a fresh Firecracker
@@ -743,19 +660,16 @@ pub fn verify(
 ///
 /// Returns `Err` when any stage fails.
 pub fn up(args: &crate::cli::zeroboot::ZerobootUpArgs) -> Result<Value, CliError> {
-    let caps = detect();
-    let linux = matches!(caps.kind, HostKind::Linux | HostKind::Wsl);
-    if !linux || !caps.kvm {
-        return Err(crate::cli::error::no_vm(
-            "Linux/KVM are required for zeroboot up",
-        ));
-    }
+    // Argument-level validation first (KVM-free, mirrors forkd backend-up:
+    // bad arguments must fail with their own message even on hosts without
+    // KVM, before any environment gate fires).
     if args.n == 0 {
         return Err(validation("--n must be positive"));
     }
-    let (rootfs, rootfs_source) = match (&args.rootfs, &args.pid1_dir) {
-        (Some(rootfs), None) => (rootfs.clone(), "provided".to_owned()),
-        (None, Some(dir)) => {
+    let (rootfs, rootfs_source) = crate::cli::image_build::resolve_rootfs_source(
+        args.rootfs.as_deref(),
+        args.pid1_dir.as_deref(),
+        |dir| {
             let built = dir.join("zeroboot-sandbox.ext4");
             crate::cli::image_build::build_rootfs(
                 &dir.join("rfb-runtime"),
@@ -772,21 +686,17 @@ pub fn up(args: &crate::cli::zeroboot::ZerobootUpArgs) -> Result<Value, CliError
                     extra_files: Vec::new(),
                 },
             )?;
-            (built, "built from pid1".to_owned())
-        }
-        (Some(_), Some(_)) => {
-            return Err(validation("--rootfs and --pid1-dir are mutually exclusive"))
-        }
-        (None, None) => return Err(validation("one of --rootfs or --pid1-dir is required")),
-    };
-    if !readable_file(&rootfs) {
-        return Err(validation(format!("rootfs missing: {}", rootfs.display())));
-    }
-    if !readable_file(&args.kernel) {
-        return Err(validation(format!(
-            "kernel missing: {}",
-            args.kernel.display()
-        )));
+            Ok(built)
+        },
+    )?;
+    crate::cli::image_build::require_readable(&rootfs, "rootfs")?;
+    crate::cli::image_build::require_readable(&args.kernel, "kernel")?;
+    let caps = detect();
+    let linux = matches!(caps.kind, HostKind::Linux | HostKind::Wsl);
+    if !linux || !caps.kvm {
+        return Err(crate::cli::error::no_vm(
+            "Linux/KVM are required for zeroboot up",
+        ));
     }
 
     /// One sandbox: its VM child, the relay UDS, and the cleaned-up work dir.
@@ -797,16 +707,43 @@ pub fn up(args: &crate::cli::zeroboot::ZerobootUpArgs) -> Result<Value, CliError
     }
 
     let tcp = args.tcp.clone();
-    let host_ip = tcp
-        .rsplit_once(':')
-        .map(|(ip, _)| ip)
-        .unwrap_or("127.0.0.1")
-        .to_owned();
-    let base_port: u16 = tcp
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5000);
+    // Strict parse: a malformed --tcp must be a usage error, not a silent
+    // fallback to 5000 (a wrong bind target fails confusingly later); the
+    // bind must be loopback — the relay exposes an UNAUTHENTICATED ZBRT
+    // guest, binding it non-loopback would publish it to the network.
+    let (host_ip, base_port) = match tcp.rsplit_once(':') {
+        Some((ip, port)) => {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| validation(format!("--tcp port is not a valid port number: {tcp}")))?;
+            (ip.to_owned(), port)
+        }
+        None => return Err(validation(format!("--tcp must be host:port, got {tcp}"))),
+    };
+    if host_ip != "127.0.0.1" && host_ip != "::1" && host_ip != "localhost" {
+        return Err(validation(
+            "--tcp must bind loopback (the ZBRT relay has no authentication)",
+        ));
+    }
+    // Multi-sandbox increments must not wrap around (release builds would
+    // silently bind low ports).
+    let last_port =
+        u16::try_from(base_port as u32 + (args.n.saturating_sub(1) as u32)).map_err(|_| {
+            validation(format!(
+                "--tcp port range exhausted: {} + {} sandboxes",
+                base_port, args.n
+            ))
+        })?;
+    let last_cid = args
+        .cid
+        .checked_add(args.n.saturating_sub(1) as u32)
+        .ok_or_else(|| {
+            validation(format!(
+                "--cid range exhausted: {} + {} sandboxes",
+                args.cid, args.n
+            ))
+        })?;
+    let _ = (last_port, last_cid);
 
     let mut vms: Vec<Vm> = Vec::new();
     let result = (|| -> Result<Value, CliError> {
@@ -856,26 +793,36 @@ pub fn up(args: &crate::cli::zeroboot::ZerobootUpArgs) -> Result<Value, CliError
                 let uds = uds.clone();
                 accept_loops.push(tokio::spawn(async move {
                     loop {
-                        let Ok((mut tcp_stream, _)) = listener.accept().await else {
-                            continue;
-                        };
-                        let uds = uds.clone();
-                        tokio::spawn(async move {
-                            let handshake = Duration::from_secs(10);
-                            let Ok(mut relay) =
-                                crate::vsock::connect_firecracker_uds(&uds, guest_port, handshake)
+                        match listener.accept().await {
+                            Ok((mut tcp_stream, _)) => {
+                                let uds = uds.clone();
+                                tokio::spawn(async move {
+                                    let handshake = Duration::from_secs(10);
+                                    let Ok(mut relay) = crate::vsock::connect_firecracker_uds(
+                                        &uds, guest_port, handshake,
+                                    )
                                     .await
-                            else {
-                                return;
-                            };
-                            let _ =
-                                tokio::io::copy_bidirectional(&mut tcp_stream, &mut relay).await;
-                        });
+                                    else {
+                                        return;
+                                    };
+                                    let _ =
+                                        tokio::io::copy_bidirectional(&mut tcp_stream, &mut relay)
+                                            .await;
+                                });
+                            }
+                            // A PERSISTENT accept error (fd exhaustion…) must
+                            // not busy-spin the current-thread runtime: back
+                            // off and retry.
+                            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        }
                     }
                 }));
             }
-            // Announce readiness only after every listener exists.
-            println!(
+            // Announce readiness only after every listener exists — on
+            // STDERR: this is a status announcement, not command output, and
+            // `--json` promises exactly ONE JSON document on stdout (the
+            // final render comes from dispatch after shutdown).
+            eprintln!(
                 "{}",
                 json!({
                     "ok": true,
@@ -896,7 +843,21 @@ pub fn up(args: &crate::cli::zeroboot::ZerobootUpArgs) -> Result<Value, CliError
                 })
             );
             eprintln!("zeroboot up: {n} sandbox VM(s) bridged at {addresses:?} (Ctrl-C to stop)");
-            tokio::signal::ctrl_c()
+            // Ctrl-C AND SIGTERM both tear down: SIGTERM is what systemd /
+            // nohup-style supervisors send, and the doc promises it works.
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .map_err(|error| external(format!("signal listener: {error}")))?;
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            ctrl_c
                 .await
                 .map_err(|error| external(format!("ctrl-c listener: {error}")))?;
             Ok(json!({

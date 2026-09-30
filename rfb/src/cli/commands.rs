@@ -173,7 +173,7 @@ pub enum Rfb1Command {
 #[derive(clap::Args, Debug)]
 pub struct ImagePath {
     /// Path to the image manifest JSON.
-    #[arg(value_name = "MANIFEST", help = "Path to the image manifest JSON")]
+    #[arg(value_name = "MANIFEST")]
     pub manifest: PathBuf,
 }
 
@@ -204,16 +204,13 @@ pub struct InitArgs {
 #[derive(clap::Args, Debug)]
 pub struct BuildArgs {
     /// Path to the image manifest JSON.
-    #[arg(value_name = "MANIFEST", help = "Path to the image manifest JSON")]
+    #[arg(value_name = "MANIFEST")]
     pub manifest: PathBuf,
     /// Output image path (defaults to the manifest's output path).
     #[arg(long, value_name = "IMAGE")]
     pub output: Option<PathBuf>,
     /// Allow invoking mke2fs/debugfs; without this, only a safe dry-run is performed.
-    #[arg(
-        long,
-        help = "Allow invoking mke2fs/debugfs; without this, only a safe dry-run is performed"
-    )]
+    #[arg(long)]
     pub execute: bool,
 }
 
@@ -221,13 +218,10 @@ pub struct BuildArgs {
 #[derive(clap::Args, Debug)]
 pub struct BuildRootfsArgs {
     /// Runtime binary to install in the rootfs.
-    #[arg(
-        value_name = "RUNTIME_BIN",
-        help = "Runtime binary to install in the rootfs"
-    )]
+    #[arg(value_name = "RUNTIME_BIN")]
     pub runtime: PathBuf,
     /// Output ext4 rootfs image path.
-    #[arg(value_name = "OUTPUT", help = "Output ext4 rootfs image path")]
+    #[arg(value_name = "OUTPUT")]
     pub output: PathBuf,
     /// Rootfs size in MiB (defaults to an automatic size).
     #[arg(long, value_name = "MIB")]
@@ -241,13 +235,10 @@ pub struct BuildRootfsArgs {
     )]
     pub mode: String,
     /// Allow dynamically-linked runtime binaries.
-    #[arg(long, help = "Allow dynamically-linked runtime binaries")]
+    #[arg(long)]
     pub allow_dynamic: bool,
     /// Refuse to overwrite an existing output without this flag.
-    #[arg(
-        long,
-        help = "Refuse to overwrite an existing output without this flag"
-    )]
+    #[arg(long)]
     pub force: bool,
     /// Install /bin/python3 (hardlink to the runtime, `rustpython` feature).
     #[arg(
@@ -261,6 +252,14 @@ pub struct BuildRootfsArgs {
         help = "Install /bin/lua (hardlink to the runtime; the binary must be built with the mlua feature)"
     )]
     pub with_lua: bool,
+    #[command(flatten)]
+    pub bake_dirs: BakeDirsArgs,
+}
+
+/// Offline extension-package directories shared by `image build-rootfs` and
+/// `image build-all` (identical flags in both commands).
+#[derive(clap::Args, Debug)]
+pub struct BakeDirsArgs {
     /// Local directory of pure-Python packages to bake into the image
     /// (/usr/lib/python3/site-packages).
     #[arg(
@@ -286,10 +285,10 @@ pub struct CleanupArgs {
     #[arg(long, value_name = "PATH", help = "Target rfb-runtime directory")]
     pub target: PathBuf,
     /// Actually delete (otherwise dry-run).
-    #[arg(long, help = "Actually delete (otherwise dry-run)")]
+    #[arg(long)]
     pub yes: bool,
     /// Only list what would be deleted.
-    #[arg(long, help = "Only list what would be deleted")]
+    #[arg(long)]
     pub dry_run: bool,
 }
 
@@ -346,7 +345,7 @@ pub struct BuildAllArgs {
     )]
     pub features: String,
     /// Output ext4 rootfs image path.
-    #[arg(value_name = "OUTPUT", help = "Output ext4 rootfs image path")]
+    #[arg(value_name = "OUTPUT")]
     pub output: PathBuf,
     /// Rootfs size in MiB (defaults to an automatic size).
     #[arg(long, value_name = "MIB")]
@@ -360,25 +359,10 @@ pub struct BuildAllArgs {
     )]
     pub mode: String,
     /// Refuse to overwrite an existing output without this flag.
-    #[arg(
-        long,
-        help = "Refuse to overwrite an existing output without this flag"
-    )]
+    #[arg(long)]
     pub force: bool,
-    /// Local directory of pure-Python packages to bake into the image.
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Directory of pure-Python packages baked into the image (offline import path)"
-    )]
-    pub py_site_dir: Option<PathBuf>,
-    /// Local directory of Lua modules to bake into the image.
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Directory of Lua modules baked into the image (offline require path)"
-    )]
-    pub lua_lib_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub bake_dirs: BakeDirsArgs,
     /// Kernel image to check and boot-verify the final rootfs against
     /// (skips the Firecracker verification stage when omitted).
     #[arg(
@@ -416,7 +400,7 @@ pub enum SkillsCommand {
         /// Skill name, optionally `NAME/PATH` for a file under the skill.
         name: String,
         /// Emit a JSON envelope instead of raw markdown.
-        #[arg(long, help = "Emit a JSON envelope instead of raw markdown")]
+        #[arg(long)]
         json: bool,
     },
 }
@@ -437,17 +421,24 @@ pub enum RunTarget {
     Preflight(ForkdPreflightArgs),
 }
 
-/// Arguments for the forkd acceptance path used by shell wrappers.
+/// The forkd controller URL shared by every forkd-targeted subcommand.
 #[derive(clap::Args, Debug)]
-pub struct RunForkdArgs {
+pub struct ForkdUrlArgs {
     /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
     #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
     pub url: String,
+}
+
+/// Arguments for the forkd acceptance path used by shell wrappers.
+#[derive(clap::Args, Debug)]
+pub struct RunForkdArgs {
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to use (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
     /// Exit 12 if prerequisites are missing.
-    #[arg(long, help = "Exit 12 if prerequisites are missing")]
+    #[arg(long)]
     pub require_vm: bool,
     /// Require controller provenance and a verified snapshot binding.
     #[arg(
@@ -461,24 +452,10 @@ pub struct RunForkdArgs {
 #[derive(Subcommand, Debug)]
 pub enum BenchCommand {
     /// forkd microbenchmark (create/ping/stream/exec/cleanup quantiles).
-    Forkd(BenchForkdArgs),
+    Forkd(ForkdBenchArgs),
     /// RFB1 codec microbenchmark is kept in the runtime benches; this lists
     /// available `cargo bench` targets.
     List,
-}
-
-/// Arguments for the forkd benchmark.
-#[derive(clap::Args, Debug)]
-pub struct BenchForkdArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
-    /// Snapshot tag to benchmark (`FORKD_SNAPSHOT_TAG`, default `rfb`).
-    #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
-    pub tag: String,
-    /// Number of benchmark iterations (default 10).
-    #[arg(long, default_value_t = 10)]
-    pub n: usize,
 }
 
 /// Real RFB web service benchmark subcommands.
@@ -493,9 +470,8 @@ pub enum WebCommand {
 /// Arguments for `rfb-cli forkd preflight`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdPreflightArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to preflight (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
@@ -506,16 +482,15 @@ pub struct ForkdPreflightArgs {
     #[arg(long)]
     pub snapshot_binding: Option<PathBuf>,
     /// Exit 12 if prerequisites are missing.
-    #[arg(long, help = "Exit 12 if prerequisites are missing")]
+    #[arg(long)]
     pub require_vm: bool,
 }
 
 /// Arguments for `rfb-cli forkd snapshot-bind`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotBindArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to bind.
     #[arg(long)]
     pub tag: String,
@@ -526,24 +501,20 @@ pub struct ForkdSnapshotBindArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
     /// Require controller provenance and matching snapshot digest.
-    #[arg(
-        long,
-        help = "Require controller provenance and matching snapshot digest"
-    )]
+    #[arg(long)]
     pub require_provenance: bool,
 }
 
 /// Arguments for `rfb-cli forkd acceptance`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdGateArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to accept (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
     /// Exit non-zero if prerequisites are missing.
-    #[arg(long, help = "Exit non-zero if prerequisites are missing")]
+    #[arg(long)]
     pub require_vm: bool,
     /// Require controller provenance and a verified snapshot binding.
     #[arg(
@@ -564,9 +535,8 @@ pub struct ForkdGateArgs {
 /// Arguments for `rfb-cli forkd benchmark`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdBenchArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to benchmark (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
@@ -578,9 +548,8 @@ pub struct ForkdBenchArgs {
 /// Arguments for `rfb-cli forkd workload`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdWorkloadArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to run the workload on (`FORKD_SNAPSHOT_TAG`, default `rfb-final-verified`).
     #[arg(long, default_value = "rfb-final-verified", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
@@ -598,9 +567,8 @@ pub struct ForkdWorkloadArgs {
 /// Arguments for `rfb-cli forkd sandbox-create`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSandboxArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to create the sandbox from (`FORKD_SNAPSHOT_TAG`, default `rfb`).
     #[arg(long, default_value = "rfb", env = "FORKD_SNAPSHOT_TAG")]
     pub tag: String,
@@ -616,9 +584,8 @@ pub struct ForkdSandboxArgs {
 /// Arguments for `rfb-cli forkd sandbox-destroy`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSandboxDestroyArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Sandbox identifier to destroy.
     #[arg(value_name = "SANDBOX_ID", help = "Sandbox identifier to destroy")]
     pub id: String,
@@ -627,9 +594,8 @@ pub struct ForkdSandboxDestroyArgs {
 /// Arguments for `rfb-cli forkd snapshot-create`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotCreateArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to create.
     #[arg(long)]
     pub tag: String,
@@ -714,9 +680,8 @@ pub struct ForkdBackendUpArgs {
 }
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotInfoArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to inspect.
     #[arg(long)]
     pub tag: String,
@@ -734,9 +699,8 @@ pub struct ForkdSnapshotInfoArgs {
 /// Arguments for `rfb-cli forkd snapshot-delete`.
 #[derive(clap::Args, Debug)]
 pub struct ForkdSnapshotDeleteArgs {
-    /// forkd controller URL (`FORKD_URL`, default `http://127.0.0.1:8889`).
-    #[arg(long, default_value = "http://127.0.0.1:8889", env = "FORKD_URL")]
-    pub url: String,
+    #[command(flatten)]
+    pub url: ForkdUrlArgs,
     /// Snapshot tag to delete.
     #[arg(long)]
     pub tag: String,
@@ -765,6 +729,6 @@ pub struct Rfb1AcceptanceArgs {
     #[arg(long, default_value = "firecracker")]
     pub firecracker: String,
     /// Exit non-zero if prerequisites are missing.
-    #[arg(long, help = "Exit non-zero if prerequisites are missing")]
+    #[arg(long)]
     pub require_vm: bool,
 }

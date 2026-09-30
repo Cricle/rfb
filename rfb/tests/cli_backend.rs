@@ -5,27 +5,9 @@
 //! work: no KVM, no TAP, no controller). Real-VM behaviour is exercised by
 //! the `*_real` suites and the local gates, not here.
 
-use std::process::{Command, Output};
+mod common;
 
-fn cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rfb-cli"))
-}
-
-fn run(args: &[&str]) -> Output {
-    cli().args(args).output().expect("run rfb-cli")
-}
-
-fn stdout_text(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn combined_text(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
+use common::cli::{combined_text, run, stdout_text};
 
 /// `forkd backend-up`: contract violations fail fast with actionable
 /// messages — regardless of whether the caller is root (argument validation
@@ -120,7 +102,7 @@ fn preflight_reports_json_without_kvm_requirement() {
 /// linked test-build) binaries and let `image build-rootfs` assemble the ext4.
 #[test]
 fn backend_up_builds_rootfs_from_pid1_dir_without_cargo() {
-    let tmp = std::env::temp_dir().join(format!("rfb-backend-up-{}", std::process::id()));
+    let tmp = common::fsutil::unique_temp_dir("rfb-backend-up");
     let pid1 = tmp.join("pid1");
     std::fs::create_dir_all(&pid1).expect("create pid1 dir");
     // pid1 内容对组装契约无关（build-rootfs 只做文件安装 + 硬链接）；用小
@@ -170,7 +152,7 @@ fn backend_up_builds_rootfs_from_pid1_dir_without_cargo() {
 /// actionable message (rfb-busybox provides the guest's /bin/sh).
 #[test]
 fn backend_up_rejects_pid1_dir_without_busybox() {
-    let tmp = std::env::temp_dir().join(format!("rfb-backend-up-busy-{}", std::process::id()));
+    let tmp = common::fsutil::unique_temp_dir("rfb-backend-up-busy");
     let pid1 = tmp.join("pid1");
     std::fs::create_dir_all(&pid1).expect("create pid1 dir");
     std::fs::write(pid1.join("rfb-runtime"), vec![0x7f; 1024]).expect("write fake pid1");

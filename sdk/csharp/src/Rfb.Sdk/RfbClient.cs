@@ -31,12 +31,14 @@ public sealed class RfbClient : IDisposable
             tok = null;
         }
 
-        if (timeoutS <= 0)
+        if (double.IsNaN(timeoutS) || double.IsInfinity(timeoutS) || timeoutS <= 0)
         {
-            throw new ValidationException("timeout must be positive");
+            throw new ValidationException("timeout must be a positive, finite number of seconds");
         }
-
-        _timeout = TimeSpan.FromSeconds(timeoutS);
+        // Clamp before converting: HttpClient.Timeout rejects spans above
+        // ~24.8 days with a non-RfbException, so a unit mix-up (ms as s) must
+        // surface as validation, not as a raw setter throw.
+        _timeout = TimeSpan.FromSeconds(Math.Min(timeoutS, 86_400));
         _controller = new ForkdControllerHttp(url, tok, _timeout);
     }
 
@@ -61,7 +63,8 @@ public sealed class RfbClient : IDisposable
         // otherwise leak ArgumentException/OverflowException instead of an
         // RfbException subtype.
         GuestValidation.Timeout(timeoutS);
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(timeoutS);
+        var deadline =
+            DateTime.UtcNow + TimeSpan.FromSeconds(Math.Min(timeoutS, 86_400));
         while (true)
         {
             var snapshots = await ListSnapshots().ConfigureAwait(false);
@@ -152,6 +155,9 @@ public sealed class RfbClient : IDisposable
             case string id:
                 {
                     GuestValidation.Id(id);
+                    // Fail closed on the transport BEFORE any network traffic
+                    // (§9.8), matching Java/Node/Python's validation order.
+                    GuestValidation.Transport(transport);
                     var list = await ListSandboxes(transport).ConfigureAwait(false);
                     foreach (var sandbox in list)
                     {

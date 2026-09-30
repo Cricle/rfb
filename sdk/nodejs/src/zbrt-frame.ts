@@ -4,7 +4,7 @@
  * "ZBRT", version 1, kind, flags (u16 BE, must be 0), request_id (16 bytes),
  * payload_len (u32 BE, ≤ 16 MiB). INTERNAL.
  */
-import { DecodeError } from './errors.js';
+import { DecodeError, RfbError, TransportError } from './errors.js';
 
 export const HEADER_LEN = 28;
 export const MAX_PAYLOAD = 16 * 1024 * 1024;
@@ -178,7 +178,10 @@ export function frameReader(stream: {
     }
   });
   stream.on('error', (e: Error) => {
-    failure = failure ?? e;
+    // UNIFIED_API.md §7: every SDK failure is an RfbError — a raw socket
+    // error must surface as Transport; already-classified RfbErrors passed
+    // to socket.destroy(error) keep their class.
+    failure = failure ?? (e instanceof RfbError ? e : new TransportError(`stream error: ${e.message}`));
     done = true;
     wake();
   });

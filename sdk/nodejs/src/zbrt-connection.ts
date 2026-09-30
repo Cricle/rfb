@@ -234,7 +234,11 @@ export class ZbrtConnection {
     const socket = this.#socket;
     if (!socket) throw new TransportError('connection closed');
     await new Promise<void>((resolve, reject) => {
-      socket.write(frame.encode(), (error) => (error ? reject(error) : resolve()));
+      // UNIFIED_API.md §7: a raw write failure must surface as Transport,
+      // not a bare socket Error.
+      socket.write(frame.encode(), (error) =>
+        error ? reject(new TransportError(`zbrt write failed: ${error.message}`)) : resolve(),
+      );
     });
   }
 

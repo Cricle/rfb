@@ -40,6 +40,10 @@ where
     let mut writer = tokio::io::BufWriter::new(writer_stream);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<TurnResult>(4);
     let mut worker_active = false;
+    // The in-flight turn's worker handle: a panic kills the worker WITHOUT
+    // ever sending on result_tx, so the channel alone cannot detect it while
+    // this connection lives — the join result is the online panic detector.
+    let mut worker_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Frame reading lives in a dedicated task: read_frame is not
     // cancellation-safe, so the select! below must never drop it mid-frame —
@@ -74,18 +78,61 @@ where
                 match result {
                     Some((sequence, session_id, request_id, result, executor)) => {
                         worker_active = false;
+                        worker_handle = None;
                         let responses = {
                             let mut runtime = shared.lock().await;
                             runtime.complete_turn(session_id, request_id, result, executor)
                         };
                         write_responses(&mut writer, &codec, sequence, &responses).await?;
                     }
-                    // The worker died without delivering a result (panic):
-                    // reclaim the in-flight turn bookkeeping so the runtime
-                    // keeps answering instead of reporting a phantom active
-                    // turn forever.
+                    // The worker dropped its sender without delivering: the
+                    // result can never arrive — reclaim the in-flight turn
+                    // bookkeeping so the runtime keeps answering instead of
+                    // reporting a phantom active turn forever.
                     None => {
                         worker_active = false;
+                        worker_handle = None;
+                        let responses = {
+                            let mut runtime = shared.lock().await;
+                            runtime.abandon_active_turn()
+                        };
+                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                    }
+                }
+            }
+            // Panic detector: the worker died without delivering a result.
+            // (Biased after the result branch: a delivery always wins over
+            // the join notification racing it.)
+            joined = async {
+                match worker_handle.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            }, if worker_active => {
+                worker_active = false;
+                worker_handle = None;
+                match (joined, result_rx.try_recv()) {
+                    // Panic: the executor can never come back — reclaim the
+                    // in-flight turn so the runtime keeps answering.
+                    (Err(_), _) => {
+                        let responses = {
+                            let mut runtime = shared.lock().await;
+                            runtime.abandon_active_turn()
+                        };
+                        write_responses(&mut writer, &codec, 0, &responses).await?;
+                    }
+                    // The worker finished and its delivery is queued (the
+                    // biased result branch lost the race): take it here.
+                    (Ok(()), Ok((sequence, session_id, request_id, result, executor))) => {
+                        let responses = {
+                            let mut runtime = shared.lock().await;
+                            runtime.complete_turn(session_id, request_id, result, executor)
+                        };
+                        write_responses(&mut writer, &codec, sequence, &responses).await?;
+                    }
+                    // The worker finished but never delivered (send failed):
+                    // reclaim.
+                    (Ok(()), Err(_)) => {
                         let responses = {
                             let mut runtime = shared.lock().await;
                             runtime.abandon_active_turn()
@@ -108,6 +155,19 @@ where
                 let responses = match &request {
                     ControlMessage::StartTurn(turn) if !worker_active => {
                         let turn = turn.clone();
+                        // At-least-once replay: a repeated StartTurn whose
+                        // result is cached (completed / cancelled / evicted)
+                        // replays the terminal instead of re-running or
+                        // hard-rejecting — mirrors the serial path.
+                        let replay = {
+                            let mut runtime = shared.lock().await;
+                            runtime.replay_cached_turn(&turn)
+                        };
+                        if let Some(responses) = replay {
+                            write_responses(&mut writer, &codec, response_sequence, &responses)
+                                .await?;
+                            continue;
+                        }
                         // Claim the turn under the shared lock, then release it
                         // immediately so other connections can Cancel while the
                         // worker runs.
@@ -129,7 +189,7 @@ where
                         };
                         let mut executor = executor;
                         let tx = result_tx.clone();
-                        tokio::task::spawn_blocking(move || {
+                        worker_handle = Some(tokio::task::spawn_blocking(move || {
                             let session_id = turn.session_id.clone();
                             let request_id = turn.request_id.clone();
                             let result = executor.start_turn(&turn);
@@ -140,7 +200,7 @@ where
                                 result,
                                 executor,
                             ));
-                        });
+                        }));
                         worker_active = true;
                         vec![]
                     }
@@ -163,31 +223,45 @@ where
     // If the connection ends while a turn is in flight (the client vanished),
     // a detached task keeps the result channel alive so the worker's delivery
     // succeeds and the executor is returned to the shared service exactly
-    // once. The wait is bounded: a worker that neither delivers nor dies (or
-    // died without delivering) within DETACHED_TURN_WAIT is treated as stuck
-    // and the turn is abandoned explicitly so the runtime keeps answering
-    // instead of wedging on a phantom turn.
+    // once. The FIRST wait is bounded: a worker that neither delivers nor dies
+    // within DETACHED_TURN_WAIT stops being treated as merely slow — the
+    // in-flight bookkeeping is abandoned so Cancel/health answers stop lying.
+    // But the channel stays alive past that point: a healthy worker with a
+    // long deadline (legal turns run up to 1800s) delivers later, and its
+    // complete_turn is what returns the single workspace executor — dropping
+    // the receiver here would brick every future turn on this runtime.
     if worker_active {
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            match tokio::time::timeout(DETACHED_TURN_WAIT, result_rx.recv()).await {
-                Ok(Some((_, session_id, request_id, result, executor))) => {
-                    let mut runtime = shared.lock().await;
-                    runtime.complete_turn(session_id, request_id, result, executor);
-                }
+            async fn wait_delivery(
+                result_rx: &mut tokio::sync::mpsc::Receiver<TurnResult>,
+            ) -> Option<TurnResult> {
+                // `Some` = the worker delivered; `None` = the worker dropped
+                // its sender without delivering (no result is ever coming).
+                result_rx.recv().await
+            }
+            async fn deliver(shared: Arc<Mutex<RuntimeService>>, delivery: TurnResult) {
+                let (_, session_id, request_id, result, executor) = delivery;
+                let mut runtime = shared.lock().await;
+                runtime.complete_turn(session_id, request_id, result, executor);
+            }
+            match tokio::time::timeout(DETACHED_TURN_WAIT, wait_delivery(&mut result_rx)).await {
+                Ok(Some(delivery)) => deliver(shared, delivery).await,
                 Ok(None) => {
                     let mut runtime = shared.lock().await;
                     runtime.abandon_active_turn();
                 }
+                // Bounded wait elapsed with a still-running worker: abandon
+                // the bookkeeping once, then keep waiting for the late
+                // delivery — it is the executor's only way home.
                 Err(_elapsed) => {
-                    eprintln!(
-                        "rfb-runtime: detached turn wait timed out after {:?}; \
-                         the worker appears stuck (no result delivered) — \
-                         abandoning the active turn",
-                        DETACHED_TURN_WAIT
-                    );
-                    let mut runtime = shared.lock().await;
-                    runtime.abandon_active_turn();
+                    {
+                        let mut runtime = shared.lock().await;
+                        runtime.abandon_active_turn();
+                    }
+                    if let Some(delivery) = wait_delivery(&mut result_rx).await {
+                        deliver(shared, delivery).await;
+                    }
                 }
             }
         });

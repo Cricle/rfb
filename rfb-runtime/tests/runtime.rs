@@ -311,6 +311,7 @@ fn structured_file_rpc_round_trips_and_fail_closes_without_executor_support() {
         request_id: "write-1".into(),
         path: "out.txt".into(),
         content: b"hello".to_vec(),
+        append: false,
     });
     let mut service = rfb_runtime::runtime_service::RuntimeService::from_environment();
     service.handle(ControlMessage::Hello {

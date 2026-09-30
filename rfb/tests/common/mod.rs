@@ -3,6 +3,16 @@
 // this module whole, so helpers unused by one target are expected here.
 #![allow(dead_code)]
 
+pub mod cli;
+pub mod fsutil;
+pub mod http;
+pub mod ndjson;
+#[cfg(all(feature = "zeroboot", target_os = "linux"))]
+pub mod realvm;
+pub mod stubs;
+#[cfg(feature = "zeroboot")]
+pub mod zbrt;
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,7 +32,11 @@ pub struct RunOutcome {
 }
 
 /// Spawn the real `rfb-cli` binary with its current directory at the rfb
-/// workspace root so `resx/` asset resolution (find_resx) works.
+/// workspace root so `resx/` asset resolution (find_resx) works. Feature-
+/// gated because `CARGO_BIN_EXE_rfb-cli` only exists when the binary is
+/// built (`required-features = ["cli"]`), and zeroboot-only suites include
+/// this module too.
+#[cfg(feature = "cli")]
 pub fn cli() -> Command {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rfb-cli"));

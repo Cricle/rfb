@@ -14,10 +14,12 @@
 //! contract and open a fresh (Hello-ed) TCP connection per turn; `health` and
 //! the structured fs RPCs (`Fs`/`FsResult`) share one long-lived *control
 //! connection* behind an internal async mutex. A failed exchange on the
-//! control connection drops the cached socket, reconnects once, and retries
-//! the request once (stale-connection semantics). The control connection is
-//! opened lazily and closed when the owning `GuestSandbox` facade (and its
-//! clones) is dropped.
+//! control connection drops the cached socket and retries the request exactly
+//! once on a fresh connection — but only when the failure proves the request
+//! was never processed (write failure, connection-kind read failure); a read
+//! timeout returns the error without resending (the guest may still be
+//! executing the request). The control connection is opened lazily and closed
+//! when the owning `GuestSandbox` facade (and its clones) is dropped.
 
 use std::io;
 use std::sync::Arc;
@@ -32,7 +34,7 @@ use super::error::{transport_timeout, RfbError};
 use super::types::{GuestExecResult, StreamEvent, StreamEventKind};
 use crate::protocol::{
     read_frame_async, write_frame_async, Cancel, Error as ZbrtErrorFrame, Execute, Exit, Frame, Fs,
-    Health, Hello, HelloAck, Kind, Output, ZBRT_V1_CAPABILITIES,
+    Health, HelloAck, Kind, Output,
 };
 
 /// Client identity advertised in the mandatory connection Hello
@@ -45,6 +47,11 @@ const MAX_ARGC: usize = u8::MAX as usize;
 /// Aggregate cap on one exec turn's captured output (mirrors the NDJSON
 /// response cap so a chatty guest cannot grow host memory without bound).
 const MAX_EXEC_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
+
+/// Frame-count cap on one exec turn (mirrors the NDJSON response-row cap,
+/// `MAX_RESPONSE_LINES`): a guest that drips empty `Output` frames forever
+/// must fail closed instead of looping on the connection indefinitely.
+const MAX_EXEC_FRAMES: usize = 65_536;
 
 /// Long-lived ZBRT guest adapter owned by a [`GuestSandbox`](super::GuestSandbox)
 /// facade; clones share the same control connection.
@@ -151,21 +158,8 @@ impl ZbrtGuest {
 
     async fn try_handshake(&self, stream: &mut TcpStream) -> Result<(), RfbError> {
         let request_id = Self::request_id();
-        let payload = Hello {
-            client: HELLO_CLIENT.to_owned(),
-            capabilities: ZBRT_V1_CAPABILITIES
-                .iter()
-                .map(|cap| (*cap).to_owned())
-                .collect(),
-        }
-        .encode()
-        .map_err(|_| io_error("failed to encode Hello payload"))?;
-        let hello = Frame {
-            kind: Kind::Hello,
-            flags: 0,
-            request_id,
-            payload,
-        };
+        let hello = crate::protocol::hello_frame(HELLO_CLIENT, request_id)
+            .map_err(|_| io_error("failed to encode Hello payload"))?;
         Self::write_frame(stream, &hello).await?;
         let ack = Self::read_frame(stream, self.timeout).await?;
         Self::check_id(&ack, request_id)?;
@@ -195,27 +189,21 @@ impl ZbrtGuest {
         Ok(())
     }
 
-    /// Write one request and read its reply on `stream` (request id checked).
-    async fn exchange_on(
-        stream: &mut TcpStream,
-        request: &Frame,
-        timeout: Duration,
-    ) -> Result<Frame, RfbError> {
-        Self::write_frame(stream, request).await?;
-        let frame = Self::read_frame(stream, timeout).await?;
-        Self::check_id(&frame, request.request_id)?;
-        Ok(frame)
-    }
-
     /// Run one request/response exchange on the shared control connection,
-    /// (re)connecting and Hello-ing as needed. A failed exchange drops the
-    /// cached connection and retries the request exactly once on a fresh
-    /// connection (stale-connection semantics); a guest `Error` frame is a
-    /// definitive answer for the request id and is returned as-is (no retry).
+    /// (re)connecting and Hello-ing as needed. Only failures that prove the
+    /// request was never processed are retried on a fresh connection
+    /// (stale-connection semantics): a **write** failure means the frame never
+    /// went out, and a connection-kind read failure (reset/broken pipe/EOF)
+    /// means the connection died before a functioning guest could answer. A
+    /// **read timeout does NOT retry** (P1-5): the request was delivered and
+    /// may still execute on the guest — a retried non-idempotent Fs op (e.g.
+    /// an `append` write) would run twice — so a timeout returns the error
+    /// after dropping the (now unusable) cached connection. A guest `Error`
+    /// frame is a definitive answer for the request id and is returned as-is.
     async fn control_exchange(&self, request: Frame) -> Result<Frame, RfbError> {
         let mut guard = self.control.lock().await;
         // At most two attempts: the cached connection, then exactly one
-        // reconnect + retry.
+        // reconnect + retry (only when the failure proves non-delivery).
         for attempt in 0..2 {
             if guard.is_none() {
                 let mut stream = self.connect().await?;
@@ -223,19 +211,62 @@ impl ZbrtGuest {
                 *guard = Some(stream);
             }
             let stream = guard.as_mut().expect("control connection established");
-            match Self::exchange_on(stream, &request, self.timeout).await {
-                Ok(frame) => return Ok(frame),
-                Err(err) => {
-                    // Stale or broken control connection: forget it; the next
-                    // iteration reconnects (Hello included) and resends once.
-                    *guard = None;
-                    if attempt == 1 {
+            // Stage 1 — write. Any failure here means the request was never
+            // delivered, so a retry is always safe.
+            if let Err(err) = Self::write_frame(stream, &request).await {
+                *guard = None;
+                if attempt == 1 {
+                    return Err(err);
+                }
+                continue;
+            }
+            // Stage 2 — read + id check.
+            let frame = match Self::read_frame(stream, self.timeout).await {
+                Ok(frame) => match Self::check_id(&frame, request.request_id) {
+                    Ok(()) => frame,
+                    Err(err) => {
+                        // The connection carried a frame this request id
+                        // cannot claim (leftover from an earlier failed
+                        // exchange): unusable — drop it and surface the error.
+                        *guard = None;
                         return Err(err);
                     }
+                },
+                Err(err) => {
+                    // A timed-out read leaves the connection in an unknown
+                    // framing state, so it is always dropped; whether the
+                    // request is retried depends on the error kind.
+                    *guard = None;
+                    if attempt == 1 || !Self::retryable_read_failure(&err) {
+                        return Err(err);
+                    }
+                    // Connection died before a functioning guest could
+                    // answer: reconnect (next iteration) and resend once.
+                    continue;
                 }
-            }
+            };
+            return Ok(frame);
         }
         unreachable!("the loop returns within two attempts")
+    }
+
+    /// Whether a read failure after a successful write may be retried on a
+    /// fresh connection. Only connection-death kinds qualify (the request was
+    /// written but the peer went away before answering). A `TimedOut` read is
+    /// excluded (P1-5): delivery succeeded and the guest may still be
+    /// executing the request.
+    fn retryable_read_failure(error: &RfbError) -> bool {
+        match error {
+            RfbError::Transport(err) => matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::NotConnected
+            ),
+            _ => false,
+        }
     }
 
     /// One exec turn: `Execute` → `Output`* → `Exit`|`Error`, on a fresh
@@ -269,7 +300,14 @@ impl ZbrtGuest {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut total = 0usize;
+        let mut frames = 0usize;
         loop {
+            frames += 1;
+            if frames > MAX_EXEC_FRAMES {
+                return Err(RfbError::Remote(format!(
+                    "guest output exceeded {MAX_EXEC_FRAMES} frames"
+                )));
+            }
             let frame = Self::read_frame(&mut stream, self.timeout).await?;
             Self::check_id(&frame, request_id)?;
             match frame.kind {
@@ -300,7 +338,16 @@ impl ZbrtGuest {
                         timed_out: false,
                     });
                 }
-                Kind::Error => return Err(error_frame(&frame.payload)),
+                Kind::Error => {
+                    // Decision (P2): a guest deadline miss surfaces as an
+                    // Error frame ("command timed out", code 1) and raises
+                    // Remote here, while the NDJSON path answers
+                    // `timed_out: true` — ZBRT v1 has no timed-out wire flag,
+                    // so mapping the message text would fork the transport
+                    // semantics (every other SDK also raises on Error
+                    // frames). Documented divergence, not a defect.
+                    return Err(error_frame(&frame.payload));
+                }
                 _ => {
                     return Err(decode_error(format!(
                         "unexpected ZBRT frame kind {:?} during exec",

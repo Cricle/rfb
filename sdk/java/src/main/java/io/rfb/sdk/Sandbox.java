@@ -500,11 +500,13 @@ public final class Sandbox {
     /**
      * Current-key-first per UNIFIED_API.md §4: exec answers with
      * {@code exit_code}, eval with {@code status} (PROTOCOL.md §2.4) — the
-     * caller names the pair in precedence order.
+     * caller names the pair in precedence order. A NON-INTEGER number (e.g.
+     * 1.5 from a misbehaving agent) is a contract violation: it maps to the
+     * fallback (-1), never truncates to a fake success code.
      */
     private static Integer statusCode(JsonNode v, int fallback, String current, String legacy) {
         JsonNode code = firstOf(v, current, legacy);
-        return code != null && code.isNumber() ? code.intValue() : fallback;
+        return code != null && code.isIntegralNumber() ? code.intValue() : fallback;
     }
 
     private static JsonNode firstOf(JsonNode v, String a, String b) {

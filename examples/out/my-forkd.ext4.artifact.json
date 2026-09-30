@@ -1,0 +1,18 @@
+{
+  "schema": "rfb-artifact/v1",
+  "backend": "forkd",
+  "profile": "forkd-agent-tcp",
+  "arch": "x86_64",
+  "transport": "tcp",
+  "protocol": "forkd",
+  "entrypoint": "/forkd-init.sh",
+  "guest_port": 8888,
+  "rootfs": {
+    "path": "examples/out/my-forkd.ext4",
+    "sha256": "bacb3a161f301e5acf027c8353be4d1728025bf2aec056394a47e7c079a36b74"
+  },
+  "vm": {
+    "cpus": 1,
+    "memory_bytes": 0
+  }
+}

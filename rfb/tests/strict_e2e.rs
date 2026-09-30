@@ -124,6 +124,7 @@ fn fake_rpc_lifecycle_and_permission_boundaries() {
             request_id: "w".into(),
             path: "out.txt".into(),
             content: b"x".to_vec(),
+            append: false,
         }),
         &mut sequence,
     );

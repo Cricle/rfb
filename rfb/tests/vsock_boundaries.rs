@@ -7,8 +7,11 @@ use rfb::vsock::{connect_firecracker_uds, execute_frame, round_trip};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+mod common;
+
 fn socket_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("rfb-vsock-{label}-{}", std::process::id()))
+    // Anti-collision path from `common::fsutil` (pid + nanos + sequence).
+    common::fsutil::socket_path(&format!("rfb-vsock-{label}"))
 }
 
 #[tokio::test]

@@ -6,10 +6,21 @@ mod agent;
 #[allow(dead_code)]
 #[path = "../src/builtin.rs"]
 mod builtin;
+// agent/search.rs resolves find patterns via `crate::glob`; include the same
+// source under the same path so that import resolves inside this test crate.
+#[allow(dead_code)]
+#[path = "../src/glob.rs"]
+mod glob;
+// agent/stream.rs decodes live output chunks via `crate::utf8_boundary`.
+#[allow(dead_code)]
+#[path = "../src/utf8_boundary.rs"]
+mod utf8_boundary;
 use serde_json::{json, Value};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+use rfb::forkd_guest::{ForkdGuestClient, ForkdGuestError};
 
 /// Connect with retries on `PermissionDenied`. On Windows the ephemeral
 /// source-port allocator can sweep into a Hyper-V excluded range, failing
@@ -34,6 +45,10 @@ async fn connect_retry(addr: &'static str) -> TcpStream {
 /// Spawn the agent against a temporary workspace: CI runners run as a
 /// non-root user that cannot create `/workspace`, so every test points
 /// `RFB_AGENT_WORKSPACE` at one shared temp dir (initialized once).
+///
+/// Agents are pinned to open access via `run_with_token(.., None)` so ambient
+/// or parallel `FORKD_AGENT_TOKEN` mutations (see the auth round-trip tests
+/// below) can never flip an unrelated contract test into token-gated mode.
 fn spawn_agent(addr: &'static str) -> tokio::task::JoinHandle<std::io::Result<()>> {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -41,7 +56,7 @@ fn spawn_agent(addr: &'static str) -> tokio::task::JoinHandle<std::io::Result<()
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("RFB_AGENT_WORKSPACE", &dir);
     });
-    tokio::spawn(agent::run(addr))
+    tokio::spawn(agent::run_with_token(addr, None))
 }
 
 async fn request(stream: &mut TcpStream, value: Value) -> Value {
@@ -81,11 +96,45 @@ async fn ping_and_unknown_actions_are_ndjson_responses() {
     task.abort();
 }
 
-#[test]
-fn find_patterns_support_common_globs_and_literal_compatibility() {
-    assert!("*.rs".contains('*'));
-    assert!("*".contains('*'));
-    assert!(!"agent".contains('*'));
+/// Real find contract over the agent NDJSON wire (PROTOCOL.md §2.5a): find
+/// semantics are glob *name* matching with a single source across every
+/// transport/backend — a pattern without `*` is a full-name exact match,
+/// never a substring contains() ("note" must not hit note.txt).
+#[tokio::test]
+async fn find_uses_glob_name_matching_not_substring() {
+    // Seed the shared agent workspace with the probe file.
+    let dir = std::env::temp_dir().join("rfb-agent-contract-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), b"x").unwrap();
+    let task = spawn_agent("127.0.0.1:18911");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let mut stream = connect_retry("127.0.0.1:18911").await;
+    let literal = request(
+        &mut stream,
+        json!({"action":"find","path":".","pattern":"note","max_results":100}),
+    )
+    .await;
+    assert!(
+        literal["matches"].as_array().is_some_and(|m| m.is_empty()),
+        "literal 'note' must not substring-match note.txt: {literal}"
+    );
+    let exact = request(
+        &mut stream,
+        json!({"action":"find","path":".","pattern":"note.txt","max_results":100}),
+    )
+    .await;
+    assert_eq!(exact["matches"], json!(["note.txt"]), "got {exact}");
+    let globbed = request(
+        &mut stream,
+        json!({"action":"find","path":".","pattern":"*.txt","max_results":100}),
+    )
+    .await;
+    let matches = globbed["matches"].as_array().expect("find matches");
+    assert!(
+        matches.iter().any(|m| m.as_str() == Some("note.txt")),
+        "glob *.txt must match note.txt: {globbed}"
+    );
+    task.abort();
 }
 
 #[test]
@@ -335,7 +384,7 @@ async fn stream_timeout_emits_explicit_terminal_ndjson_response() {
     assert_eq!(terminal["timed_out"], true);
     assert_eq!(terminal["exit_code"], Value::Null);
     assert_eq!(terminal["done"], true);
-    // PROTOCOL.md 搂2.4: a timeout is a normal terminal outcome 鈥?a string
+    // PROTOCOL.md §2.4: a timeout is a normal terminal outcome — a string
     // `error` key would make the host raise Remote instead of exposing
     // `timed_out` to callers.
     assert!(
@@ -716,12 +765,179 @@ async fn exec_timeout_keeps_official_aliases_and_terminal_state() {
     assert_eq!(result["stdout"], "");
     assert_eq!(result["err"], "process timeout");
     assert_eq!(result["stderr"], "process timeout");
-    // PROTOCOL.md 搂2.4: no string `error` on the timeout terminal 鈥?the host
+    // PROTOCOL.md §2.4: no string `error` on the timeout terminal — the host
     // classifies any `error` as a fatal Remote failure and would swallow
     // `timed_out`.
     assert!(
         result.get("error").is_none(),
         "timeout response must not carry the error key: {result}"
+    );
+    task.abort();
+}
+
+/// P1-2 (agent side): live stream output chunks are decoded with incremental
+/// UTF-8 boundary handling — a multi-byte character straddling an 8 KiB pipe
+/// read must not surface as U+FFFD in the concatenated stream.
+#[cfg(unix)]
+#[tokio::test]
+async fn stream_multibyte_output_never_splits_across_8kib_chunks() {
+    let task = spawn_agent("127.0.0.1:18910");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let stream = connect_retry("127.0.0.1:18910").await;
+    let (mut read, mut write) = stream.into_split();
+    let script = "i=0; while [ $i -lt 4095 ]; do printf 'é'; i=$((i+1)); done; i=0; while [ $i -lt 2000 ]; do printf '你'; i=$((i+1)); done";
+    write
+        .write_all(
+            serde_json::to_string(&json!({
+                "action":"stream", "args":["/bin/sh", "-c", script]
+            }))
+            .unwrap()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    write.write_all(b"\n").await.unwrap();
+    let mut reader = BufReader::new(&mut read);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(line.trim()).unwrap()["stream"],
+        "started"
+    );
+    let mut output = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let frame: Value = serde_json::from_str(line.trim()).unwrap();
+        if frame.get("exit_code").is_some() {
+            assert_eq!(frame["exit_code"], 0);
+            break;
+        }
+        if let Some(chunk) = frame.get("out").and_then(Value::as_str) {
+            output.push_str(chunk);
+        }
+    }
+    let expected = format!("{}{}", "é".repeat(4095), "你".repeat(2000));
+    assert_eq!(
+        output, expected,
+        "live stream must be byte-identical to the child output"
+    );
+    assert!(
+        !output.contains('\u{FFFD}'),
+        "a chunk boundary must not split a codepoint"
+    );
+    task.abort();
+}
+
+/// P1-9: when the agent enforces the agent token, the Rust guest client must
+/// complete the auth handshake before its first business frame. The agent is
+/// spawned with an explicit token via `run_with_token` (never through the
+/// env-reading `run`), so only the client side consults `FORKD_AGENT_TOKEN` —
+/// mirroring production, where the token reaches the agent through its own
+/// deployment env.
+static TOKEN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_agent_token(token: Option<&str>) {
+    match token {
+        Some(token) => std::env::set_var(rfb::forkd_guest::AGENT_TOKEN_ENV, token),
+        None => std::env::remove_var(rfb::forkd_guest::AGENT_TOKEN_ENV),
+    }
+}
+
+#[tokio::test]
+async fn guest_client_completes_agent_token_auth_and_execs() {
+    let _guard = TOKEN_ENV_LOCK.lock().await;
+    let task = tokio::spawn(agent::run_with_token(
+        "127.0.0.1:18912",
+        Some("contract-token"),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let client = ForkdGuestClient::new("127.0.0.1:18912");
+    set_agent_token(Some("contract-token"));
+    let result = client
+        .exec_in(
+            "/workspace",
+            vec!["/missing/bin/echo".into(), "hello".into(), "world".into()],
+            10,
+        )
+        .await;
+    set_agent_token(None);
+    let result = result.unwrap();
+    assert_eq!(result["out"], "hello world\n");
+    assert_eq!(result["exit_code"], 0);
+    task.abort();
+}
+
+/// The stream path runs the same per-connection handshake before the business
+/// frame, and the buffered reader built during auth is carried into the
+/// stream (no bytes lost between the handshake and the started event).
+#[tokio::test]
+async fn guest_client_stream_completes_agent_token_auth() {
+    let _guard = TOKEN_ENV_LOCK.lock().await;
+    let task = tokio::spawn(agent::run_with_token(
+        "127.0.0.1:18913",
+        Some("contract-token"),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let client = ForkdGuestClient::new("127.0.0.1:18913");
+    set_agent_token(Some("contract-token"));
+    let mut stream = client
+        .stream(
+            vec!["/no/such/echo".into(), "auth-stream".into()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut output = String::new();
+    let mut exited = false;
+    while let Some(event) = stream.next_event().await.unwrap() {
+        if let Some(chunk) = event.get("out").and_then(Value::as_str) {
+            output.push_str(chunk);
+        }
+        if event.get("exit_code").is_some() {
+            exited = true;
+            break;
+        }
+    }
+    set_agent_token(None);
+    assert_eq!(output, "auth-stream\n");
+    assert!(exited, "stream must reach a terminal exit frame");
+    task.abort();
+}
+
+/// Rejections map onto the client's remote-error classification, matching the
+/// Python SDK's `guest agent auth failed` wording: a missing token and a wrong
+/// token both surface as `ForkdGuestError::Remote`, not a transport failure.
+#[tokio::test]
+async fn guest_client_auth_rejections_map_to_remote_errors() {
+    let _guard = TOKEN_ENV_LOCK.lock().await;
+    let task = tokio::spawn(agent::run_with_token(
+        "127.0.0.1:18914",
+        Some("contract-token"),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let client = ForkdGuestClient::new("127.0.0.1:18914");
+    // No token configured (clear any ambient value first): the client sends
+    // no auth frame, and the agent rejects the ping with its own error —
+    // surfaced through the normal remote mapping.
+    set_agent_token(None);
+    let missing = client.ping().await.unwrap_err();
+    assert!(
+        matches!(missing, ForkdGuestError::Remote(ref message)
+            if message.contains("authentication required")),
+        "missing token must surface the agent's auth rejection: {missing}"
+    );
+    // Wrong token: the agent answers {"action":"auth","ok":false,...}.
+    set_agent_token(Some("wrong-token"));
+    let wrong = client.ping().await.unwrap_err();
+    set_agent_token(None);
+    assert!(
+        matches!(wrong, ForkdGuestError::Remote(ref message)
+            if message == "guest agent auth failed: authentication failed"),
+        "wrong token must be a remote auth failure: {wrong}"
     );
     task.abort();
 }

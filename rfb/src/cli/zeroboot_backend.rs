@@ -4,7 +4,7 @@
 //! sandbox is one Firecracker VM over vsock, owned by this process.
 
 use crate::cli::error::{external, validation, CliError};
-use crate::cli::report::{quantile_ns, Outcome};
+use crate::cli::report::{checked, count_op, record, record_sample, Outcome};
 use crate::cli::tool::HostKind;
 use crate::core::{ExecSpec, Sandbox as _, SandboxSpec};
 use crate::guest;
@@ -47,6 +47,26 @@ fn spec(argv: &[&str]) -> ExecSpec {
     }
 }
 
+/// Drain a zeroboot guest stream to clean close, requiring an `Exit` frame.
+/// Errors from event reads keep the external error wording.
+async fn stream_to_exit(stream: &mut (dyn guest::GuestStream + '_)) -> Result<(), CliError> {
+    let mut exited = false;
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .map_err(|e| external(e.to_string()))?
+    {
+        if matches!(event, guest::StreamEvent::Exit { .. }) {
+            exited = true;
+        }
+    }
+    if exited {
+        Ok(())
+    } else {
+        Err(validation("stream closed"))
+    }
+}
+
 /// ZeroBoot microbenchmark: N iterations of create/health/exec/stream/cleanup
 /// with sanitized p50/p95/p99 quantiles — the provider-level mirror of the
 /// forkd benchmark. Guest payloads are never logged.
@@ -74,40 +94,32 @@ pub async fn benchmark(
                 continue;
             }
         };
-        samples
-            .entry("create".into())
-            .or_default()
-            .push(started.elapsed().as_nanos() as u64);
+        record_sample(&mut samples, "create", started);
 
         let t = Instant::now();
-        let healthy = sandbox.ping().await.is_ok();
-        if healthy {
-            samples
-                .entry("health".into())
-                .or_default()
-                .push(t.elapsed().as_nanos() as u64);
-            outcome.success += 1;
-        } else {
-            outcome.failure += 1;
-        }
+        record(
+            &mut samples,
+            &mut outcome,
+            "health",
+            t,
+            sandbox.ping().await.is_ok(),
+        );
 
         // The first exec also covers the guest's ready path.
         let ready_started = Instant::now();
         let exec = sandbox.exec(spec(&["/bin/true"])).await;
         let exec_ok = exec.as_ref().is_ok_and(|r| r.status == Some(0));
-        if exec_ok {
-            samples
-                .entry("ready+exec".into())
-                .or_default()
-                .push(ready_started.elapsed().as_nanos() as u64);
-            outcome.success += 1;
-        } else {
-            outcome.failure += 1;
-        }
+        record(
+            &mut samples,
+            &mut outcome,
+            "ready+exec",
+            ready_started,
+            exec_ok,
+        );
 
         let t = Instant::now();
-        let streamed = (|| async {
-            let mut stream = sandbox
+        let streamed = {
+            let opened = sandbox
                 .stream(guest::StreamSpec {
                     command: "/bin/echo".into(),
                     args: vec!["zb-bench".into()],
@@ -115,54 +127,22 @@ pub async fn benchmark(
                     ..Default::default()
                 })
                 .await
-                .map_err(|e| external(e.to_string()))?;
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|e| external(e.to_string()))?
-            {
-                if matches!(event, guest::StreamEvent::Exit { .. }) {
-                    return Ok(());
-                }
+                .map_err(|e| external(e.to_string()));
+            match opened {
+                Ok(mut stream) => stream_to_exit(stream.as_mut()).await,
+                Err(error) => Err(error),
             }
-            Err(validation("stream closed"))
-        })()
-        .await;
-        if streamed.is_ok() {
-            samples
-                .entry("stream".into())
-                .or_default()
-                .push(t.elapsed().as_nanos() as u64);
-            outcome.success += 1;
-        } else {
-            outcome.failure += 1;
-        }
+        };
+        record(&mut samples, &mut outcome, "stream", t, streamed.is_ok());
 
         // Dropping the sandbox is the cleanup (VM teardown) — time it.
         let t = Instant::now();
         drop(sandbox);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        samples
-            .entry("cleanup".into())
-            .or_default()
-            .push(t.elapsed().as_nanos() as u64);
-        outcome.success += 1;
+        record(&mut samples, &mut outcome, "cleanup", t, true);
     }
 
-    let mut stats = serde_json::Map::new();
-    for (name, values) in &samples {
-        let mut sorted = values.clone();
-        sorted.sort_unstable();
-        stats.insert(
-            name.clone(),
-            json!({
-                "samples": values.len(),
-                "p50_ns": quantile_ns(&sorted, 0.50),
-                "p95_ns": quantile_ns(&sorted, 0.95),
-                "p99_ns": quantile_ns(&sorted, 0.99),
-            }),
-        );
-    }
+    let stats = crate::cli::report::samples_stats_json(&samples, None);
     Ok(json!({
         "result": if outcome.failure == 0 { "PASS" } else { "FAIL" },
         "iterations": n,
@@ -189,31 +169,28 @@ pub async fn workload(
     }
     let provider = provider(args)?;
     let mut op_count: std::collections::BTreeMap<String, usize> = Default::default();
-    macro_rules! count {
-        ($op:expr) => {
-            *op_count.entry($op.to_owned()).or_default() += 1
-        };
-    }
 
     for si in 0..sandboxes {
         let sandbox = provider
             .create_zero_boot(SandboxSpec::default())
             .await
             .map_err(|error| external(format!("sandbox {si} create failed: {error}")))?;
-        count!("sandbox_create");
+        count_op(&mut op_count, "sandbox_create");
 
         for ri in 0..rounds {
-            if sandbox.ping().await.is_ok() {
-                count!("ping");
-            } else {
-                return Err(validation("ping failed"));
-            }
+            checked(
+                &mut op_count,
+                sandbox.ping().await.is_ok(),
+                "ping",
+                "ping failed",
+            )?;
             let exec = sandbox.exec(spec(&["/bin/true"])).await;
-            if exec.is_ok_and(|r| r.status == Some(0)) {
-                count!("exec");
-            } else {
-                return Err(validation("exec failed"));
-            }
+            checked(
+                &mut op_count,
+                exec.is_ok_and(|r| r.status == Some(0)),
+                "exec",
+                "exec failed",
+            )?;
 
             let fname = format!("orders-2026-08-30-{si}-{ri}.csv");
             let row = format!("txn-{si}-{ri},pending,value-{}", si * 100 + ri);
@@ -222,11 +199,12 @@ pub async fn workload(
                 .write(guest::WriteRequest::new(&fname, content.as_bytes()))
                 .await
                 .map_err(|e| external(e.to_string()))?;
-            if written.bytes_written == content.len() as u64 {
-                count!("write");
-            } else {
-                return Err(validation("write failed"));
-            }
+            checked(
+                &mut op_count,
+                written.bytes_written == content.len() as u64,
+                "write",
+                "write failed",
+            )?;
 
             let read = sandbox
                 .read(guest::ReadRequest {
@@ -237,31 +215,34 @@ pub async fn workload(
                 .await
                 .map_err(|e| external(e.to_string()))?;
             let text = String::from_utf8_lossy(&read.data).into_owned();
-            if text.contains("txn-") && text.ends_with('\n') {
-                count!("read");
-            } else {
-                return Err(validation("read mismatch"));
-            }
+            checked(
+                &mut op_count,
+                text.contains("txn-") && text.ends_with('\n'),
+                "read",
+                "read mismatch",
+            )?;
 
             let found = sandbox
                 .find(guest::FindRequest::new(".", &fname))
                 .await
                 .map_err(|e| external(e.to_string()))?;
-            if found.matches.iter().any(|m| m.contains(&fname)) {
-                count!("find");
-            } else {
-                return Err(validation("find failed"));
-            }
+            checked(
+                &mut op_count,
+                found.matches.iter().any(|m| m.contains(&fname)),
+                "find",
+                "find failed",
+            )?;
 
             let greps = sandbox
                 .grep(guest::GrepRequest::new(".", "pending"))
                 .await
                 .map_err(|e| external(e.to_string()))?;
-            if !greps.matches.is_empty() {
-                count!("grep");
-            } else {
-                return Err(validation("grep failed"));
-            }
+            checked(
+                &mut op_count,
+                !greps.matches.is_empty(),
+                "grep",
+                "grep failed",
+            )?;
 
             let mut stream = sandbox
                 .stream(guest::StreamSpec {
@@ -272,31 +253,23 @@ pub async fn workload(
                 })
                 .await
                 .map_err(|e| external(e.to_string()))?;
-            let mut streamed = false;
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|e| external(e.to_string()))?
-            {
-                if matches!(event, guest::StreamEvent::Exit { .. }) {
-                    streamed = true;
-                }
-            }
-            if streamed {
-                count!("stream");
-            } else {
-                return Err(validation("stream closed"));
-            }
+            checked(
+                &mut op_count,
+                stream_to_exit(stream.as_mut()).await.is_ok(),
+                "stream",
+                "stream closed",
+            )?;
         }
 
         // Session-reuse pressure: repeated execs ride the pool.
         for _ in 0..5 {
             let exec = sandbox.exec(spec(&["/bin/true"])).await;
-            if exec.is_ok_and(|r| r.status == Some(0)) {
-                count!("reuse_exec");
-            } else {
-                return Err(validation("reuse exec failed"));
-            }
+            checked(
+                &mut op_count,
+                exec.is_ok_and(|r| r.status == Some(0)),
+                "reuse_exec",
+                "reuse exec failed",
+            )?;
         }
 
         // Handoff: write a summary, read it back, verify byte-exact.
@@ -309,20 +282,21 @@ pub async fn workload(
             ))
             .await
             .map_err(|e| external(e.to_string()))?;
-        count!("summary_write");
+        count_op(&mut op_count, "summary_write");
         let read = sandbox
             .read(guest::ReadRequest::new("summary.json"))
             .await
             .map_err(|e| external(e.to_string()))?;
         // Byte-exact handoff: the read-back must equal what we wrote.
-        if read.data == summary_text.as_bytes() {
-            count!("handoff_verify");
-        } else {
-            return Err(validation("handoff digest mismatch"));
-        }
+        checked(
+            &mut op_count,
+            read.data == summary_text.as_bytes(),
+            "handoff_verify",
+            "handoff digest mismatch",
+        )?;
         // Dropping the sandbox tears the VM down (leak-free by construction).
         drop(sandbox);
-        count!("sandbox_destroy");
+        count_op(&mut op_count, "sandbox_destroy");
     }
 
     Ok(json!({

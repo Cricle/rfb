@@ -142,23 +142,83 @@ pub async fn ping_sandbox(url: &str, sandbox_id: &str) -> Result<Value, CliError
 /// Returns `Err` when the operation fails; the error type carries the cause.
 pub async fn guest_call(address: &str, action: Value, terminal: bool) -> Result<Value, CliError> {
     let client = ForkdGuestClient::new(address.to_owned());
-    if terminal {
-        let value = client
-            .request(action)
+    let value = client
+        .request(action)
+        .await
+        .map_err(|error| external(error.to_string()))?;
+    value.into_iter().last().ok_or_else(|| {
+        validation(if terminal {
+            "guest returned no terminal response"
+        } else {
+            "guest returned no response"
+        })
+    })
+}
+
+/// Open a guest stream and read it to the terminal `exit_code` frame. With
+/// `require_zero_exit` a non-zero exit code (or a stream that closes before
+/// the exit frame) is an error; otherwise only the closed-early case is.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
+pub async fn stream_to_exit(
+    address: &str,
+    argv: Vec<String>,
+    require_zero_exit: bool,
+) -> Result<(), CliError> {
+    let mut stream = ForkdGuestClient::new(address.to_owned())
+        .stream(argv, None, Some(false), None, None)
+        .await
+        .map_err(|e| external(e.to_string()))?;
+    loop {
+        match stream
+            .next_event()
             .await
-            .map_err(|error| external(error.to_string()))?;
-        value
-            .into_iter()
-            .last()
-            .ok_or_else(|| validation("guest returned no terminal response"))
-    } else {
-        let value = client
-            .request(action)
-            .await
-            .map_err(|error| external(error.to_string()))?;
-        value
-            .into_iter()
-            .last()
-            .ok_or_else(|| validation("guest returned no response"))
+            .map_err(|e| external(e.to_string()))?
+        {
+            Some(value) => {
+                if let Some(code) = value.get("exit_code") {
+                    if require_zero_exit && code.as_i64() != Some(0) {
+                        return Err(validation("guest stream exit code != 0"));
+                    }
+                    break;
+                }
+            }
+            None => {
+                return Err(validation(if require_zero_exit {
+                    "guest stream closed before exit"
+                } else {
+                    "stream closed"
+                }))
+            }
+        }
     }
+    Ok(())
+}
+
+/// Create one sandbox and wait for its guest listener to come up. A guest
+/// that never becomes ready destroys the sandbox before returning the error
+/// (no caller may leak it). `empty_error` is each gate's own message for a
+/// create that returned no sandbox.
+///
+/// # Errors
+///
+/// Returns `Err` when the operation fails; the error type carries the cause.
+pub async fn create_ready_sandbox(
+    url: &str,
+    tag: &str,
+    empty_error: &'static str,
+) -> Result<SandboxInfo, CliError> {
+    let sandbox = create_sandbox(url, tag, 1, Some(32), false)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| validation(empty_error))?;
+    let address = sandbox.guest_addr.clone();
+    if let Err(error) = wait_for_guest_ready(&address, GUEST_READY_DEADLINE).await {
+        let _ = destroy_sandbox(url, &sandbox.id).await;
+        return Err(error);
+    }
+    Ok(sandbox)
 }

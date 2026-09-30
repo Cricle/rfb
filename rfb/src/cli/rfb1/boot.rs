@@ -181,11 +181,17 @@ pub fn boot_firecracker_with(options: BootOptions<'_>) -> Result<Child, CliError
     let _ = fs::remove_file(&socket);
     let log_file = fs::File::create(log).map_err(|error| io(error.to_string()))?;
 
-    let child = Command::new(tool_command(firecracker))
+    let mut command = Command::new(tool_command(firecracker));
+    command
         .args(["--api-sock", socket.to_str().unwrap_or("firecracker.sock")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file));
+    // Same orphan-VM hardening as the provider's spawn path: every
+    // Firecracker spawn (CLI included) must die with its parent.
+    crate::firecracker::attach_pdeathsig(&mut command)
+        .map_err(|error| external(error.to_string()))?;
+    let child = command
         .spawn()
         .map_err(|error| external(format!("failed to start firecracker: {error}")))?;
     // From here until boot completes, every failure path must tear the VM

@@ -9,7 +9,8 @@
 #
 # 覆盖的清单（与 rfb/tests/release_contract.rs 的断言一一对应）：
 #   sdk/python/pyproject.toml [project] version
-#   sdk/nodejs/package.json 顶层 "version"
+#   sdk/nodejs/package.json 顶层 "version" + package-lock.json 两处（root 与
+#     packages[""]——漏掉会让每次 npm install 都产生 lock 重写 diff）
 #   sdk/java/pom.xml project <version>
 #   sdk/java/tests/pom.xml project <version> + rfb-sdk 依赖 <version>（前两处）
 #   sdk/csharp/src/Rfb.Sdk/Rfb.Sdk.csproj <Version>
@@ -58,6 +59,10 @@ sub("sdk/python/pyproject.toml", r'(?m)^version = "[^"]*"',
     f'version = "{version}"')
 sub("sdk/nodejs/package.json", r'(?m)^(\s*)"version": "[^"]*"',
     rf'\g<1>"version": "{version}"')
+# package-lock.json：root 顶层 + packages[""] 两处（结构固定，恰好是文件里
+# 最早的 "version" 行）。
+sub("sdk/nodejs/package-lock.json", r'"version": "[^"]*"',
+    f'"version": "{version}"', 2)
 # pom.xml / tests/pom.xml：字面量 <version> 按出现顺序计数——主 pom 的第一处
 # 是 project version；tests/pom 前两处是 project version + rfb-sdk 依赖
 # （后续的 ${junit.version} 等属性引用不匹配字面量模式之外的……它们也匹配

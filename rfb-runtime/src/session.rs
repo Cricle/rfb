@@ -10,6 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The request opcode each control message is carried with.
+#[cfg(any(feature = "guest", all(feature = "host-vsock", unix)))]
+use crate::codec::MessageType;
+
 /// A turn request: identity plus the opaque prompt the executor interprets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRequest {
@@ -54,6 +58,11 @@ pub struct FileWriteRequest {
     pub path: String,
     /// Exact bytes to write.
     pub content: Vec<u8>,
+    /// Append to the file instead of truncating it (`false` = the historical
+    /// truncate-and-write semantics). Defaults to `false` on the wire so
+    /// hosts that do not send the field keep the old behavior.
+    #[serde(default)]
+    pub append: bool,
 }
 
 /// Terminal output stream selector for the typed terminal schema.
@@ -191,6 +200,23 @@ pub enum ControlMessage {
     WriteWorkspaceFile(FileWriteRequest),
     /// Orderly shutdown: the runtime replies `ShutdownAck` and stops servicing.
     Shutdown,
+}
+
+/// Map a host control message onto the request opcode it is carried with.
+/// This is the single `ControlMessage` → `MessageType` mapping shared by the
+/// guest protocol writers and the host-side vsock transport.
+#[cfg(any(feature = "guest", all(feature = "host-vsock", unix)))]
+pub(crate) fn control_type(message: &ControlMessage) -> MessageType {
+    match message {
+        ControlMessage::Hello { .. } => MessageType::Hello,
+        ControlMessage::Capabilities { .. } => MessageType::Capabilities,
+        ControlMessage::StartTurn(_) => MessageType::StartTurn,
+        ControlMessage::Cancel { .. } => MessageType::CancelTurn,
+        ControlMessage::ReadWorkspaceFile(_) => MessageType::ReadWorkspaceFile,
+        ControlMessage::ReadHostFile(_) => MessageType::ReadHostFile,
+        ControlMessage::WriteWorkspaceFile(_) => MessageType::WriteWorkspaceFile,
+        ControlMessage::Shutdown => MessageType::Shutdown,
+    }
 }
 
 /// Runtime responses to control messages.

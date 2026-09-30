@@ -4,21 +4,13 @@
 
 #![cfg(feature = "host-vsock")]
 
+mod common;
+
 use rfb_runtime::host_vsock::{VsockEndpoint, VsockEndpointError};
 
 #[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
-
-#[cfg(unix)]
 fn unique_temp_dir() -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "rfb-host-vsock-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+    common::unique_temp_dir("rfb-host-vsock")
 }
 
 #[test]

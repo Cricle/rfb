@@ -25,16 +25,19 @@ internal sealed class ForkdGuestNdjson
     public async Task<JsonElement> PingAsync() =>
         await LastResponseAsync(new Dictionary<string, object?> { ["action"] = "ping" }).ConfigureAwait(false);
 
-    public async Task<JsonElement> ExecAsync(string cwd, IReadOnlyList<string> args, ulong timeoutSecs) =>
-        await LastResponseAsync(new Dictionary<string, object?>
-        {
-            ["action"] = "exec",
-            ["cwd"] = cwd,
-            ["args"] = args,
-            ["timeout"] = timeoutSecs,
-        });
+    public async Task<JsonElement> ExecAsync(
+        string cwd, IReadOnlyList<string> args, ulong timeoutSecs, TimeSpan? readBudget = null) =>
+        await LastResponseAsync(
+            new Dictionary<string, object?>
+            {
+                ["action"] = "exec",
+                ["cwd"] = cwd,
+                ["args"] = args,
+                ["timeout"] = timeoutSecs,
+            },
+            readBudget).ConfigureAwait(false);
 
-    public async Task<JsonElement> EvalAsync(string code, string? cwd, double? timeoutS)
+    public async Task<JsonElement> EvalAsync(string code, string? cwd, double? timeoutS, TimeSpan? readBudget = null)
     {
         var action = new Dictionary<string, object?>
         {
@@ -51,7 +54,7 @@ internal sealed class ForkdGuestNdjson
             action["timeout"] = TimeoutSecs(timeoutS.Value);
         }
 
-        return await LastResponseAsync(action).ConfigureAwait(false);
+        return await LastResponseAsync(action, readBudget).ConfigureAwait(false);
     }
 
     public async Task<JsonElement> ToolAsync(string tool, Dictionary<string, object?> args)
@@ -101,21 +104,22 @@ internal sealed class ForkdGuestNdjson
     /// <summary>Raw request exposed for tests: all response lines up to and including the terminal one.</summary>
     internal Task<List<JsonElement>> RequestAsyncForTests(Dictionary<string, object?> action) => RequestAsync(action);
 
-    private async Task<JsonElement> LastResponseAsync(Dictionary<string, object?> action)
+    private async Task<JsonElement> LastResponseAsync(Dictionary<string, object?> action, TimeSpan? readBudget = null)
     {
-        var responses = await RequestAsync(action).ConfigureAwait(false);
+        var responses = await RequestAsync(action, readBudget).ConfigureAwait(false);
         return responses[^1];
     }
 
-    /// <summary>Send one action and read response lines until the terminal line.</summary>
-    private async Task<List<JsonElement>> RequestAsync(Dictionary<string, object?> action)
+    /// <summary>Send one action and read response lines until the terminal line.
+    /// `readBudget` null reads at the base timeout (PROTOCOL.md §2.1).</summary>
+    private async Task<List<JsonElement>> RequestAsync(Dictionary<string, object?> action, TimeSpan? readBudget = null)
     {
         using var tcp = new TcpClient();
         await ConnectAsync(tcp).ConfigureAwait(false);
         using var stream = tcp.GetStream();
         await WriteLineAsync(stream, JsonSerializer.Serialize(action)).ConfigureAwait(false);
 
-        var reader = new NdjsonLineReader(stream, _timeout);
+        var reader = new NdjsonLineReader(stream, readBudget ?? _timeout);
         var responses = new List<JsonElement>();
         while (true)
         {

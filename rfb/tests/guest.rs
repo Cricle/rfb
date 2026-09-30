@@ -20,6 +20,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod common;
+
+/// Counts dispatches so tests can prove validation short-circuits before the
+/// sandbox is reached. Each operation panics if it is ever polled.
+use common::stubs::PanicSandbox as StrictSandbox;
+
 #[tokio::test]
 async fn operations_facade_applies_timeout_and_validates_paths() {
     struct Fake;
@@ -598,76 +604,10 @@ async fn operations_facade_preserves_explicit_timeouts() {
     );
 }
 
-/// Counts dispatches so tests can prove validation short-circuits before the
-/// sandbox is reached. Each operation panics if it is ever polled.
-struct StrictSandbox {
-    calls: Arc<AtomicUsize>,
-}
-impl StrictSandbox {
-    fn record(&self) {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-    }
-    fn unreachable<T>() -> BoxFuture<'static, Result<T, SandboxError>> {
-        Box::pin(async { unreachable!("strict sandbox must not be dispatched") })
-    }
-}
-impl Sandbox for StrictSandbox {
-    fn backend(&self) -> rfb::BackendKind {
-        rfb::BackendKind::InMemory
-    }
-    fn transport(&self) -> rfb::TransportKind {
-        rfb::TransportKind::InProcess
-    }
-    fn capabilities(&self) -> &[Capability] {
-        &[]
-    }
-    fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn ls<'a>(&'a self, _: LsRequest) -> BoxFuture<'a, Result<LsResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn find<'a>(&'a self, _: FindRequest) -> BoxFuture<'a, Result<FindResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn grep<'a>(&'a self, _: GrepRequest) -> BoxFuture<'a, Result<GrepResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn read<'a>(&'a self, _: ReadRequest) -> BoxFuture<'a, Result<ReadResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn write<'a>(&'a self, _: WriteRequest) -> BoxFuture<'a, Result<WriteResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn eval<'a>(&'a self, _: EvalRequest) -> BoxFuture<'a, Result<EvalResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn cancel<'a>(&'a self, _: CancelRequest) -> BoxFuture<'a, Result<CancelResult, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-    fn stream<'a>(
-        &'a self,
-        _: StreamSpec,
-    ) -> BoxFuture<'a, Result<Box<dyn GuestStream + 'a>, SandboxError>> {
-        self.record();
-        Self::unreachable()
-    }
-}
-
 #[tokio::test]
 async fn operations_facade_rejects_invalid_requests_before_dispatch() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let sandbox = StrictSandbox {
-        calls: calls.clone(),
-    };
+    let sandbox = StrictSandbox::new(calls.clone());
     let ops = GuestOperations::new(&sandbox);
 
     // Map every typed op's result onto the uniform `Result<(), SandboxError>`

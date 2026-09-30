@@ -60,6 +60,7 @@ if [[ "$mode" == dry-run ]]; then
 fi
 
 : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required}"
+export CARGO_REGISTRY_TOKEN
 
 # Package and publish strictly in dependency order. rfb-sdk/rfb-rig cannot be
 # packaged until rfb-runtime 0.0.1 is resolvable on crates.io, so packaging
@@ -77,10 +78,13 @@ publish_crate() {
     return 0
   fi
   cargo package -p "$1" --locked
-  # --token on the command line: the CARGO_REGISTRIES_CRATES_IO_TOKEN env var
-  # was not honored by the runner's cargo during one release run ("no token
-  # found"); a CLI flag cannot be lost to environment plumbing.
-  cargo publish -p "$1" --locked --token "$CARGO_REGISTRY_TOKEN"
+  # Token via env, never argv: argv is world-readable via /proc/<pid>/cmdline.
+  # One release run's cargo ignored CARGO_REGISTRY_TOKEN ("no token found") —
+  # most likely an env-plumbing gap in the workflow; covering BOTH canonical
+  # names here (the registry-scoped one is what `--registry`-less publish
+  # resolves) keeps that from recurring without putting the token in argv.
+  CARGO_REGISTRIES_CRATES_IO_TOKEN="$CARGO_REGISTRY_TOKEN" \
+    cargo publish -p "$1" --locked
 }
 publish_crate rfb-runtime
 printf 'rfb-runtime published; waiting %ss for index propagation\n' "${CRATES_IO_PROPAGATION_SECONDS:-30}"

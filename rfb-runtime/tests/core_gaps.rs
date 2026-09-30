@@ -1,3 +1,5 @@
+mod common;
+
 use rfb_runtime::config::{
     RuntimeConfig, DEFAULT_ENVIRONMENT_PATH, DEFAULT_FORKD_AGENT_ADDR, DEFAULT_VSOCK_PORT,
     DEFAULT_WORKSPACE,
@@ -65,19 +67,10 @@ mod guest_service {
     }
 
     fn ready(service: &mut RuntimeService) {
-        assert!(matches!(
-            service.handle(ControlMessage::Hello {
-                protocol_version: 1
-            })[..],
-            [RuntimeMessage::HelloAck { .. }]
-        ));
+        crate::common::ready(service);
     }
     fn turn(session: &str, request: &str) -> SessionRequest {
-        SessionRequest {
-            session_id: session.into(),
-            request_id: request.into(),
-            prompt: String::new(),
-        }
+        crate::common::turn_request(session, request, "")
     }
 
     #[test]

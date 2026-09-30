@@ -89,12 +89,11 @@ internal static class GuestResults
 
     public static FileRead ParseRead(JsonElement v)
     {
-        if (!WireJson.HasKey(v, "data"))
-        {
-            throw new DecodeException("invalid read result: missing data");
-        }
-
-        var data = WireJson.ValueBytes(v.GetProperty("data"));
+        // PROTOCOL.md §2.4: a missing `data` key reads as EMPTY (an agent may
+        // omit it for zero-byte files) — not a decode error.
+        var data = WireJson.HasKey(v, "data")
+            ? WireJson.ValueBytes(v.GetProperty("data"))
+            : Array.Empty<byte>();
         return new FileRead(data, WireJson.BoolOr(v, "truncated", false), WireJson.OptInt(v, "total_bytes"));
     }
 

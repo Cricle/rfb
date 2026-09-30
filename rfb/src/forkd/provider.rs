@@ -76,7 +76,10 @@ impl Default for ForkdConfig {
         Self {
             base_url: "http://127.0.0.1:8889".into(),
             token: None,
-            timeout: Duration::from_secs(10),
+            // Controller HTTP budget. 10s proved too small for snapshot-restore
+            // creates (P2: a timeout there orphans a sandbox holding the shared
+            // TAP); 60s covers controller + guest boot while still bounding.
+            timeout: Duration::from_secs(60),
             snapshot_tag: None,
             // Aligned with the ZeroBoot provider's Config::default timeout so
             // an ExecSpec without an explicit deadline gets the same default
@@ -92,7 +95,12 @@ impl ForkdConfig {
     pub fn from_env() -> Self {
         let mut c = Self::default();
         if let Ok(v) = std::env::var("FORKD_URL") {
-            c.base_url = v;
+            // Trim like client/facade.rs so both FORKD_URL consumers accept
+            // the same whitespace-padded value; blank falls back to default.
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                c.base_url = trimmed.to_owned();
+            }
         }
         if let Ok(v) = std::env::var("FORKD_TOKEN") {
             if !v.trim().is_empty() {
@@ -386,7 +394,9 @@ impl Sandbox for ForkdSandbox {
                 status: v
                     .get("exit_code")
                     .and_then(|x| x.as_i64())
-                    .map(|x| x as i32),
+                    // Wraparound would turn a huge failure code into 0
+                    // ("success"); out-of-range fails closed to -1 instead.
+                    .map(|x| i32::try_from(x).unwrap_or(-1)),
                 stdout: bytes(v.get("out").or_else(|| v.get("stdout")))?,
                 stderr: bytes(v.get("err").or_else(|| v.get("stderr")))?,
                 timed_out: v
@@ -492,9 +502,20 @@ impl Sandbox for ForkdSandbox {
                 Some(serde_json::Value::String(s)) => s.as_bytes().to_vec(),
                 Some(serde_json::Value::Array(a)) => a
                     .iter()
-                    .filter_map(|x| x.as_u64().and_then(|n| u8::try_from(n).ok()))
-                    .collect(),
-                _ => Vec::new(),
+                    .map(|x| -> Result<u8, SandboxError> {
+                        x.as_u64()
+                            .and_then(|n| u8::try_from(n).ok())
+                            // Same contract as exec: an out-of-range element
+                            // is an error, never a silently dropped byte.
+                            .ok_or_else(|| SandboxError::Execution("invalid output".into()))
+                    })
+                    .collect::<Result<Vec<u8>, SandboxError>>()?,
+                // Missing/null output reads as empty; any other shape is a
+                // protocol violation, not silence.
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                _ => {
+                    return Err(SandboxError::Execution("invalid output".into()));
+                }
             };
             Ok(core_guest::EvalResult {
                 output,
@@ -505,7 +526,7 @@ impl Sandbox for ForkdSandbox {
                     .get("status")
                     .or_else(|| v.get("exit_code"))
                     .and_then(|x| x.as_i64())
-                    .map(|x| x as i32),
+                    .map(|x| i32::try_from(x).unwrap_or(-1)),
                 timed_out: v
                     .get("timed_out")
                     .and_then(|x| x.as_bool())
@@ -599,7 +620,8 @@ fn forkd_stream_event(value: serde_json::Value) -> Result<core_guest::StreamEven
     }
     if let Some(code) = value.get("exit_code").and_then(serde_json::Value::as_i64) {
         return Ok(core_guest::StreamEvent::Exit {
-            code: Some(code as i32),
+            // Wraparound would turn a huge failure code into 0 ("success").
+            code: Some(i32::try_from(code).unwrap_or(-1)),
         });
     }
     if value.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -660,17 +682,40 @@ impl SandboxProvider for ForkdClient {
     ) -> BoxFuture<'a, Result<Box<dyn Sandbox>, ProviderError>> {
         Box::pin(async move {
             crate::core::check_create_spec(&spec, self.capabilities())?;
+            // Forkd controllers take a per-sandbox `memory_limit_mib`, so the
+            // memory ceiling maps onto the create request (same as
+            // cluster.rs); every other declared resource fails closed instead
+            // of being silently ignored.
+            let memory_limit_mib = crate::core::check_create_resources(&spec, true)?;
             let tag = self
                 .config
                 .snapshot_tag
                 .clone()
                 .ok_or_else(|| ProviderError::Unavailable("snapshot tag is required".into()))?;
-            let req = CreateSandboxRequest::single(&tag);
+            let mut req = CreateSandboxRequest::single(&tag);
+            req.memory_limit_mib = memory_limit_mib;
             let s = self
                 .create(&req)
                 .await
-                .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
+                .map_err(|e| class_create_error(&e))?;
             Ok(Box::new(s) as Box<dyn Sandbox>)
         })
     }
+}
+
+/// Classify a controller create failure: a deadline is *indeterminate* (the
+/// controller answers for the request's lifetime and may have created the
+/// sandbox anyway — cluster.rs treats it the same way), so it must not be
+/// reported as an ordinary unavailability. `ProviderError` has no dedicated
+/// timeout variant, so the distinction is carried in the message.
+fn class_create_error(error: &ForkdClientError) -> ProviderError {
+    let indeterminate = matches!(error, ForkdClientError::Timeout)
+        || matches!(error, ForkdClientError::Transport(err) if err.is_timeout());
+    if indeterminate {
+        return ProviderError::Unavailable(
+            "forkd create request timed out; the controller may have created the sandbox anyway"
+                .into(),
+        );
+    }
+    ProviderError::Unavailable(error.to_string())
 }

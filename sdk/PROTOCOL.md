@@ -104,9 +104,23 @@ JSON 数组或 UTF-8 字符串（二者皆收）；缺省读作空。
 
 ### 2.5 stream 事件行（`forkd_stream_event` 映射）
 
-顺序判定：`started`（`{"event":"started"}` 或 `{"started":true}`）→ `exit_code`（终结，标记会话
-结束）→ `done:true`（Exit 无码）→ 输出键 `stdout`（旧 `out`）/ `stderr`（旧 `err`）→ 其余忽略。
+顺序判定：`started`（`{"event":"started"}` 或 `{"started":true}`）→ `exit_code`（**键存在即终结**：
+值为 null（子进程被信号杀死）→ Exit 无码终结，不是协议错误）→ `done:true`（Exit 无码）→ 输出键
+`stdout`（旧 `out`）/ `stderr`（旧 `err`）→ 其余忽略。
 输入：`{"in": text}`；停止：`{"action":"stop"}`（幂等）。
+
+### 2.5a find 的 pattern 语义（所有传输、所有后端**单一来源**）
+
+`pattern` 是 **glob 名字匹配**（实现：`rfb-runtime/src/glob.rs::glob_matches`，全部 find 走同一
+walk）：
+
+- `*` 匹配任意字节序列（**含路径分隔符**——匹配对象是逐条 walked 条目的名字，目录条目名也参与
+  匹配）；
+- 其余字符是字面量；无 `*` 的 pattern = **全名精确匹配**（`note` 不命中 `note.txt`——不是子串
+  匹配）；
+- 匹配按 walked 条目名进行（递归），结果为相对 `path` 的 `/` 分隔路径；
+- `matches` 被 `max_results` 截断时 `truncated: true`（结果形状见 §2.4 的 `read` 同名字段；
+  find 的 `matches`/`truncated` 同形状）。
 
 ### 2.6 agent 认证（可选 `FORKD_AGENT_TOKEN`）
 

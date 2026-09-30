@@ -1,7 +1,7 @@
 use crate::codec::{read_frame, write_frame, FrameCodec, MessageType};
 #[cfg(target_os = "linux")]
 use crate::codec::{read_frame_blocking, write_frame_blocking};
-use crate::session::{ControlMessage, RuntimeMessage};
+use crate::session::{control_type, ControlMessage, RuntimeMessage};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
@@ -18,16 +18,7 @@ pub async fn write_control_message<W: AsyncWrite + Unpin>(
     message: &ControlMessage,
     sequence: u64,
 ) -> io::Result<()> {
-    let message_type = match message {
-        ControlMessage::Hello { .. } => MessageType::Hello,
-        ControlMessage::Capabilities { .. } => MessageType::Capabilities,
-        ControlMessage::StartTurn(_) => MessageType::StartTurn,
-        ControlMessage::Cancel { .. } => MessageType::CancelTurn,
-        ControlMessage::ReadWorkspaceFile(_) => MessageType::ReadWorkspaceFile,
-        ControlMessage::ReadHostFile(_) => MessageType::ReadHostFile,
-        ControlMessage::WriteWorkspaceFile(_) => MessageType::WriteWorkspaceFile,
-        ControlMessage::Shutdown => MessageType::Shutdown,
-    };
+    let message_type = control_type(message);
     write_frame(writer, codec, message_type, sequence, message).await
 }
 
@@ -44,16 +35,7 @@ pub fn write_control_message_blocking<W: Write>(
     message: &ControlMessage,
     sequence: u64,
 ) -> io::Result<()> {
-    let message_type = match message {
-        ControlMessage::Hello { .. } => MessageType::Hello,
-        ControlMessage::Capabilities { .. } => MessageType::Capabilities,
-        ControlMessage::StartTurn(_) => MessageType::StartTurn,
-        ControlMessage::Cancel { .. } => MessageType::CancelTurn,
-        ControlMessage::ReadWorkspaceFile(_) => MessageType::ReadWorkspaceFile,
-        ControlMessage::ReadHostFile(_) => MessageType::ReadHostFile,
-        ControlMessage::WriteWorkspaceFile(_) => MessageType::WriteWorkspaceFile,
-        ControlMessage::Shutdown => MessageType::Shutdown,
-    };
+    let message_type = control_type(message);
     write_frame_blocking(writer, codec, message_type, sequence, message)
 }
 

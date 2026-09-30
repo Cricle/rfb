@@ -73,6 +73,30 @@ pub fn prepare_process(command: &mut Command, piped: bool) {
 /// is drained but dropped, and `truncated` is set.
 const MAX_EXEC_STREAM_BYTES: usize = 128 * 1024;
 
+/// Deadline applied when an `exec` request carries no `timeout`. The
+/// connection loop owns no per-request disconnect signal (the peer is only
+/// observed between requests), so without a deadline a client that connected,
+/// dispatched a long command and vanished would leave the child — and the
+/// response slot — alive indefinitely. The default matches the order of the
+/// host clients' base read timeouts (the forkd guest client reads with a 10 s
+/// base timeout, SDKs 10–60 s): an abandoned command is reaped around the
+/// moment its client would have given up anyway. Clients that need longer
+/// pass an explicit `timeout`, which always wins.
+const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve the effective exec deadline for one request: an explicit `timeout`
+/// always wins; a request without one (or with a non-numeric one, which the
+/// historical contract ignored) gets [`DEFAULT_EXEC_TIMEOUT`] instead of
+/// waiting forever. An explicit 0 keeps its existing contract — expires
+/// immediately and is reported as `timed_out`.
+fn effective_exec_timeout(request: &Value) -> Duration {
+    request
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_EXEC_TIMEOUT)
+}
+
 /// Read a child stream to EOF, keeping at most `limit` bytes. Draining past
 /// the cap keeps the child from blocking on a full pipe.
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
@@ -102,10 +126,10 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
 }
 
 pub async fn execute(request: &Value) -> io::Result<Value> {
-    let timeout = request
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .map(Duration::from_secs);
+    // An explicit `timeout` always wins; a request without one gets the
+    // default deadline instead of waiting forever (see
+    // `effective_exec_timeout`).
+    let timeout = effective_exec_timeout(request);
     if let Some(kind) = builtin(request) {
         // Validate the complete request (including cwd/env and argument types)
         // even though the builtin does not spawn a process.
@@ -144,36 +168,34 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
         )?;
         Ok::<_, io::Error>((out, err, status))
     });
-    let (out, err, truncated, status) = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, wait).await {
-            Ok(result) => {
-                let ((out, out_truncated), (err, err_truncated), status) = result?;
-                (out, err, out_truncated || err_truncated, status)
-            }
-            Err(_) => {
-                // The wait future owns the child while it is polled. Kill its
-                // process group before dropping the cancelled future so a timed
-                // out command cannot outlive the request.
-                terminate_id(child_id).await;
-                // PROTOCOL.md §2.4: the exec terminal shape is
-                // exit_code/stdout/stderr/timed_out — a timeout is a normal
-                // terminal outcome, NOT an `error` string (the host classifies
-                // any `error` as a fatal Remote failure and would never expose
-                // `timed_out`).
-                return Ok(json!({
-                    "out": "",
-                    "err": "process timeout",
-                    "stdout": "",
-                    "stderr": "process timeout",
-                    "exit_code": null,
-                    "timed_out": true,
-                    "truncated": false
-                }));
-            }
-        },
-        None => {
-            let ((out, out_truncated), (err, err_truncated), status) = wait.await?;
+    // The deadline is always set (explicit `timeout` or the default), so the
+    // wait future can never outlive the request: a child that outlives the
+    // deadline has its process group killed here, mirroring the stream path's
+    // EOF-driven teardown.
+    let (out, err, truncated, status) = match tokio::time::timeout(timeout, wait).await {
+        Ok(result) => {
+            let ((out, out_truncated), (err, err_truncated), status) = result?;
             (out, err, out_truncated || err_truncated, status)
+        }
+        Err(_) => {
+            // The wait future owns the child while it is polled. Kill its
+            // process group before dropping the cancelled future so a timed
+            // out command cannot outlive the request.
+            terminate_id(child_id).await;
+            // PROTOCOL.md §2.4: the exec terminal shape is
+            // exit_code/stdout/stderr/timed_out — a timeout is a normal
+            // terminal outcome, NOT an `error` string (the host classifies
+            // any `error` as a fatal Remote failure and would never expose
+            // `timed_out`).
+            return Ok(json!({
+                "out": "",
+                "err": "process timeout",
+                "stdout": "",
+                "stderr": "process timeout",
+                "exit_code": null,
+                "timed_out": true,
+                "truncated": false
+            }));
         }
     };
     Ok(json!({
@@ -210,4 +232,51 @@ pub async fn terminate_id(pid: Option<u32>) {
 pub async fn terminate(child: &mut Child) {
     terminate_id(child.id()).await;
     let _ = child.kill().await;
+}
+
+#[cfg(test)]
+mod exec_deadline_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_timeout_gets_the_default_deadline() {
+        let request = json!({"action":"exec","args":["/bin/true"],"cwd":"."});
+        assert_eq!(
+            effective_exec_timeout(&request),
+            DEFAULT_EXEC_TIMEOUT,
+            "a request without `timeout` must never wait forever"
+        );
+    }
+
+    #[test]
+    fn explicit_timeout_wins_over_the_default() {
+        let request = json!({"action":"exec","args":["/bin/sleep","5"],"timeout":2});
+        assert_eq!(effective_exec_timeout(&request), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn explicit_zero_keeps_immediate_expiry_contract() {
+        let request = json!({"action":"exec","args":["/bin/true"],"timeout":0});
+        assert_eq!(effective_exec_timeout(&request), Duration::ZERO);
+    }
+
+    #[test]
+    fn non_numeric_timeout_falls_back_to_the_default() {
+        // A non-numeric `timeout` was historically ignored (wait forever);
+        // ignoring it now must fall back to the default deadline, not remove
+        // the bound.
+        let request = json!({"action":"exec","args":["/bin/true"],"timeout":"soon"});
+        assert_eq!(effective_exec_timeout(&request), DEFAULT_EXEC_TIMEOUT);
+    }
+
+    #[test]
+    fn default_deadline_is_client_patience_scale() {
+        // The default exists so an abandoned exec is reaped around the moment
+        // its client's read timeout would have fired (host clients read with a
+        // 10 s base timeout, SDKs 10-60 s). It must stay on that scale — not
+        // the executor's 1800 s max runtime, and not an unbounded wait.
+        assert!(DEFAULT_EXEC_TIMEOUT >= Duration::from_secs(10));
+        assert!(DEFAULT_EXEC_TIMEOUT <= Duration::from_secs(60));
+    }
 }

@@ -91,24 +91,7 @@ pub async fn write_frame(
 /// Returns `Err` when the operation fails; the error type carries the cause.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub async fn read_frame(stream: &mut UnixStream, io_timeout: Duration) -> io::Result<Frame> {
-    timeout(io_timeout, async {
-        let mut header = vec![0u8; crate::protocol::HEADER_LEN];
-        stream.read_exact(&mut header).await?;
-        let length = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        if length > crate::protocol::MAX_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "payload too large",
-            ));
-        }
-        let mut bytes = header;
-        bytes.resize(crate::protocol::HEADER_LEN + length, 0);
-        stream
-            .read_exact(&mut bytes[crate::protocol::HEADER_LEN..])
-            .await?;
-        Frame::decode(&mut bytes.as_slice())
-    })
-    .await?
+    timeout(io_timeout, crate::protocol::read_frame_async(stream)).await?
 }
 
 /// Send a typed ZBRT Execute frame and decode one response frame.

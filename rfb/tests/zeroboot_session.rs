@@ -19,11 +19,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+mod common;
+
 fn socket_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rfb-zeroboot-session-{label}-{}",
-        std::process::id()
-    ))
+    // Anti-collision path from `common::fsutil` (pid + nanos + sequence);
+    // the label keeps the suite's readable prefix.
+    common::fsutil::socket_path(&format!("rfb-zeroboot-session-{label}"))
 }
 
 fn reply(id: [u8; 16], kind: Kind, payload: Vec<u8>) -> Frame {
@@ -53,23 +54,17 @@ fn exec_request(args: &[&str], timeout_ms: u32) -> Execute {
     }
 }
 
+/// Thin delegates over the canonical wire implementation
+/// (`rfb::protocol` re-exports `rfb-runtime`'s `zeroboot_protocol`); the
+/// hand-rolled header reassembly this file used to carry duplicated it.
 async fn read_frame(stream: &mut UnixStream) -> Frame {
-    let mut header = vec![0u8; rfb::protocol::HEADER_LEN];
-    stream.read_exact(&mut header).await.unwrap();
-    let length = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-    let mut bytes = header;
-    bytes.resize(rfb::protocol::HEADER_LEN + length, 0);
-    stream
-        .read_exact(&mut bytes[rfb::protocol::HEADER_LEN..])
-        .await
-        .unwrap();
-    Frame::decode(&mut &bytes[..]).unwrap()
+    rfb::protocol::read_frame_async(stream).await.unwrap()
 }
 
 async fn write_frame(stream: &mut UnixStream, frame: &Frame) {
-    let mut bytes = Vec::new();
-    frame.encode(&mut bytes).unwrap();
-    stream.write_all(&bytes).await.unwrap();
+    rfb::protocol::write_frame_async(stream, frame)
+        .await
+        .unwrap();
 }
 
 /// Answer the Firecracker `CONNECT <port>\n` / `OK <host-port>\n` relay
@@ -87,6 +82,26 @@ async fn expect_connect(stream: &mut UnixStream, port: u32) {
     }
     assert_eq!(command, format!("CONNECT {port}\n").into_bytes());
     stream.write_all(b"OK 123\n").await.unwrap();
+}
+
+/// Fallible frame read for mock guests that serve until the connection
+/// closes (EOF is a normal end of service, not a failure). Maps every
+/// transport/decode failure (including EOF) to `None`, exactly as before.
+async fn try_read_frame(stream: &mut UnixStream) -> Option<Frame> {
+    rfb::protocol::read_frame_async(stream).await.ok()
+}
+
+/// Wait until the session's reader task has reported the connection dead,
+/// so a test never races the reader's exit.
+async fn wait_until_dead(session: &ZeroBootSession) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while session.is_alive() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reader never reported the dead connection"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]
@@ -1092,4 +1107,208 @@ async fn fork_fails_closed_without_hot_mode_snapshot_dir() {
     };
     assert!(error.to_string().contains("RFB_ZBRT_SNAPSHOT_DIR"));
     server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reader_exit_marks_session_dead() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let server_task = tokio::spawn(async move {
+        let hello = read_frame(&mut server).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["execute".into()]),
+            ),
+        )
+        .await;
+        // HOLD the connection open briefly: dropping immediately would race
+        // the EOF past the liveness assertion below. Returning (dropping the
+        // stream) is what actually kills the session — the reader observes
+        // the EOF and must report it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+    let session = ZeroBootSession::from_stream(client, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(session.is_alive());
+    server_task.await.unwrap();
+    wait_until_dead(&session).await;
+}
+
+#[tokio::test]
+async fn pool_skips_dead_slot_and_reports_all_dead() {
+    // Slot 0 dies before the first claim; every exec must be routed to the
+    // surviving connection instead of the corpse. Once the survivor dies
+    // too, acquire must fail closed with the all-dead error instead of
+    // hanging or handing out dead sessions.
+    let (client_a, server_a) = UnixStream::pair().unwrap();
+    let (client_b, server_b) = UnixStream::pair().unwrap();
+    let a_task = tokio::spawn(async move {
+        let mut server = server_a;
+        let hello = read_frame(&mut server).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["execute".into()]),
+            ),
+        )
+        .await;
+        // Drop: connection A dies.
+    });
+    let b_task = tokio::spawn(async move {
+        let mut server = server_b;
+        let hello = read_frame(&mut server).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["execute".into()]),
+            ),
+        )
+        .await;
+        // Serve every exec until the connection closes.
+        while let Some(frame) = try_read_frame(&mut server).await {
+            if frame.kind != Kind::Execute {
+                continue;
+            }
+            write_frame(
+                &mut server,
+                &reply(
+                    frame.request_id,
+                    Kind::Exit,
+                    Exit {
+                        code: 0,
+                        signal: None,
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            )
+            .await;
+        }
+    });
+    let session_a = ZeroBootSession::from_stream(client_a, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let session_b = ZeroBootSession::from_stream(client_b, Duration::from_secs(2))
+        .await
+        .unwrap();
+    a_task.await.unwrap();
+    wait_until_dead(&session_a).await;
+    let sandbox =
+        ZeroBootSandbox::from_sessions_for_test(Config::default(), vec![session_a, session_b]);
+    for _ in 0..4 {
+        let result = sandbox.exec(ExecSpec::new("echo")).await.unwrap();
+        assert_eq!(result.status, Some(0));
+    }
+    // Kill the survivor: the dead slot must be condemned on claim, and once
+    // every slot is dead acquire must fail closed with the all-dead error.
+    b_task.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match sandbox.exec(ExecSpec::new("echo")).await {
+            Ok(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "pool never reported all slots dead"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("all pooled guest connections are dead") {
+                    break;
+                }
+                // Transient: the claim raced the reader's alive-flag flip
+                // (connection died under an in-flight exec). That error is
+                // legitimate and retryable — keep going until the pool
+                // condemns the slot and reports all-dead.
+                assert!(
+                    message.contains("connection closed")
+                        || message.contains("transport failure")
+                        || message.contains("timed out"),
+                    "unexpected error: {error}"
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "pool never reported all slots dead"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn health_routes_to_first_alive_session() {
+    // The primary connection is dead; the health probe must route to the
+    // first still-alive slot instead of permanently reporting the dead
+    // primary's failure.
+    let (client_a, server_a) = UnixStream::pair().unwrap();
+    let (client_b, mut server_b) = UnixStream::pair().unwrap();
+    let a_task = tokio::spawn(async move {
+        let mut server = server_a;
+        let hello = read_frame(&mut server).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["health".into()]),
+            ),
+        )
+        .await;
+        // Drop: connection A dies.
+    });
+    let b_task = tokio::spawn(async move {
+        let hello = read_frame(&mut server_b).await;
+        assert_eq!(hello.kind, Kind::Hello);
+        write_frame(
+            &mut server_b,
+            &reply(
+                hello.request_id,
+                Kind::HelloAck,
+                hello_ack(vec!["health".into()]),
+            ),
+        )
+        .await;
+        let health = read_frame(&mut server_b).await;
+        assert_eq!(health.kind, Kind::Health);
+        write_frame(
+            &mut server_b,
+            &reply(
+                health.request_id,
+                Kind::HealthAck,
+                Health {
+                    healthy: true,
+                    message: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        )
+        .await;
+    });
+    let session_a = ZeroBootSession::from_stream(client_a, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let session_b = ZeroBootSession::from_stream(client_b, Duration::from_secs(2))
+        .await
+        .unwrap();
+    a_task.await.unwrap();
+    wait_until_dead(&session_a).await;
+    let sandbox =
+        ZeroBootSandbox::from_sessions_for_test(Config::default(), vec![session_a, session_b]);
+    let health = sandbox.health().await.unwrap();
+    assert!(health.healthy);
+    b_task.await.unwrap();
 }

@@ -3,34 +3,10 @@
 //! Unit-level tests for the unified backend factory: environment selection,
 //! capability advertisement, and prerequisite reporting. No VM is booted.
 
+mod common;
+
+use common::cli::with_env;
 use rfb::backend::{SandboxBackendConfig, BACKEND_ENV};
-use std::sync::Mutex;
-
-/// `std::env` manipulation is process-global; serialize the env-dependent
-/// tests so parallel test threads cannot race on `RFB_SANDBOX_BACKEND`.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let saved: Vec<(String, Option<String>)> = vars
-        .iter()
-        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-        .collect();
-    for (key, value) in vars {
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-    let result = f();
-    for (key, saved_value) in saved {
-        match saved_value {
-            Some(v) => std::env::set_var(&key, v),
-            None => std::env::remove_var(&key),
-        }
-    }
-    result
-}
 
 #[test]
 fn unset_backend_selector_fails_closed_with_hint() {

@@ -38,10 +38,12 @@ pub mod cluster;
 #[cfg(feature = "forkd")]
 #[path = "forkd/controller.rs"]
 mod controller;
-/// Firecracker microVM boot driver behind the ZeroBoot backend.
+/// Firecracker microVM boot driver behind the ZeroBoot backend（统一实现住
+/// rfb-runtime，rfb 侧 re-export——与 protocol 同方向）。
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-#[path = "zeroboot/firecracker.rs"]
-pub mod firecracker;
+pub mod firecracker {
+    pub use rfb_runtime::firecracker_core::firecracker::*;
+}
 #[cfg(feature = "forkd")]
 pub mod forkd;
 #[cfg(feature = "forkd")]

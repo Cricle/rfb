@@ -21,12 +21,14 @@ pub use build::{
     build, build_rootfs, image_diagnostics, init, profile_summary, validate_extra_guest_path,
     ExtraFile, RootfsOptions, LUA_LIB_DIR, PY_SITE_PACKAGES,
 };
+pub(crate) use build::{read_zbrt_markers, readable_file, require_readable, resolve_rootfs_source};
 pub(crate) use manifest::hex_lower;
 pub use manifest::{
     load, safe_join, sha256, sha256_bytes, validate, ImageManifestWire, StagedFile,
     StagingManifest, FORKD_PROFILE, FORKD_PROTOCOL, FORKD_TRANSPORT,
 };
 pub use script::{build_from_script, features_for, parse_script, SCRIPT_SCHEMA};
+pub(crate) use verify::stat_is_executable_regular;
 pub use verify::{
     build_static_runtime, check_kernel, inspect_rootfs, run_debugfs, verify_installed_file,
 };

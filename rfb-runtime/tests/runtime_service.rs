@@ -1,5 +1,6 @@
+mod common;
+
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn exec_prompt(argv: &[&str], timeout_secs: Option<u64>) -> String {
     let mut prompt = serde_json::json!({"op": "exec", "args": argv, "cwd": "."});
@@ -71,15 +72,7 @@ impl GuestExecutor for RecordingExecutor {
 }
 
 fn temp_workspace() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "rfb-runtime-test-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
+    common::unique_temp_dir("rfb-runtime-test")
 }
 
 #[test]
@@ -304,7 +297,8 @@ fn workspace_executor_confines_paths_and_enforces_read_write_limits() {
         .write_workspace_file(&FileWriteRequest {
             request_id: "w".into(),
             path: "new.txt".into(),
-            content: b"12345".to_vec()
+            content: b"12345".to_vec(),
+            append: false,
         })
         .is_err());
     let _ = fs::remove_dir_all(root);
@@ -323,22 +317,11 @@ fn default_environment_executor_fails_closed() {
 }
 
 fn request(session_id: &str, request_id: &str) -> ControlMessage {
-    ControlMessage::StartTurn(SessionRequest {
-        session_id: session_id.into(),
-        request_id: request_id.into(),
-        prompt: "prompt".into(),
-    })
+    common::start_turn(session_id, request_id, "prompt")
 }
 
 fn ready(service: &mut RuntimeService) {
-    assert!(matches!(
-        service
-            .handle(ControlMessage::Hello {
-                protocol_version: 1
-            })
-            .as_slice(),
-        [RuntimeMessage::HelloAck { .. }]
-    ));
+    common::ready(service);
 }
 
 #[test]
@@ -487,6 +470,7 @@ fn workspace_executor_protocol_covers_start_terminal_and_filesystem() {
         request_id: "write".into(),
         path: "nested/result.txt".into(),
         content: b"saved".to_vec(),
+        append: false,
     }));
     assert!(
         matches!(write.as_slice(), [RuntimeMessage::WriteAck { path, .. }] if path == "nested/result.txt")
@@ -691,6 +675,72 @@ fn cross_connection_cancel_stops_turn_started_on_another_connection() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Find semantics are GLOB name matching (PROTOCOL.md find contract): `*`
+/// matches any sequence, other characters are literal, and a pattern without
+/// a wildcard is a full-name match — a substring contains() would
+/// over-match ("note" hitting note.txt) and never honor `*`.
+#[test]
+fn workspace_executor_find_matches_glob_names_not_substrings() {
+    let root = temp_workspace();
+    let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
+    service.handle(ControlMessage::Hello {
+        protocol_version: 1,
+    });
+
+    for name in ["note.txt", "other.log", "sub/nested.txt"] {
+        service.handle(ControlMessage::StartTurn(SessionRequest {
+            session_id: "s".into(),
+            request_id: format!("w-{name}"),
+            prompt: format!(
+                r#"{{"op":"write","args":{{"path":"{name}","data":list,"append":false}}}}"#
+            )
+            .replace(
+                "list",
+                &serde_json::to_string(&"x".as_bytes().to_vec()).unwrap(),
+            ),
+        }));
+    }
+
+    let find = |pattern: &str, service: &mut RuntimeService| -> Vec<String> {
+        let responses = service.handle(ControlMessage::StartTurn(SessionRequest {
+            session_id: "s".into(),
+            request_id: format!("find-{pattern}"),
+            prompt: format!(
+                r#"{{"op":"find","args":{{"path":".","pattern":"{pattern}","max_results":256}}}}"#
+            ),
+        }));
+        responses
+            .iter()
+            .find_map(|m| match m {
+                RuntimeMessage::Event(e) if e.kind == "turn.completed" => {
+                    let value: serde_json::Value = serde_json::from_slice(&e.payload).unwrap();
+                    Some(
+                        value["matches"]
+                            .as_array()
+                            .expect("find result matches")
+                            .iter()
+                            .map(|v| v.as_str().unwrap().to_owned())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            })
+            .expect("find turn completed")
+    };
+
+    let mut names = find("*.txt", &mut service);
+    names.sort();
+    assert_eq!(names, vec!["note.txt", "sub/nested.txt"]);
+    // Full-name literal: no wildcard = exact name match, not a substring.
+    assert!(
+        find("note", &mut service).is_empty(),
+        "contains() must not match"
+    );
+    assert_eq!(find("note.txt", &mut service), vec!["note.txt"]);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn workspace_executor_filesystem_rpc_writes_reads_and_projects() {
     let root = temp_workspace();
@@ -705,6 +755,7 @@ fn workspace_executor_filesystem_rpc_writes_reads_and_projects() {
             request_id: "w1".into(),
             path: "dir/a.txt".into(),
             content: b"hello".to_vec(),
+            append: false,
         })
         .unwrap();
     assert_eq!(
@@ -724,6 +775,7 @@ fn workspace_executor_filesystem_rpc_writes_reads_and_projects() {
             request_id: "w2".into(),
             path: "dir/a.txt".into(),
             content: b"hi".to_vec(),
+            append: false,
         })
         .unwrap();
     assert_eq!(
@@ -743,6 +795,7 @@ fn workspace_executor_filesystem_rpc_writes_reads_and_projects() {
             request_id: "w3".into(),
             path: "deep/nested/b.txt".into(),
             content: b"nested".to_vec(),
+            append: false,
         })
         .unwrap();
     assert!(root.join("deep/nested/b.txt").exists());
@@ -763,6 +816,7 @@ fn workspace_executor_filesystem_rpc_enforces_size_limits() {
             request_id: "w".into(),
             path: "big.txt".into(),
             content: vec![b'a'; 50 * 1024 + 1],
+            append: false,
         })
         .unwrap_err();
     assert!(error.contains("file rpc limit"));
@@ -920,7 +974,7 @@ fn workspace_executor_search_operations_respect_max_results() {
         &SessionRequest {
             session_id: "s".into(),
             request_id: "find".into(),
-            prompt: r#"{"op":"find","args":{"path":".","pattern":".txt","max_results":2}}"#.into(),
+            prompt: r#"{"op":"find","args":{"path":".","pattern":"*.txt","max_results":2}}"#.into(),
         },
     );
     assert_eq!(find["matches"].as_array().unwrap().len(), 2);
@@ -949,7 +1003,8 @@ fn workspace_executor_find_recurses_into_subdirectories() {
     let request = SessionRequest {
         session_id: "s".into(),
         request_id: "r".into(),
-        prompt: r#"{"op":"find","args":{"path":".","pattern":"target","max_results":10}}"#.into(),
+        prompt: r#"{"op":"find","args":{"path":".","pattern":"target.rs","max_results":10}}"#
+            .into(),
     };
     let events = executor.start_turn(&request).unwrap();
     let completed = events
@@ -1195,5 +1250,199 @@ fn workspace_executor_serves_builtin_applets_like_the_forkd_agent() {
         prompt: r#"{"op":"exec","args":["echo","x"],"cwd":"../outside"}"#.into(),
     });
     assert!(escape.is_err(), "out-of-workspace cwd must be rejected");
+    let _ = fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// P1-1 / P1-3 / P1-2 regressions: structured write append/mode, find
+// truncation, chunk-boundary UTF-8.
+// ---------------------------------------------------------------------------
+
+/// P1-1: the structured `write` op must honor `append` (previous content
+/// survives) and fail closed on `mode`, which has no implementation over this
+/// transport — a silently dropped permission-tightening request is worse than
+/// an error.
+#[test]
+fn workspace_executor_write_honors_append_and_fails_closed_on_mode() {
+    let root = temp_workspace();
+    let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
+    service.handle(ControlMessage::Hello {
+        protocol_version: 1,
+    });
+
+    let write = |service: &mut RuntimeService, request_id: &str, args: serde_json::Value| {
+        service.handle(ControlMessage::StartTurn(SessionRequest {
+            session_id: "s".into(),
+            request_id: request_id.into(),
+            prompt: serde_json::json!({"op": "write", "args": args}).to_string(),
+        }))
+    };
+
+    write(
+        &mut service,
+        "w1",
+        serde_json::json!({"path": "log.txt", "data": b"one".to_vec(), "append": false}),
+    );
+    write(
+        &mut service,
+        "w2",
+        serde_json::json!({"path": "log.txt", "data": b"+two".to_vec(), "append": true}),
+    );
+    assert_eq!(
+        fs::read(root.join("log.txt")).unwrap(),
+        b"one+two",
+        "append must preserve the previous content (P1-1)"
+    );
+
+    // mode is not implemented here: fail closed, file untouched.
+    let responses = write(
+        &mut service,
+        "w3",
+        serde_json::json!({"path": "log.txt", "data": b"x".to_vec(), "mode": 420}),
+    );
+    assert!(
+        matches!(responses.as_slice(), [RuntimeMessage::Error { message, .. }]
+            if message.contains("mode is not supported over this transport")),
+        "got {responses:?}"
+    );
+    assert_eq!(
+        fs::read(root.join("log.txt")).unwrap(),
+        b"one+two",
+        "the mode rejection must not touch the file"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// P1-1: the typed control-message write path gains `append` with the same
+/// semantics (truncate-write remains the `append: false` default).
+#[test]
+fn workspace_executor_typed_write_append_preserves_previous_content() {
+    let root = temp_workspace();
+    let mut executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    executor
+        .write_workspace_file(&FileWriteRequest {
+            request_id: "w1".into(),
+            path: "log.txt".into(),
+            content: b"one".to_vec(),
+            append: false,
+        })
+        .unwrap();
+    executor
+        .write_workspace_file(&FileWriteRequest {
+            request_id: "w2".into(),
+            path: "log.txt".into(),
+            content: b"+two".to_vec(),
+            append: true,
+        })
+        .unwrap();
+    assert_eq!(
+        executor
+            .read_workspace_file(&FileReadRequest {
+                request_id: "r".into(),
+                path: "log.txt".into(),
+                max_bytes: 16,
+            })
+            .unwrap(),
+        b"one+two"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// P1-3: find's `truncated` must carry the bounded walk's real truncation
+/// flag — a max_results cap silently dropping entries is silent data loss.
+#[test]
+fn workspace_executor_find_reports_real_truncation() {
+    let root = temp_workspace();
+    for name in ["aa.txt", "ab.txt", "ac.txt"] {
+        fs::write(root.join(name), b"x").unwrap();
+    }
+    let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
+    service.handle(ControlMessage::Hello {
+        protocol_version: 1,
+    });
+
+    let find = |service: &mut RuntimeService, max_results: usize| -> serde_json::Value {
+        let responses = service.handle(ControlMessage::StartTurn(SessionRequest {
+            session_id: "s".into(),
+            request_id: format!("find-{max_results}"),
+            prompt: format!(
+                r#"{{"op":"find","args":{{"path":".","pattern":"*.txt","max_results":{max_results}}}}}"#
+            ),
+        }));
+        responses
+            .iter()
+            .find_map(|m| match m {
+                RuntimeMessage::Event(e) if e.kind == "turn.completed" => {
+                    Some(serde_json::from_slice::<serde_json::Value>(&e.payload).unwrap())
+                }
+                _ => None,
+            })
+            .expect("find turn completed")
+    };
+
+    let capped = find(&mut service, 2);
+    assert_eq!(
+        capped["truncated"], true,
+        "2 of 3 matches must report truncation"
+    );
+    let full = find(&mut service, 10);
+    assert_eq!(full["truncated"], false);
+    assert_eq!(full["matches"].as_array().unwrap().len(), 3);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// P1-2: a multi-byte character straddling a 32 KiB pipe-read boundary must
+/// not be replaced by U+FFFD — the live terminal.output stream concatenation
+/// is byte-identical to the child's output.
+#[cfg(unix)]
+#[test]
+fn workspace_executor_live_stream_never_splits_multibyte_across_chunks() {
+    use std::sync::{Arc, Mutex};
+
+    let root = temp_workspace();
+    let mut executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let live: Arc<Mutex<Vec<GuestEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = live.clone();
+    executor.attach_event_sink(Some(Arc::new(move |event| {
+        sink.lock().unwrap().push(event);
+    })));
+    // 16383 'é' (2 bytes each) then 2000 '你' (3 bytes each): at least one
+    // character straddles the 32 KiB read boundary whatever the pipe split.
+    let prompt = serde_json::json!({
+        "op": "exec",
+        "args": ["/bin/sh", "-c",
+            "i=0; while [ $i -lt 16383 ]; do printf 'é'; i=$((i+1)); done; \
+             i=0; while [ $i -lt 2000 ]; do printf '你'; i=$((i+1)); done"],
+        "cwd": ".",
+        "timeout_secs": 30,
+    });
+    let request = SessionRequest {
+        session_id: "s".into(),
+        request_id: "r".into(),
+        prompt: prompt.to_string(),
+    };
+    let events = executor.start_turn(&request).unwrap();
+    let completed = events.iter().find(|e| e.kind == "turn.completed").unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&completed.payload).unwrap();
+    let expected = format!("{}{}", "é".repeat(16383), "你".repeat(2000));
+    // The aggregated capture is raw bytes: byte-exact.
+    assert_eq!(payload["stdout"].as_str().unwrap(), expected);
+
+    let mut streamed = String::new();
+    for event in live.lock().unwrap().iter() {
+        if event.kind != "terminal.output" {
+            continue;
+        }
+        let terminal: serde_json::Value =
+            serde_json::from_slice(&event.payload).expect("terminal.output payload");
+        streamed.push_str(terminal["data"].as_str().unwrap());
+    }
+    assert_eq!(
+        streamed, expected,
+        "live stream must not split a codepoint at a chunk boundary"
+    );
+    assert!(!streamed.contains('\u{FFFD}'));
     let _ = fs::remove_dir_all(root);
 }

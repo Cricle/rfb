@@ -39,10 +39,12 @@ fn require_root() -> Result<(), CliError> {
 
 /// Kill leftover Firecracker processes: a killed VM leaves a zombie holding
 /// the shared TAP, and the next create fails with "Resource busy" until it
-/// is gone. Best-effort: pkill may be absent.
+/// is gone. Scoped to an exact process-name match (`-x`, not a `-f` command
+/// line substring) so unrelated processes whose arguments merely mention
+/// firecracker are never hit. Best-effort: pkill may be absent.
 fn kill_leftover_firecrackers() {
     let _ = Command::new("pkill")
-        .args(["-9", "-f", "firecracker"])
+        .args(["-9", "-x", "firecracker"])
         .status();
 }
 
@@ -69,6 +71,21 @@ fn ensure_tap(tap: &str) -> Result<(), CliError> {
         let mut addr = Command::new("ip");
         addr.args(["addr", "add", "10.42.0.1/24", "dev", tap]);
         step(addr)?;
+    } else {
+        // Idempotent convergence: a TAP left over from a run that crashed
+        // between `tuntap add` and `addr add` (or whose address was flushed)
+        // must get its address back — otherwise guest networking is dead and
+        // the failure surfaces far away, at create/snapshot time.
+        let has_addr = Command::new("ip")
+            .args(["addr", "show", "dev", tap])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("10.42.0.1"))
+            .unwrap_or(false);
+        if !has_addr {
+            let mut addr = Command::new("ip");
+            addr.args(["addr", "add", "10.42.0.1/24", "dev", tap]);
+            step(addr)?;
+        }
     }
     let mut up = Command::new("ip");
     up.args(["link", "set", tap, "up"]);
@@ -141,6 +158,8 @@ fn build_rootfs_from_pid1(
     with_lua: bool,
     allow_dynamic: bool,
 ) -> Result<PathBuf, CliError> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|error| external(format!("create state dir: {error}")))?;
     let runtime = pid1_dir.join("rfb-runtime");
     if !runtime.is_file() {
         return Err(validation(format!(
@@ -244,27 +263,18 @@ pub async fn backend_up(
             "bind must be loopback (the controller refuses 0.0.0.0 without a token)",
         ));
     }
-    match (&args.rootfs, &args.pid1_dir) {
-        (Some(_), None) | (None, Some(_)) => {}
-        (Some(_), Some(_)) => {
-            return Err(validation("--rootfs and --pid1-dir are mutually exclusive"))
-        }
-        (None, None) => return Err(validation("one of --rootfs or --pid1-dir is required")),
-    }
-    // The rootfs build is pure file work (no TAP/VM): it runs before the
-    // root check so non-root environments (CI) exercise the same contract.
     let state_dir = args.state_dir.clone().unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default()
             .join(".local/share/rfb/backend")
     });
-    std::fs::create_dir_all(&state_dir)
-        .map_err(|error| external(format!("create state dir: {error}")))?;
-
-    let (rootfs, rootfs_source) = match (&args.rootfs, &args.pid1_dir) {
-        (Some(rootfs), None) => (rootfs.clone(), "provided".to_owned()),
-        (None, Some(dir)) => (
+    // The rootfs build is pure file work (no TAP/VM): it runs before the
+    // root check so non-root environments (CI) exercise the same contract.
+    let (rootfs, rootfs_source) = crate::cli::image_build::resolve_rootfs_source(
+        args.rootfs.as_deref(),
+        args.pid1_dir.as_deref(),
+        |dir| {
             build_rootfs_from_pid1(
                 dir,
                 &state_dir,
@@ -272,20 +282,13 @@ pub async fn backend_up(
                 args.with_python,
                 args.with_lua,
                 args.allow_dynamic,
-            )?,
-            "built from pid1".to_owned(),
-        ),
-        (Some(_), Some(_)) | (None, None) => unreachable!("validated above"),
-    };
-    if !rootfs.is_file() {
-        return Err(validation(format!("rootfs missing: {}", rootfs.display())));
-    }
-    if !args.kernel.is_file() {
-        return Err(validation(format!(
-            "kernel missing: {}",
-            args.kernel.display()
-        )));
-    }
+            )
+        },
+    )?;
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|error| external(format!("create state dir: {error}")))?;
+    crate::cli::image_build::require_readable(&rootfs, "rootfs")?;
+    crate::cli::image_build::require_readable(&args.kernel, "kernel")?;
     require_root()?;
     let controller_bin = PathBuf::from("forkd-controller");
     let found = Command::new("which")
@@ -300,13 +303,17 @@ pub async fn backend_up(
         ));
     }
 
-    kill_leftover_firecrackers();
     ensure_tap(&args.tap)?;
 
     let url = format!("http://{}", args.bind);
     let client = controller_client(&url)?;
     let mut controller_started = false;
     if client.list_snapshots().await.is_err() {
+        // First bring-up (or the previous stack died): leftovers from the dead
+        // run still hold the shared TAP, so clear them before spawning a new
+        // controller. A REACHABLE controller is never touched — re-run
+        // convergence must not slaughter the live VMs it owns.
+        kill_leftover_firecrackers();
         let snapshot_root = default_snapshot_root()?;
         spawn_controller(&controller_bin, &state_dir, &snapshot_root, &args.bind)?;
         controller_started = true;
@@ -320,7 +327,7 @@ pub async fn backend_up(
 
     if !client.snapshot_ready(&args.tag).await.unwrap_or(false) {
         let create_args = super::super::commands::ForkdSnapshotCreateArgs {
-            url: url.clone(),
+            url: super::super::commands::ForkdUrlArgs { url: url.clone() },
             tag: args.tag.clone(),
             kernel: Some(args.kernel.clone()),
             rootfs: Some(rootfs.clone()),
