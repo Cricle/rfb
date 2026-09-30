@@ -72,6 +72,12 @@ jobs:
       # 清单策略保证（见下方 build-rootfs 步骤的说明）。随后按 runbook §0
       # 的标准安装把 forkd 二进制放进 PATH（controller 按自身 PATH 找
       # firecracker；`forkd exec` 验证步骤也依赖它）。
+      # 依赖缓存：e2e 的 release 编译（compile-once + musl 静态链 +
+      # rustpython 镜像链）大头是依赖树；与 ci.yml 同款 rust-cache（同一
+      # commit SHA）。key 含 Cargo.lock 哈希，依赖变更自动失效；target/
+      # 下 musl 子目录一并覆盖。
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
       - name: Verify resx checksums and install forkd binaries
         run: |
           set -euo pipefail

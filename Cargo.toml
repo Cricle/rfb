@@ -19,6 +19,9 @@ rfb = { package = "rfb-sdk", path = "rfb", version = "0.0.2" }
 
 [profile.dev]
 opt-level = 0
+# 行号表足够的调试信息：panic 回溯仍带 file:line，但生成与链接的调试段
+# 大幅缩水（--all-features 下 90+ 测试二进制每个都要链进 rustpython 等大件）。
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = "z"

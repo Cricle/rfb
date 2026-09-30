@@ -62,7 +62,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("guest"))'
 [dev-dependencies]
 # agent_contract includes rfb-runtime agent sources: they need
 # process/sync/io-std beyond the plain client-test set.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time", "process", "sync", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "net", "io-util", "time", "process", "sync"] }
 futures-lite = "2"
 tempfile = "3"
 libc = "0.2"
