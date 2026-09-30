@@ -31,6 +31,11 @@ jobs:
     # 与"stable + MSRV job 单独钉 1.93"的既有口径一致。
     container:
       image: rust:1-bookworm
+    # 容器 job 的默认 shell 是 sh（dash）：`set -o pipefail` 直接 Illegal
+    # option——所有步骤显式走 bash。
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -272,6 +277,9 @@ jobs:
     # 直接用 1.93 镜像（rustup 预装）：省掉 dtolnay 的工具链下载。
     container:
       image: rust:1.93-bookworm
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
