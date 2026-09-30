@@ -303,6 +303,28 @@ pub struct GuestSandbox {
 }
 
 impl GuestSandbox {
+    /// Attach a sandbox at a KNOWN guest address with an explicit transport —
+    /// the entry point for direct ZBRT bridges (no controller involved).
+    /// Mirrors the other SDKs' `Sandbox.attach` / `Sandbox.Attach`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if the placeholder controller endpoint cannot be
+    /// built (never for a valid build); the handle stays inert on a direct
+    /// attach — the bridge's runner owns the VM lifecycle.
+    pub fn attach(
+        info: SandboxInfo,
+        transport: GuestTransport,
+        timeout: Duration,
+    ) -> Result<Self, RfbError> {
+        let http = crate::controller::ForkdClient::new(
+            "http://127.0.0.1:8889",
+            None,
+            timeout,
+        )?;
+        Ok(Self::new(http, info, transport, timeout))
+    }
+
     pub(super) fn new(
         http: crate::controller::ForkdClient,
         info: SandboxInfo,

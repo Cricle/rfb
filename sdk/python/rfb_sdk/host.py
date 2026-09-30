@@ -105,6 +105,49 @@ def fc_api_put(sock_path: str, path: str, body: dict) -> None:
         raise RfbError(f"Firecracker API {path}: HTTP {status} {text}")
 
 
+def _pkill_all(pattern: str) -> None:
+    """SIGTERM first, wait for the process table to drain, SIGKILL only the
+    survivors. SIGKILL is last resort BY DESIGN: a SIGKILLed VM whose parent
+    is gone becomes an unreapable zombie, and the controller's shared-TAP
+    gate counts process-table users — a zombie jammed every later create
+    with a 503 "in use by another live sandbox" (2026-09-30, hours of
+    alternating green/red rounds)."""
+    subprocess.run(["pkill", "-f", pattern], capture_output=True)
+    for _ in range(20):
+        probe = subprocess.run(["pgrep", "-f", pattern], capture_output=True)
+        if probe.returncode != 0:
+            return
+        time.sleep(0.5)
+    subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
+
+
+def _become_child_subreaper() -> None:
+    """PR_SET_CHILD_SUBREAPER: orphaned descendants (the `forkd snapshot`
+    daemon's parent VM survives the binary that spawned it) reparent to US
+    instead of a non-reaping init. Without this, a SIGKILLed parent VM sits
+    in the process table as an unreapable zombie — and the controller's
+    shared-TAP gate counts every firecracker entry, zombie or live."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(36, 1)  # PR_SET_CHILD_SUBREAPER, 1
+        threading.Thread(target=_reap_loop, daemon=True).start()
+    except Exception:
+        pass  # hygiene, not correctness
+
+
+def _reap_loop() -> None:
+    """Drain reparented zombies so the process table stays clean."""
+    while True:
+        try:
+            os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            time.sleep(1)
+        except OSError:
+            time.sleep(0.2)
+
+
 def _attach_pdeathsig() -> None:
     """Kernel-kills the spawned Firecracker when this process dies
     (PR_SET_PDEATHSIG, the same hygiene as the Rust `attach_pdeathsig`):
@@ -333,14 +376,11 @@ class ZerobootHost:
         pidfile = os.path.join(self.run_dir, "firecracker.pid")
         if os.path.exists(pidfile):
             try:
-                os.kill(int(open(pidfile).read().strip()), 9)
+                os.kill(int(open(pidfile).read().strip()), 15)
             except (ValueError, OSError):
                 pass
             os.remove(pidfile)
-        subprocess.run(["pkill", "-f", f"firecracker.*{self.run_dir}"],
-                       capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", f"firecracker.*{self.run_dir}"],
-                       capture_output=True)
+        _pkill_all(f"firecracker.*{self.run_dir}")
 
     def up(self) -> None:
         if self.alive():
@@ -421,6 +461,7 @@ class ForkdHost:
         self.tap = tap
         self.snapshot_root = snapshot_root or default_snapshot_root()
         self._process = None
+        _become_child_subreaper()
 
     def _env(self):
         # The forkd binaries resolve the kernel via FORKD_KERNEL and
@@ -457,10 +498,17 @@ class ForkdHost:
         ip("link", "set", self.tap, "up")
 
     def _kill_stale(self) -> None:
-        for pattern in (f"firecracker.*{self.run_dir}",
-                        "forkd-controller serve"):
-            subprocess.run(["pkill", "-f", pattern], capture_output=True)
-            subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
+        # The controller gets SIGTERM first: it reaps its own VMs. Killing
+        # the VMs with SIGKILL first would orphan-zombie them (see
+        # _pkill_all) and jam the shared-TAP gate.
+        _pkill_all("forkd-controller serve")
+        _pkill_all(f"firecracker.*{self.run_dir}")
+        # The `forkd snapshot` helper daemon (forkd-daemon-<tag>-*) keeps its
+        # origin VM alive on the shared TAP for live-fork; a daemon left over
+        # from an interrupted run makes every later create 503 ("shared host
+        # tap is in use by another live sandbox"). Its VM is not ours to
+        # manage — take the daemon down with the stack.
+        _pkill_all("forkd-daemon-")
 
     def _wait_controller(self, timeout_s: int) -> None:
         for _ in range(timeout_s):
@@ -488,6 +536,12 @@ class ForkdHost:
     def up(self) -> None:
         if not self.alive():
             self._kill_stale()
+            import glob as _glob
+
+            for stale_dir in _glob.glob("/tmp/forkd-daemon-*"):
+                import shutil
+
+                shutil.rmtree(stale_dir, ignore_errors=True)
             time.sleep(0.5)
         self._ensure_tap()
         if not self.alive():
@@ -513,8 +567,8 @@ class ForkdHost:
             # leave the snapshot pointing at a deleted file) so the asset
             # stays pristine and the snapshot survives run-dir wipes.
             # --boot-wait-secs bounds the origin boot.
-            private_rootfs = os.path.join(self.snapshot_root, self.tag,
-                                          "rootfs.ext4")
+            private_rootfs = os.path.join(self.run_dir,
+                                          f"{self.tag}-rootfs.ext4")
             if not os.path.exists(private_rootfs):
                 import shutil
 
@@ -537,6 +591,16 @@ class ForkdHost:
                 print(proc.stderr.rstrip())
             if proc.returncode != 0:
                 raise RfbError(f"forkd snapshot failed rc={proc.returncode}")
+            # The snapshot's parent VM lingers (the live-fork template) and
+            # the controller's shared-TAP gate counts it — retire it and wait
+            # for the process table to drain before handing the stack over.
+            _pkill_all("firecracker.*forkd-parent-")
+            for _ in range(15):
+                probe = subprocess.run(["pgrep", "-f", "firecracker"],
+                                       capture_output=True)
+                if probe.returncode != 0:
+                    break
+                time.sleep(1)
         client.wait_snapshot(self.tag)
 
     def down(self) -> None:
@@ -547,4 +611,8 @@ class ForkdHost:
             except subprocess.TimeoutExpired:
                 self._process.kill()
             self._process = None
-        self._kill_stale()
+        # The controller (SIGTERMed above) reaps its own VMs; the sweep only
+        # force-kills what survived, and never SIGKILLs a VM while its
+        # parent might still reap it (see _pkill_all).
+        _pkill_all("forkd-controller serve")
+        _pkill_all(f"firecracker.*{self.run_dir}")
