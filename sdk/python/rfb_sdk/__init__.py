@@ -14,6 +14,7 @@ from .errors import (
     ValidationError,
 )
 from .facade import GuestStream, RfbClient, Sandbox
+from .host import ForkdHost, TcpVsockRelay, ZerobootHost
 from .models import (
     DirEntry,
     ExecResult,
@@ -27,6 +28,9 @@ from .models import (
 
 __all__ = [
     "RfbClient",
+    "ZerobootHost",
+    "ForkdHost",
+    "TcpVsockRelay",
     "Sandbox",
     "GuestStream",
     "StreamEvent",
