@@ -303,3 +303,35 @@ mod config {
 mod firecracker {
     pub use rfb_runtime::firecracker::FirecrackerConfig;
 }
+
+/// 回归（E2E 卡死 20 分钟的根因）：204 响应**没有 Content-Length** 且连接是
+/// keep-alive——缺 CL 必须当作"无 body"立即返回，绝不能继续等 1MiB 上限。
+/// 这里 body 端永远有后续字节：修复前的实现会一路读满 MAX 再报
+/// "exceeds limit"；修复后一次 read 就返回头部。
+#[test]
+fn response_without_content_length_never_waits_for_a_body() {
+    struct HeadersThenInfiniteBody {
+        sent_headers: bool,
+    }
+    impl std::io::Read for HeadersThenInfiniteBody {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent_headers {
+                self.sent_headers = true;
+                let headers = b"HTTP/1.1 204 No Content\r\nServer: Firecracker\r\n\r\n";
+                buf[..headers.len()].copy_from_slice(headers);
+                return Ok(headers.len());
+            }
+            // keep-alive 上"随时可能有更多数据"：永远再给 1 字节。
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+    let response = read_http_response(&mut HeadersThenInfiniteBody {
+        sent_headers: false,
+    })
+    .expect("a header-only 204 must return without reading a body");
+    assert_eq!(
+        response,
+        b"HTTP/1.1 204 No Content\r\nServer: Firecracker\r\n\r\n"
+    );
+}

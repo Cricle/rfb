@@ -150,11 +150,14 @@ pub fn read_http_response(stream: &mut impl Read) -> Result<Vec<u8>, Firecracker
             }
         }
     }
+    // 无 Content-Length = 无 body（FC 的 204 响应头后没有 Content-Length，
+    // 且连接是 keep-alive——把它当 1MiB 上限去等 body 会在 read() 上永久
+    // 阻塞；合并前的旧 reader 语义正是"缺 CL 即无 body"）。
     let response_end = match content_length {
         Some(length) => header_end.checked_add(length).ok_or_else(|| {
             FirecrackerError::Protocol("Firecracker API response exceeds limit".into())
         })?,
-        None => MAX_RESPONSE_BYTES,
+        None => header_end,
     };
     if response_end > MAX_RESPONSE_BYTES {
         return Err(FirecrackerError::Protocol(
