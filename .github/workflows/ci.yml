@@ -25,30 +25,26 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
+    # 官方 rust 镜像：rustup + stable + clippy/rustfmt 预装——省掉每次 run
+    # 的 dtolnay 工具链下载安装（~1-2 分钟）。1-bookworm 跟随最新 1.x，
+    # 与"stable + MSRV job 单独钉 1.93"的既有口径一致。
+    container:
+      image: rust:1-bookworm
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # all-features（rustpython/mlua）+ 全 targets + musl 的构建峰值会顶满
-      # runner 的剩余盘（本轮已出现过 No space left on device）；先清掉预装
-      # 大件换回 ~20GB。
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h /
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
       # 冷启动全特性编译（rustpython/mlua）约 8-12 分钟；rust-cache 复用
-      # registry 与 target，key 跟随 Cargo.lock。
+      # registry 与 target，key 跟随 Cargo.lock。容器内 HOME/CARGO_HOME 固定
+      # （/root、/usr/local/cargo），action 自动识别。
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      # all-features 会启用 rustpython（libffi-sys）等系统链接依赖
-      - name: Install system packages
+      # all-features 会启用 rustpython（libffi-sys）等系统链接依赖；容器是
+      # 纯 root，无需 sudo。官方镜像带 clippy/rustfmt 组件，这里幂等补一次
+      #（镜像若精简也不至于翻车）。
+      - name: Install system packages and toolchain components
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libffi-dev e2fsprogs musl-tools
+          apt-get update
+          apt-get install -y libffi-dev e2fsprogs musl-tools
+          rustup component add rustfmt clippy
       # build_script_bakes_files_and_rust_apps_into_a_real_image（cli.rs）是
       # 工具门控测试：有 cargo+musl target+mke2fs/debugfs 才会真正执行
       # （静态 runtime 构建 + mke2fs/debugfs 组装 + debugfs 回读校验），
@@ -272,12 +268,12 @@ jobs:
   msrv:
     name: MSRV check (Rust 1.93)
     runs-on: ubuntu-latest
+    # 直接用 1.93 镜像（rustup 预装）：省掉 dtolnay 的工具链下载。
+    container:
+      image: rust:1.93-bookworm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
-        with:
-          toolchain: 1.93.0
       # A fast compile-only check (no clippy/tests) to catch dependency MSRV regressions.
       # Dependabot may try to bump past the declared MSRV; this job fails before the
       # version reaches CI's all-features build.

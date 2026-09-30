@@ -17,9 +17,12 @@ on:
 permissions:
   contents: read
 
+# 新推送自动取消还在跑的上一次 E2E（每次 push 都会触发新的全量真机跑，
+# 旧跑的结果对新代码无意义；runner 一次性，被取消 run 的残留进程随 runner
+# 销毁，无需清理）。发布流水线 release.yml 保持串行，不在此列。
 concurrency:
   group: rfb-forkd-real-e2e
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   forkd-real-e2e:
