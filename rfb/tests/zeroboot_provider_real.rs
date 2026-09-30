@@ -136,12 +136,15 @@ fn filesystem_roundtrip_and_escape_rejection() {
 
         // write → read round-trip inside the workspace.
         let payload = b"rfb-zeroboot-provider-e2e\n";
+        // The ZBRT v1 wire has no mode field: the round-trip write carries no
+        // mode (the workspace executor fails a mode-carrying write closed —
+        // asserted right after this block, never silently ignores it).
         sandbox
             .write(WriteRequest {
                 path: "/workspace/e2e-probe.txt".into(),
                 data: payload.to_vec(),
                 append: false,
-                mode: Some(0o644),
+                mode: None,
             })
             .await
             .expect("write");
@@ -154,6 +157,22 @@ fn filesystem_roundtrip_and_escape_rejection() {
             .await
             .expect("read");
         assert_eq!(read.data, payload);
+
+        // mode fail-closed over the ZBRT transport (workspace executor
+        // contract): rejected, not silently dropped.
+        let mode_error = sandbox
+            .write(WriteRequest {
+                path: "/workspace/e2e-probe.txt".into(),
+                data: b"x".to_vec(),
+                append: false,
+                mode: Some(0o644),
+            })
+            .await
+            .expect_err("a mode-carrying write must be rejected over ZBRT");
+        assert!(
+            mode_error.to_string().contains("mode is not supported"),
+            "unexpected rejection: {mode_error}"
+        );
 
         // ls sees the file.
         let ls = sandbox
