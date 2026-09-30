@@ -322,6 +322,11 @@ jobs:
           apt-get install -y --no-install-recommends python3
           # 官方镜像带 clippy/rustfmt 组件，这里幂等补一次（与 rust job 同款）。
           rustup component add rustfmt clippy
+      # split-minimal --check 的 SDK 测试门需要 node（npm）与 java（maven）。
+      - name: Install node and java toolchains
+        run: |
+          apt-get update
+          apt-get install -y nodejs npm default-jdk-headless maven
       - name: Minimal split --check
         run: |
           set -euo pipefail

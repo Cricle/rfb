@@ -44,6 +44,24 @@ pub mod dispatcher {
     }
 }
 
+/// Serve the RFB1 framed NDJSON runtime over the guest's vsock listener
+/// (pid-1 mode): bind the configured vsock port, then accept and dispatch
+/// framed sessions until the listener fails. Transient accept errors back
+/// off (see `vsock::accept_failure_action`); config-class errors end run().
+///
+/// # Errors
+///
+/// Returns `Err` when the endpoint is invalid, the bind fails, or the accept
+/// loop exhausts its failure budget.
+/// Serve the RFB1 framed NDJSON runtime over the guest's vsock listener
+/// (pid-1 mode): bind the configured vsock port, then accept and dispatch
+/// framed sessions until the listener fails. Transient accept errors back
+/// off (see `vsock::accept_failure_action`); config-class errors end run().
+///
+/// # Errors
+///
+/// Returns `Err` when the endpoint is invalid, the bind fails, or the accept
+/// loop exhausts its failure budget.
 #[cfg(target_os = "linux")]
 pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
     crate::vsock::validate_endpoint(0, crate::config::DEFAULT_VSOCK_PORT)?;
