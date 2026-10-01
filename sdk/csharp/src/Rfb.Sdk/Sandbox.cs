@@ -7,7 +7,7 @@ namespace Rfb.Sdk;
 /// Sandbox facade over one forkd guest. Transport is "ndjson" (default) or
 /// "zbrt"; method names and result shapes are identical on both (UNIFIED_API.md §4).
 /// </summary>
-public sealed class Sandbox
+public sealed class Sandbox : IAsyncDisposable
 {
     private readonly RfbClient _client;
     private readonly TimeSpan _timeout;
@@ -419,6 +419,13 @@ public sealed class Sandbox
     public async Task Delete()
     {
         await _client.DeleteSandbox(Id).ConfigureAwait(false);
+    }
+
+    /// <summary>Async disposal — deletes the sandbox (2xx/404 both succeed);
+    /// <c>await using</c> guarantees cleanup on a mid-flow failure.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        await Delete().ConfigureAwait(false);
     }
 
     // Constant ZBRT fs-request bodies (payload never varies → build once).

@@ -29,6 +29,10 @@ Java = `io.rfb.sdk.*` + `*Error`（unchecked）；C# = `Rfb.Sdk.*` + `*Exception
 | `token` | env `FORKD_TOKEN`；**非空才带** `Authorization: Bearer` 头 |
 | `timeout_s` | 10 秒；必须 `> 0`（Java/C# 另拒绝 NaN/Inf），否则 Validation 错误 |
 
+导出常量（四语言同名，rust 为 `rfb::client::DEFAULT_ZBRT_TCP` /
+`GuestTransport` 枚举）：`TRANSPORT_NDJSON`="ndjson"、`TRANSPORT_ZBRT`="zbrt"、
+`DEFAULT_ZBRT_TCP`="127.0.0.1:15000"——示例与调用方禁止内联这些字面量。
+
 超时覆盖一次 HTTP 请求（连接 + 读）全程。线程安全：`RfbClient` 的 controller 请求共用一条
 keep-alive 连接，Python 实现以内部锁把请求串行化（同一 client 并发调用是安全的，但不并行）；
 guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 agent 认证
@@ -45,6 +49,13 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 | `list_sandboxes()` | 存活池 → `[Sandbox]`（NDJSON 门面） |
 | `connect(sandbox_or_id, transport=None)` | 传 `Sandbox` 原样附加（仅显式 transport 才覆盖）；传 id 则先 `list_sandboxes` 解析，未命中 → Remote（“sandbox not found”） |
 | `ping_sandbox(id)` / `delete_sandbox(id)` | controller 原样 ping 值 / **2xx 与 404 都算删除成功** |
+
+**清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
+RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java
+`implements AutoCloseable`（try-with-resources）、C# `IAsyncDisposable`
+（`await using`）、node `Symbol.asyncDispose`（`await using`，Node ≥ 20.11
+才可用该语法，旧版保持 try/finally）。rust 无异步 Drop，保持显式
+`delete()`（示例放在取值之后）。任何中途失败路径都不会泄漏活沙箱。
 
 ## 4. Sandbox：guest 操作（NDJSON 与 ZBRT 同名同结果形状）
 
@@ -100,6 +111,7 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 | `wait_snapshot` 预算 / 轮询间隔 | 60 s / 100 ms |
 | `exec` 超时 / cwd | 60 s / `/workspace`（四语言缺省一致；`/` 会被 agent 拒绝） |
 | guest 端口 | NDJSON agent TCP **8888**；ZBRT vsock **5000**（→ TCP relay） |
+| ZBRT 桥 TCP | env `RFB_ZBRT_TCP` → 常量 `DEFAULT_ZBRT_TCP` = `127.0.0.1:15000` |
 | 工作区根 | `/workspace`（agent 侧可用 `RFB_AGENT_WORKSPACE` 覆盖） |
 | 单帧 / 单行上限 | ZBRT payload ≤ **16 MiB**；NDJSON 行 ≤ **1 MiB** |
 | ZBRT 单 turn 聚合输出 | stdout+stderr ≤ **16 MiB**，超限 → Remote |

@@ -23,7 +23,7 @@ import java.util.Map;
  * <p>All PROTOCOL.md §2.3 validation runs locally before anything is sent;
  * failures raise {@link ValidationError}.
  */
-public final class Sandbox {
+public final class Sandbox implements AutoCloseable {
     private final RfbClient client;
     private final SandboxInfo info;
     private final String transport;
@@ -630,6 +630,13 @@ public final class Sandbox {
      */
     public void delete() {
         client.deleteSandbox(info.getId());
+    }
+
+    /** AutoCloseable — deletes the sandbox (2xx/404 both succeed);
+     * try-with-resources guarantees cleanup on a mid-flow failure. */
+    @Override
+    public void close() {
+        delete();
     }
 
     // ---- plumbing --------------------------------------------------------

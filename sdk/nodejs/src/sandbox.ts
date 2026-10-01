@@ -13,6 +13,8 @@ import { ZbrtConnection } from './zbrt-connection.js';
 
 export const TRANSPORT_NDJSON = 'ndjson';
 export const TRANSPORT_ZBRT = 'zbrt';
+/** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */
+export const DEFAULT_ZBRT_TCP = '127.0.0.1:15000';
 
 /** Extra read budget over the client + exec deadline (Rust `EXEC_READ_MARGIN`). */
 const EXEC_READ_MARGIN_MS = 5_000;

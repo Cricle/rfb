@@ -36,6 +36,9 @@ from .validation import (
 
 DEFAULT_EXEC_TIMEOUT_S = 60.0
 DEFAULT_WAIT_TIMEOUT_S = 60
+DEFAULT_ZBRT_TCP = "127.0.0.1:15000"
+TRANSPORT_NDJSON = "ndjson"
+TRANSPORT_ZBRT = "zbrt"
 _WAIT_POLL_INTERVAL_S = 0.1
 
 
@@ -408,6 +411,13 @@ class Sandbox:
     def delete(self) -> None:
         """Delete this sandbox via the controller."""
         self._client.delete_sandbox(self.id)
+
+    def __enter__(self) -> "Sandbox":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # 兜底：异常路径也删除，2xx/404 都算成功，不留活沙箱。
+        self.delete()
 
 
 class GuestStream:

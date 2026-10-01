@@ -13,7 +13,14 @@ from .errors import (
     TransportError,
     ValidationError,
 )
-from .facade import GuestStream, RfbClient, Sandbox
+from .facade import (
+    DEFAULT_ZBRT_TCP,
+    TRANSPORT_NDJSON,
+    TRANSPORT_ZBRT,
+    GuestStream,
+    RfbClient,
+    Sandbox,
+)
 from .host import ForkdHost, TcpVsockRelay, ZerobootHost
 from .models import (
     DirEntry,
@@ -27,6 +34,9 @@ from .models import (
 )
 
 __all__ = [
+    "DEFAULT_ZBRT_TCP",
+    "TRANSPORT_NDJSON",
+    "TRANSPORT_ZBRT",
     "RfbClient",
     "ZerobootHost",
     "ForkdHost",

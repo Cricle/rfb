@@ -18,6 +18,9 @@ public sealed class RfbClient : IDisposable
     /// <summary>Guest transport: ZBRT v1 frames.</summary>
     public const string TransportZbrt = "zbrt";
 
+    /// <summary>Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default).</summary>
+    public const string DefaultZbrtTcp = "127.0.0.1:15000";
+
     /// <summary>Client timeout in seconds (mirrors the other SDKs).</summary>
     public double TimeoutS => _timeout.TotalSeconds;
 

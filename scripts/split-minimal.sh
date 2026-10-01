@@ -431,6 +431,11 @@ must_replace(facade, '''from ._zbrt import (
 ''', "")
 must_replace(facade, "    MAX_ZBRT_PAYLOAD_BYTES,\n", "")
 must_replace(facade, "    validate_zbrt_args,\n", "")
+must_replace(facade, '''DEFAULT_ZBRT_TCP = "127.0.0.1:15000"
+TRANSPORT_NDJSON = "ndjson"
+TRANSPORT_ZBRT = "zbrt"
+''', '''TRANSPORT_NDJSON = "ndjson"
+''')
 must_replace(facade, '''def _zbrt_exec_result(t: tuple) -> ExecResult:
     code, stdout, stderr = t
     return ExecResult(exit_code=code, stdout=stdout, stderr=stderr, timed_out=False)
@@ -497,6 +502,12 @@ t = t.replace("protocol adapters (forkd controller HTTP, forkd guest NDJSON, ZBR
 t = t.replace("from .host import ForkdHost, TcpVsockRelay, ZerobootHost\n",
               "from .host import ForkdHost, TcpVsockRelay\n")
 t = t.replace('    "ZerobootHost",\n', "")
+t = t.replace("    DEFAULT_ZBRT_TCP,\n    TRANSPORT_NDJSON,\n    TRANSPORT_ZBRT,\n",
+              "    TRANSPORT_NDJSON,\n")
+t = t.replace('    "DEFAULT_ZBRT_TCP",\n    "TRANSPORT_NDJSON",\n    "TRANSPORT_ZBRT",\n',
+              '    "TRANSPORT_NDJSON",\n')
+assert "DEFAULT_ZBRT_TCP" not in t and "TRANSPORT_ZBRT" not in t, \
+    "__init__.py: zbrt-const leftover"
 assert "ZerobootHost" not in t, "__init__.py: ZerobootHost leftover"
 p.write_text(t, encoding="utf-8", newline="")
 
@@ -590,6 +601,10 @@ print("  python done")
 # ---------- nodejs ----------
 N = "sdk/nodejs"
 must_replace(f"{N}/src/sandbox.ts", "import { ZbrtConnection } from './zbrt-connection.js';\n", "")
+must_replace(f"{N}/src/sandbox.ts",
+             '''/** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */
+export const DEFAULT_ZBRT_TCP = '127.0.0.1:15000';
+''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "export const TRANSPORT_ZBRT")
 drop_brace_block(f"{N}/src/sandbox.ts", "function zbrtTimeoutMs")
 drop_brace_block(f"{N}/src/sandbox.ts", "this.transport === TRANSPORT_ZBRT", expect_min=6)
@@ -743,6 +758,9 @@ t = t.replace(
 t = t.replace(
     '    /** ZBRT (ZeroBoot v1) guest transport selector for {@link #connect}. */\n'
     '    public static final String TRANSPORT_ZBRT = "zbrt";\n', "")
+t = t.replace(
+    '\n    /** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */\n'
+    '    public static final String DEFAULT_ZBRT_TCP = "127.0.0.1:15000";\n', "\n")
 t = t.replace('!TRANSPORT_NDJSON.equals(transport) && !TRANSPORT_ZBRT.equals(transport)',
               '!TRANSPORT_NDJSON.equals(transport)')
 t = t.replace('throw new ValidationError("transport must be \\"ndjson\\" or \\"zbrt\\"");',
@@ -798,6 +816,11 @@ drop_brace_block(gv, "public static void ZbrtArgc(")
 must_replace(f"{C}/src/Rfb.Sdk/RfbClient.cs",
              '''    /// <summary>Guest transport: ZBRT v1 frames.</summary>
     public const string TransportZbrt = "zbrt";
+''', "")
+must_replace(f"{C}/src/Rfb.Sdk/RfbClient.cs",
+             '''
+    /// <summary>Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default).</summary>
+    public const string DefaultZbrtTcp = "127.0.0.1:15000";
 ''', "")
 drop_lines_csharp = [
     "    private readonly Lazy<ZbrtTcpClient> _zbrt;",

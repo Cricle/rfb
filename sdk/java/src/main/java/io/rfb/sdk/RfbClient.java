@@ -32,6 +32,9 @@ public final class RfbClient {
     /** ZBRT (ZeroBoot v1) guest transport selector for {@link #connect}. */
     public static final String TRANSPORT_ZBRT = "zbrt";
 
+    /** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */
+    public static final String DEFAULT_ZBRT_TCP = "127.0.0.1:15000";
+
     /** Wait-loop ceiling (24h): nanos-conversion overflow protection. */
     private static final double MAX_WAIT_TIMEOUT_S = 86_400;
 
