@@ -15,6 +15,17 @@ internal sealed class ForkdGuestNdjson
     private readonly string _host;
     private readonly int _port;
     private readonly TimeSpan _timeout;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<
+        (TcpClient Tcp, NetworkStream Stream, NdjsonLineReader Reader, long LastUsed)> _pool = new();
+
+    /// <summary>丢弃所有空闲连接（sandbox 删除/停机）。</summary>
+    internal void DrainPool()
+    {
+        while (_pool.TryDequeue(out var entry))
+        {
+            entry.Tcp.Dispose();
+        }
+    }
 
     public ForkdGuestNdjson(string address, TimeSpan timeout)
     {

@@ -3,6 +3,7 @@ package io.rfb.sdk.internal;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.rfb.sdk.DecodeError;
 import io.rfb.sdk.RemoteError;
+import io.rfb.sdk.RfbError;
 import io.rfb.sdk.TransportError;
 
 import java.io.BufferedInputStream;
@@ -144,6 +145,115 @@ public final class GuestNdjson {
             }
         } catch (IOException e) {
             throw new TransportError("guest connection failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** NDJSON 温连接池：agent 的 serve 循环在一条连接上顺序承载多个请求，
+     * 每请求新建 TCP 的握手/拆除 ≈ 0.4ms。条目 = socket + 已缓冲的流；
+     * 空闲 >1s 的连接直接弃用重连（ndjson 无握手，connect 本身就是验证）；
+     * 借出上失败 = 请求可能已在 guest 执行，绝不重试（弃用连接）。 */
+    public static final class Pool {
+        private final InetSocketAddress address;
+        private final Duration timeout;
+        private final java.util.concurrent.ConcurrentLinkedQueue<Entry> idle =
+                new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+        private static final class Entry {
+            final Socket socket;
+            final InputStream in;
+            final OutputStream out;
+            final long lastUsedNanos;
+
+            Entry(Socket socket, InputStream in, OutputStream out, long lastUsedNanos) {
+                this.socket = socket;
+                this.in = in;
+                this.out = out;
+                this.lastUsedNanos = lastUsedNanos;
+            }
+        }
+
+        public Pool(InetSocketAddress address, Duration timeout) {
+            this.address = address;
+            this.timeout = timeout;
+        }
+
+        /** 丢弃所有空闲连接（sandbox 删除/停机）。 */
+        public void drain() {
+            Entry entry;
+            while ((entry = idle.poll()) != null) {
+                try {
+                    entry.socket.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
+        }
+
+        public List<JsonNode> request(JsonNode action, Duration socketBudget)
+                throws IOException {
+            Entry entry = idle.poll();
+            if (entry != null
+                    && System.nanoTime() - entry.lastUsedNanos < 1_000_000_000L) {
+                try {
+                    List<JsonNode> responses = exchange(entry.in, entry.out, action);
+                    idle.offer(new Entry(entry.socket, entry.in, entry.out,
+                            System.nanoTime()));
+                    return responses;
+                } catch (RfbError | IOException e) {
+                    try {
+                        entry.socket.close();
+                    } catch (IOException ignored) {
+                        // best effort
+                    }
+                    if (e instanceof RfbError) {
+                        throw (RfbError) e;
+                    }
+                    throw new TransportError("guest connection failed: " + e.getMessage(), e);
+                }
+            }
+            if (entry != null) {
+                try {
+                    entry.socket.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+            }
+            Socket socket = connect(address, timeout);
+            try {
+                OutputStream out = socket.getOutputStream();
+                InputStream in = new BufferedInputStream(socket.getInputStream());
+                authenticate(in, out);
+                List<JsonNode> responses = exchange(in, out, action);
+                idle.offer(new Entry(socket, in, out, System.nanoTime()));
+                return responses;
+            } catch (RfbError | IOException e) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // best effort
+                }
+                if (e instanceof RfbError) {
+                    throw (RfbError) e;
+                }
+                throw new TransportError("guest connection failed: " + e.getMessage(), e);
+            }
+        }
+
+        private static List<JsonNode> exchange(InputStream in, OutputStream out,
+                JsonNode action) throws IOException {
+            writeLine(out, action);
+            List<JsonNode> responses = new ArrayList<>();
+            while (true) {
+                JsonNode line = readLine(in);
+                if (line == null) {
+                    throw new RemoteError("guest closed before response");
+                }
+                checkRemoteError(line);
+                responses.add(line);
+                if (isTerminal(line)) {
+                    return responses;
+                }
+            }
         }
     }
 

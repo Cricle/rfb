@@ -12,7 +12,7 @@ namespace Rfb.Sdk.Internal;
 internal sealed class NdjsonLineReader
 {
     private readonly NetworkStream _stream;
-    private readonly TimeSpan _timeout;
+    private TimeSpan _timeout;
     private readonly byte[] _chunk = new byte[8192];
     private byte[] _pending = new byte[8192]; // staged bytes not yet scanned
     private readonly MemoryStream _line = new(1024);
@@ -24,6 +24,10 @@ internal sealed class NdjsonLineReader
         _stream = stream;
         _timeout = timeout;
     }
+
+    /// <summary>池化复用：每次借出按本操作的实际预算刷新（exec 的宽预算
+    /// 不能被首次构造时的基础超时钉死）。</summary>
+    internal void Reset(TimeSpan timeout) => _timeout = timeout;
 
     /// <summary>
     /// Read one \n-terminated line (chunk-scanned, not byte-by-byte). Trailing

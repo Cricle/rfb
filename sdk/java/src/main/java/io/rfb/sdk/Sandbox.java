@@ -802,8 +802,22 @@ public final class Sandbox implements AutoCloseable {
     }
 
     private JsonNode ndjsonRequest(ObjectNode action) {
-        return GuestNdjson.last(GuestNdjson.request(guestAddress, timeout, action), "guest");
+        try {
+            return GuestNdjson.last(ndjsonPool().request(action, timeout), "guest");
+        } catch (java.io.IOException e) {
+            throw new TransportError("guest connection failed: " + e.getMessage(), e);
+        }
     }
+
+    /** NDJSON 温连接池（每 Sandbox 一个，懒建）。 */
+    private GuestNdjson.Pool ndjsonPool() {
+        if (ndjsonPool == null) {
+            ndjsonPool = new GuestNdjson.Pool(guestAddress, timeout);
+        }
+        return ndjsonPool;
+    }
+
+    private GuestNdjson.Pool ndjsonPool;
 
     /** Fixed margin on top of the exec read budget (Python {@code _guest.py} baseline). */
     private static final long NDJSON_EXEC_READ_MARGIN_MS = 5_000L;
@@ -814,8 +828,12 @@ public final class Sandbox implements AutoCloseable {
      * so the guest's own timeout error surfaces instead of the client's.
      */
     private JsonNode ndjsonRequest(ObjectNode action, double execTimeoutS) {
-        return GuestNdjson.last(GuestNdjson.request(guestAddress, execReadBudget(execTimeoutS), action),
-                "guest");
+        try {
+            return GuestNdjson.last(
+                    ndjsonPool().request(action, execReadBudget(execTimeoutS)), "guest");
+        } catch (java.io.IOException e) {
+            throw new TransportError("guest connection failed: " + e.getMessage(), e);
+        }
     }
 
     private Duration execReadBudget(double execTimeoutS) {

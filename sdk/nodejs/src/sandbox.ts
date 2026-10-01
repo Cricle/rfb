@@ -5,7 +5,7 @@
 import net from 'node:net';
 import type { RfbError } from './errors.js';
 import { DecodeError, RemoteError, TransportError, ValidationError } from './errors.js';
-import { parseAddress, request as ndjsonRequest, agentAuthToken } from './ndjson.js';
+import { parseAddress, NdjsonPool, agentAuthToken } from './ndjson.js';
 import type { NdjsonExchange } from './ndjson.js';
 import * as validation from './validation.js';
 import { ZbrtConnection } from './zbrt-connection.js';
@@ -190,6 +190,8 @@ export class Sandbox {
   readonly #client: { deleteSandbox(id: string): Promise<void>; };
   /** exec 温连接池：已 Hello 的空闲连接，借还复用（空闲 >1s 才验活）。 */
   #zbrtExecPool: { conn: ZbrtConnection; lastUsed: number }[] = [];
+  /** NDJSON 温连接池（forkd 生产路径的同款借还语义）。 */
+  #ndjsonPool: NdjsonPool | null = null;
   readonly #guestTimeoutMs: number;
 
   constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs = 10_000) {
@@ -538,6 +540,7 @@ export class Sandbox {
    * @throws {HttpStatusError} Non-2xx, non-404 controller answer.
    */
   async delete(): Promise<void> {
+    this.#ndjsonPool?.dispose();
     for (const { conn } of this.#zbrtExecPool.splice(0)) conn.close();
     await this.#client.deleteSandbox(this.id);
   }
@@ -597,7 +600,10 @@ export class Sandbox {
 
   async #guestRequest(action: Record<string, unknown>, timeoutMs: number = this.#guestTimeoutMs): Promise<NdjsonExchange> {
     const addr = parseAddress(this.guestAddr);
-    return ndjsonRequest(addr.host ?? '', addr.port ?? 0, timeoutMs, action);
+    if (this.#ndjsonPool === null) {
+      this.#ndjsonPool = new NdjsonPool(addr.host!, addr.port!);
+    }
+    return this.#ndjsonPool.request(action, timeoutMs);
   }
 
   async #fsRequest(op: number, path: string, args: Record<string, unknown>): Promise<NdjsonExchange> {

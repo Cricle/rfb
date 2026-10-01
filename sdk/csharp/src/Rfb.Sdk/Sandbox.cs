@@ -418,6 +418,10 @@ public sealed class Sandbox : IAsyncDisposable
     /// <exception cref="HttpStatusException">The controller returned a non-2xx, non-404 status.</exception>
     public async Task Delete()
     {
+        if (Transport == "ndjson")
+        {
+            _ndjson.Value.DrainPool();
+        }
         await _client.DeleteSandbox(Id).ConfigureAwait(false);
     }
 

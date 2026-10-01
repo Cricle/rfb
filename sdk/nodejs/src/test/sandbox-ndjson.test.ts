@@ -113,7 +113,9 @@ describe('Sandbox over NDJSON (fake guest)', () => {
     const lines: string[] = [];
     const port = await startGuest((line, socket, index) => {
       lines.push(line);
-      if (index === 0) socket.write('{"data":"hi","truncated":false,"total_bytes":2}\n');
+      // NDJSON 连接池下两次 read 复用同一条连接（index 0/1 都要应答——
+      // 真 agent 的 serve 循环就是多请求循环）。
+      if (index <= 1) socket.write('{"data":"hi","truncated":false,"total_bytes":2}\n');
     });
     const sandbox = sandboxOn(port);
     const plain = await sandbox.read('notes.txt');

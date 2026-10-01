@@ -97,13 +97,87 @@ export function request(
   timeoutMs: number,
   action: Record<string, unknown>,
 ): Promise<NdjsonExchange> {
+  const socket = net.createConnection({ host, port });
+  return startExchange(socket, action, timeoutMs, { fresh: true }).then(
+    (exchange) => {
+      socket.end();
+      return exchange;
+    },
+    (error) => {
+      socket.destroy();
+      throw error;
+    },
+  );
+}
+
+/**
+ * 温连接池（NDJSON）：agent 的 serve 循环在一条连接上顺序承载多个请求，
+ * 每请求新建 TCP 连接的握手/拆除 ≈ 0.4ms。连接私有于一次操作期间（一次
+ * 活跃请求）；借出上失败 = 请求可能已在 guest 执行，绝不重试（弃用连接）；
+ * 空闲 >1s 的连接直接弃用重连（ndjson 无握手，TCP connect 本身就是验证）。
+ */
+export class NdjsonPool {
+  private readonly idle: { socket: net.Socket; lastUsed: number }[] = [];
+
+  constructor(
+    private readonly host: string,
+    private readonly port: number,
+  ) {}
+
+  request(action: Record<string, unknown>, timeoutMs: number): Promise<NdjsonExchange> {
+    const idle = this.idle.pop();
+    if (idle && performance.now() - idle.lastUsed < 1000) {
+      return startExchange(idle.socket, action, timeoutMs, { fresh: false }).then(
+        (exchange) => {
+          this.idle.push({ socket: idle.socket, lastUsed: performance.now() });
+          return exchange;
+        },
+        (error) => {
+          idle.socket.destroy();
+          throw error;
+        },
+      );
+    }
+    if (idle) {
+      idle.socket.destroy();
+    }
+    const socket = net.createConnection({ host: this.host, port: this.port });
+    return startExchange(socket, action, timeoutMs, { fresh: true }).then(
+      (exchange) => {
+        this.idle.push({ socket, lastUsed: performance.now() });
+        return exchange;
+      },
+      (error) => {
+        socket.destroy();
+        throw error;
+      },
+    );
+  }
+
+  /** 丢弃所有空闲连接（sandbox 删除/停机）。 */
+  dispose(): void {
+    for (const { socket } of this.idle.splice(0)) {
+      socket.destroy();
+    }
+  }
+}
+
+/**
+ * 一次 NDJSON 交换：`fresh` = 新建的 socket（在 connect 后发，可能先走
+ * agent auth）；否则 = 池借出的已连接 socket（立即发，无 auth）。
+ */
+function startExchange(
+  socket: net.Socket,
+  action: Record<string, unknown>,
+  timeoutMs: number,
+  opts: { fresh: boolean },
+): Promise<NdjsonExchange> {
   return new Promise<NdjsonExchange>((resolve, reject) => {
-    const socket = net.createConnection({ host, port });
     const responses: Record<string, unknown>[] = [];
     let buffer = Buffer.alloc(0);
     let settled = false;
     const agentToken = agentAuthToken();
-    let awaitingAuth = agentToken !== null;
+    let awaitingAuth = opts.fresh && agentToken !== null;
 
     const sendLine = (value: Record<string, unknown>): void => {
       socket.write(Buffer.from(JSON.stringify(value) + '\n', 'utf8'));
@@ -119,7 +193,7 @@ export function request(
     const done = () => {
       if (!settled) {
         settled = true;
-        socket.end();
+        // 池化：socket 的归属归调用方（归还或销毁），这里不 end()。
         resolve({
           responses,
           last: responses[responses.length - 1] ?? {},
@@ -133,7 +207,7 @@ export function request(
       fail(new TransportError(`guest connection failed: ${error.message}`)),
     );
 
-    socket.on('connect', () => {
+    const begin = (): void => {
       socket.setNoDelay(true);
       if (agentToken === null) {
         sendLine(action);
@@ -141,7 +215,12 @@ export function request(
         // Agent auth first; the real action goes out only after ok=true.
         sendLine({ action: 'auth', token: agentToken });
       }
-    });
+    };
+    if (opts.fresh) {
+      socket.once('connect', begin);
+    } else {
+      begin();
+    }
 
     socket.on('data', (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
