@@ -101,7 +101,7 @@ pub struct SnapshotInfo {
 }
 
 /// Metadata describing a live forkd sandbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxInfo {
     /// Sandbox identifier.
     pub id: String,

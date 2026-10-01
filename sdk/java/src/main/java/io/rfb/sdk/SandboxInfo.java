@@ -34,6 +34,12 @@ public class SandboxInfo {
     @JsonProperty("branch_count")
     private long branchCount = 0L;
 
+    /** Convenience constructor for a direct attach (see {@code Sandbox.attach}). */
+    public SandboxInfo(String id, String guestAddr) {
+        this.id = id == null ? "" : id;
+        this.guestAddr = guestAddr == null ? "" : guestAddr;
+    }
+
     /** Sandbox id (controller-assigned). */
     @JsonProperty("id")
     public String getId() {
