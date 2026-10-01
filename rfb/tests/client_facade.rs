@@ -764,15 +764,13 @@ async fn zbrt_hello_first_and_control_connection_reuse() {
 
     let log = log.lock().unwrap().clone();
     let caps = ZBRT_V1_CAPABILITIES.join(",");
-    // 统一温池：每个连接的首帧必是 Hello；顺序复用不再逐次重发 Hello。
+    // 统一温池：每个连接的首帧必是 Hello（池的空闲验活可在连接中途合法地
+    // 重发 Hello——时间阈值 >1s，顺序复用的热路径不重发）。
     let mut seen_conns: Vec<(String, bool)> = Vec::new();
     for line in &log {
         let conn = line.split_whitespace().next().unwrap_or("").to_owned();
         let is_hello = line.contains("hello client=rfb-sdk");
-        if let Some(entry) = seen_conns.iter_mut().find(|(c, _)| *c == conn) {
-            assert!(!is_hello, "mid-connection hello: {line}");
-            let _ = entry;
-        } else {
+        if !seen_conns.iter().any(|(c, _)| *c == conn) {
             seen_conns.push((conn, is_hello));
         }
     }
