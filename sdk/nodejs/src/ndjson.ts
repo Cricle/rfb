@@ -172,6 +172,10 @@ function startExchange(
   timeoutMs: number,
   opts: { fresh: boolean },
 ): Promise<NdjsonExchange> {
+  // 池化复用的前提：上一次交换的监听器必须清干净——否则每次借出都往同一
+  // socket 上再挂 data/error/close 闭包（旧闭包持有各自的 responses/buffer，
+  // 实测 2000 次操作 = 1.3GB 留驻且 GC 不回落）。
+  socket.removeAllListeners();
   return new Promise<NdjsonExchange>((resolve, reject) => {
     const responses: Record<string, unknown>[] = [];
     let buffer = Buffer.alloc(0);

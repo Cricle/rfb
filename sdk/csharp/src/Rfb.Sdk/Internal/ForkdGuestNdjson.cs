@@ -16,7 +16,7 @@ internal sealed class ForkdGuestNdjson
     private readonly int _port;
     private readonly TimeSpan _timeout;
     private readonly System.Collections.Concurrent.ConcurrentQueue<
-        (TcpClient Tcp, NetworkStream Stream, NdjsonLineReader Reader, long LastUsed)> _pool = new();
+        (TcpClient Tcp, NetworkStream Stream, long LastUsed)> _pool = new();
 
     /// <summary>丢弃所有空闲连接（sandbox 删除/停机）。</summary>
     internal void DrainPool()
@@ -125,16 +125,96 @@ internal sealed class ForkdGuestNdjson
     /// `readBudget` null reads at the base timeout (PROTOCOL.md §2.1).</summary>
     private async Task<List<JsonElement>> RequestAsync(Dictionary<string, object?> action, TimeSpan? readBudget = null)
     {
-        using var tcp = new TcpClient();
-        await ConnectAsync(tcp).ConfigureAwait(false);
-        using var stream = tcp.GetStream();
-        await WriteLineAsync(stream, JsonSerializer.Serialize(action)).ConfigureAwait(false);
+        var serialized = JsonSerializer.Serialize(action);
+        var undeliveredRetry = false;
+        while (true)
+        {
+            var (tcp, stream) = await BorrowAsync(undeliveredRetry).ConfigureAwait(false);
+            try
+            {
+                await WriteLineAsync(stream, serialized).ConfigureAwait(false);
+            }
+            catch
+            {
+                // 写失败 = 请求未送达：丢弃本连接，换新连接重试一次。
+                tcp.Dispose();
+                if (undeliveredRetry)
+                {
+                    throw;
+                }
 
-        var reader = new NdjsonLineReader(stream, readBudget ?? _timeout);
+                undeliveredRetry = true;
+                continue;
+            }
+
+            try
+            {
+                var responses = await ExchangeAsync(
+                    new NdjsonLineReader(stream, readBudget ?? _timeout)).ConfigureAwait(false);
+                Repay(tcp, stream);
+                return responses;
+            }
+            catch
+            {
+                // 已送达后的失败（读超时/解码/guest 错误/对端断开）：连接不可信，
+                // 丢弃但绝不重试——重发可能让 exec 执行两次。
+                tcp.Dispose();
+                throw;
+            }
+        }
+    }
+
+    /// <summary>借一条温连接：池中空闲 &lt;1s 的直接复用（零额外 RTT），空闲超时
+    /// 或写死的直接丢弃（NDJSON 无握手可用作验活，语义同 rust guest.rs）。</summary>
+    private async Task<(TcpClient, NetworkStream)> BorrowAsync(bool forceFresh)
+    {
+        if (!forceFresh)
+        {
+            while (_pool.TryDequeue(out var entry))
+            {
+                if (System.Diagnostics.Stopwatch.GetTimestamp() - entry.LastUsed
+                    < System.Diagnostics.Stopwatch.Frequency)
+                {
+                    return (entry.Tcp, entry.Stream);
+                }
+
+                entry.Tcp.Dispose();
+            }
+        }
+
+        var tcp = new TcpClient();
+        try
+        {
+            await ConnectAsync(tcp).ConfigureAwait(false);
+        }
+        catch
+        {
+            tcp.Dispose();
+            throw;
+        }
+
+        return (tcp, tcp.GetStream());
+    }
+
+    private void Repay(TcpClient tcp, NetworkStream stream)
+    {
+        if (_pool.Count < 8)
+        {
+            _pool.Enqueue((tcp, stream, System.Diagnostics.Stopwatch.GetTimestamp()));
+        }
+        else
+        {
+            tcp.Dispose();
+        }
+    }
+
+    /// <summary>Read response lines until the terminal one; empty keepalive
+    /// lines are skipped like the Rust/Python/Java baselines.</summary>
+    private static async Task<List<JsonElement>> ExchangeAsync(NdjsonLineReader reader)
+    {
         var responses = new List<JsonElement>();
         while (true)
         {
-            // Skip empty keepalive lines like the Rust/Python/Java baselines.
             var line = await reader.ReadLineAsync(skipEmpty: true).ConfigureAwait(false);
             if (line is null)
             {

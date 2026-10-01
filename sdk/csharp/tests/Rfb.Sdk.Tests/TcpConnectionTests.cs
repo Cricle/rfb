@@ -6,7 +6,8 @@ namespace Rfb.Sdk.Tests;
 /// <summary>
 /// TCP connection-count regression tests: the controller HTTP client must reuse
 /// one pooled keep-alive connection per RfbClient, while the NDJSON guest keeps
-/// its connection-per-request semantics (Rust reference behavior).
+/// its warm-pool reuse semantics (back-to-back ops share one accepted
+/// connection; idle >1s connections are dropped, matching the Rust baseline).
 /// </summary>
 public class TcpConnectionTests
 {
@@ -61,7 +62,7 @@ public class TcpConnectionTests
     }
 
     [Fact]
-    public async Task Guest_Ndjson_Keeps_Connection_Per_Request()
+    public async Task Guest_Ndjson_Pools_Warm_Connections()
     {
         using var guest = new FakeNdjsonGuest();
         using var server = new FakeKeepAliveHttpServer(_ =>
@@ -76,7 +77,9 @@ public class TcpConnectionTests
             Assert.Equal(0, result.ExitCode);
         }
 
-        // NDJSON guest: connection-per-request (invariable reference semantics).
-        Assert.Equal(execs, guest.AcceptCount);
+        // NDJSON guest: warm-pool reuse — back-to-back execs ride ONE accepted
+        // connection (idle <1s borrows skip the re-dial, matching the pooled
+        // rust/python/node/java baselines).
+        Assert.Equal(1, guest.AcceptCount);
     }
 }
