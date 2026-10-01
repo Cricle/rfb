@@ -195,6 +195,9 @@ public final class GuestNdjson {
             if (entry != null
                     && System.nanoTime() - entry.lastUsedNanos < 1_000_000_000L) {
                 try {
+                    // 本操作的读预算刷新 SoTimeout（exec 的宽预算不能被
+                    // 建连时的基础超时钉死）。
+                    entry.socket.setSoTimeout((int) socketBudget.toMillis());
                     List<JsonNode> responses = exchange(entry.in, entry.out, action);
                     idle.offer(new Entry(entry.socket, entry.in, entry.out,
                             System.nanoTime()));
@@ -220,6 +223,7 @@ public final class GuestNdjson {
             }
             Socket socket = connect(address, timeout);
             try {
+                socket.setSoTimeout((int) socketBudget.toMillis());
                 OutputStream out = socket.getOutputStream();
                 InputStream in = new BufferedInputStream(socket.getInputStream());
                 authenticate(in, out);

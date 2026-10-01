@@ -28,6 +28,8 @@ final class FakeNdjsonServer implements AutoCloseable {
     private final List<Socket> sockets = new ArrayList<>();
     private final List<Throwable> handlerFailures = java.util.Collections.synchronizedList(new ArrayList<>());
     private volatile boolean closed = false;
+    private final java.util.concurrent.atomic.AtomicInteger requestIndex =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     FakeNdjsonServer(ConnHandler... perConnectionHandlers) throws IOException {
         this.serverSocket = new ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"));
@@ -58,7 +60,6 @@ final class FakeNdjsonServer implements AutoCloseable {
                 synchronized (sockets) {
                     sockets.add(socket);
                 }
-                ConnHandler handler = handlers.size() > 1 ? handlers.remove(0) : handlers.get(0);
                 pool.submit(() -> {
                     try (socket) {
                         BufferedReader in = new BufferedReader(
@@ -66,7 +67,22 @@ final class FakeNdjsonServer implements AutoCloseable {
                         PrintWriter out = new PrintWriter(
                                 new java.io.BufferedWriter(new java.io.OutputStreamWriter(
                                         socket.getOutputStream(), StandardCharsets.UTF_8)));
-                        handler.handle(in, out);
+                        // 连接复用模型（对齐真 agent 的 serve 循环）：每个
+                        // 请求依序取下一个脚本化 handler；耗尽后停在最后一个
+                        // （SDK 的连接池会让多个请求共享一条连接）。
+                        while (true) {
+                            int index = requestIndex.getAndIncrement();
+                            ConnHandler handler = handlers.size() > 1
+                                    ? handlers.get(Math.min(index, handlers.size() - 1))
+                                    : handlers.get(0);
+                            try {
+                                handler.handle(in, out);
+                            } catch (NullPointerException exhausted) {
+                                // handler 读到 readLine()==null = 客户端已关：
+                                // 连接结束（流的单请求 handler 没料到循环）。
+                                break;
+                            }
+                        }
                     } catch (IOException ignored) {
                         // client went away — fine for a fake
                     } catch (Throwable failure) {
