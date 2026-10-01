@@ -67,6 +67,10 @@ pub(super) struct ZbrtGuest {
     /// lazily on next use; the socket is closed when the last clone of this
     /// adapter (i.e. of the owning facade) is dropped.
     control: Arc<Mutex<Option<TcpStream>>>,
+    /// Warm exec connections: established + Hello-ed, idle. A connection may
+    /// serve sequential turns (the c# precedent); concurrent execs each take
+    /// their own, keeping the one-active-request-per-connection rule intact.
+    exec_pool: Arc<Mutex<Vec<TcpStream>>>,
 }
 
 fn io_error(message: &'static str) -> RfbError {
@@ -91,6 +95,7 @@ impl ZbrtGuest {
             address,
             timeout,
             control: Arc::new(Mutex::new(None)),
+            exec_pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -315,8 +320,17 @@ impl ZbrtGuest {
             request_id,
             payload,
         };
-        let mut stream = self.connect().await?;
-        self.handshake(&mut stream).await?;
+        // Warm pool: borrow (the re-Hello doubles as a liveness probe — a
+        // dead idle connection falls through to a fresh one), run the turn,
+        // and return the cleanly-finished connection for reuse.
+        let mut stream = match self.borrow_exec().await {
+            Some(s) => s,
+            None => {
+                let mut s = self.connect().await?;
+                self.handshake(&mut s).await?;
+                s
+            }
+        };
         Self::write_frame(&mut stream, &request).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -352,6 +366,7 @@ impl ZbrtGuest {
                 Kind::Exit => {
                     let exit = Exit::decode(&frame.payload)
                         .map_err(|_| decode_error("invalid Exit payload"))?;
+                    self.repay_exec(stream).await;
                     return Ok(GuestExecResult {
                         exit_code: exit.code,
                         stdout,
@@ -377,6 +392,24 @@ impl ZbrtGuest {
                 }
             }
         }
+    }
+
+    async fn borrow_exec(&self) -> Option<TcpStream> {
+        let mut pool = self.exec_pool.lock().await;
+        while let Some(mut stream) = pool.pop() {
+            if self.handshake(&mut stream).await.is_ok() {
+                return Some(stream);
+            }
+        }
+        None
+    }
+
+    async fn repay_exec(&self, stream: TcpStream) {
+        let mut pool = self.exec_pool.lock().await;
+        if pool.len() < 4 {
+            pool.push(stream);
+        }
+        // else: dropped = closed
     }
 
     /// One structured filesystem RPC on the shared control connection:

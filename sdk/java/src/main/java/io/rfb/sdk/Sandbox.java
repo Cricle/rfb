@@ -32,6 +32,9 @@ public final class Sandbox implements AutoCloseable {
     /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
     private ZbrtConnection zbrtControl;
     private final Object zbrtControlLock = new Object();
+    /** exec 温连接池（已 Hello 的空闲连接）。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<ZbrtConnection>
+            zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private Sandbox(RfbClient client, SandboxInfo info, String transport) {
         this.client = client;
@@ -214,10 +217,7 @@ public final class Sandbox implements AutoCloseable {
             // The guest needs the full deadline to surface its own timeout
             // error: widen the socket budget like the NDJSON exec path
             // (client timeout + deadline + 5 s margin).
-            try (ZbrtConnection conn = openZbrt(execReadBudget(timeoutS))) {
-                ZbrtConnection.Exec exec = conn.execute(args, effectiveCwd, stdin, timeoutMs);
-                return new ExecResult(exec.code(), exec.stdout(), exec.stderr(), exec.timedOut());
-            }
+            return execViaPool(args, effectiveCwd, stdin, timeoutMs, timeoutS);
         }
         // The NDJSON exec wire contract has no stdin channel: non-empty stdin
         // would run the command WITHOUT its input, so fail closed (delivered
@@ -631,6 +631,10 @@ public final class Sandbox implements AutoCloseable {
      */
     public void delete() {
         dropZbrtControl();
+        ZbrtConnection pooled;
+        while ((pooled = zbrtExecPool.poll()) != null) {
+            pooled.close();
+        }
         client.deleteSandbox(info.getId());
     }
 
@@ -709,6 +713,66 @@ public final class Sandbox implements AutoCloseable {
                 }
             }
             throw new TransportError("zbrt control exchange exhausted");
+        }
+    }
+
+    /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活
+     * ——死的丢弃继续找/回退新连接）；写失败 = 请求未送达，换新连接重试
+     * 一次；读侧失败绝不重试。池连接的 socket 预算在借出时刷新。 */
+    private ExecResult execViaPool(List<String> args, String cwd, byte[] stdin,
+                                   long timeoutMs, double timeoutS) {
+        ZbrtConnection conn = borrowExecConn(execReadBudget(timeoutS));
+        boolean pooled = conn != null;
+        if (conn == null) {
+            conn = openZbrt(execReadBudget(timeoutS));
+        }
+        try {
+            ZbrtConnection.Exec exec =
+                    conn.execute(args, cwd, stdin, timeoutMs);
+            repayExecConn(conn);
+            return new ExecResult(exec.code(), exec.stdout(), exec.stderr(),
+                    exec.timedOut());
+        } catch (RfbError e) {
+            conn.close();
+            if (pooled && e instanceof TransportError
+                    && e.getMessage() != null
+                    && e.getMessage().startsWith("zbrt write")) {
+                ZbrtConnection fresh = openZbrt(execReadBudget(timeoutS));
+                try {
+                    ZbrtConnection.Exec exec = fresh.execute(
+                            args, cwd, stdin, timeoutMs);
+                    repayExecConn(fresh);
+                    return new ExecResult(exec.code(), exec.stdout(),
+                            exec.stderr(), exec.timedOut());
+                } catch (RfbError e2) {
+                    fresh.close();
+                    throw e2;
+                }
+            }
+            throw e;
+        }
+    }
+
+    private ZbrtConnection borrowExecConn(Duration socketBudget) {
+        while (true) {
+            ZbrtConnection conn = zbrtExecPool.poll();
+            if (conn == null) {
+                return null;
+            }
+            try {
+                conn.hello(ZbrtConnection.CLIENT_NAME);
+                return conn;
+            } catch (RfbError e) {
+                conn.close();
+            }
+        }
+    }
+
+    private void repayExecConn(ZbrtConnection conn) {
+        if (zbrtExecPool.size() < 4) {
+            zbrtExecPool.offer(conn);
+        } else {
+            conn.close();
         }
     }
 

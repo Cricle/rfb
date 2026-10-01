@@ -414,6 +414,9 @@ class _ZbrtGuestClient:
         # exec/stream 保持每 turn 一条新连接（UNIFIED_API §3.4）。
         self._control = None
         self._control_lock = threading.Lock()
+        # exec 温连接池：新连接握手是毫秒级成本；一条连接可顺序跑多个 turn
+        # （Hello 幂等），池保住已握手的空闲连接，exec 借还即用。
+        self._exec_pool = []
 
     def drop_control(self) -> None:
         """Close the cached control connection (sandbox deleted / shutdown)."""
@@ -427,6 +430,30 @@ class _ZbrtGuestClient:
             except OSError:
                 pass
             self._control = None
+
+    def _pop_exec_pool(self, timeout_s: float):
+        """Borrow a warm exec connection (re-Hello = liveness probe), or None."""
+        while self._exec_pool:
+            sock = self._exec_pool.pop()
+            try:
+                sock.settimeout(timeout_s)
+                self._handshake(sock)
+                return sock
+            except (TransportError, DecodeError, OSError):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        return None
+
+    def _repay_exec_pool(self, sock: socket.socket) -> None:
+        if len(self._exec_pool) < 4:
+            self._exec_pool.append(sock)
+        else:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     @staticmethod
     def _retryable(error: TransportError) -> bool:
@@ -531,7 +558,30 @@ class _ZbrtGuestClient:
 
     def _exec(self, argv, cwd, timeout_s, stdin) -> tuple:
         read_timeout = self._effective_timeout(timeout_s)
+        # 温连接借出（借出前已重发 Hello 验活——连接已死则回退新连接）；
+        # 写失败 = 请求未送达，换新连接重试一次；读侧失败绝不重试。
+        sock = self._pop_exec_pool(read_timeout)
+        if sock is not None:
+            try:
+                return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
+                                       read_timeout, pooled=True)
+            except TransportError as e:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if str(e).startswith("zbrt write"):
+                    sock = self._connect(read_timeout)
+                    return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
+                                           read_timeout, pooled=False)
+                raise
         sock = self._connect(read_timeout)
+        return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
+                               read_timeout, pooled=False)
+
+    def _exec_turn(self, sock, argv, cwd, timeout_s, stdin, read_timeout,
+                   pooled: bool) -> tuple:
+        repaid = False
         try:
             request_id = new_request_id()
             # Rust baseline (facade.rs GuestOps::exec / ::eval ZBRT branch):
@@ -563,13 +613,17 @@ class _ZbrtGuestClient:
                         raise DecodeError(f"invalid zbrt output stream id {stream}")
                 elif kind == KIND_EXIT:
                     code, _signal = decode_exit(payload)
+                    # 干净结束一律归还（新连接也回池）——否则池永远是空的。
+                    self._repay_exec_pool(sock)
+                    repaid = True
                     return int(code), bytes(stdout), bytes(stderr)
                 elif kind == KIND_ERROR:
                     raise RemoteError(decode_error(payload)[1])
                 else:
                     raise DecodeError(f"unexpected zbrt frame kind {kind} during execute")
         finally:
-            sock.close()
+            if not repaid:
+                sock.close()
 
     def exec(self, args, cwd, timeout_s, stdin=b"") -> tuple:
         return self._exec(list(args), cwd, timeout_s, bytes(stdin))

@@ -191,6 +191,8 @@ export class Sandbox {
   /** health/fs 复用的控制连接（rust zbrt.rs 语义）+ 串行化锁。 */
   #zbrtControlConn: Promise<ZbrtConnection> | null = null;
   #zbrtControlLock: Promise<unknown> = Promise.resolve();
+  /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活）。 */
+  #zbrtExecPool: ZbrtConnection[] = [];
   readonly #guestTimeoutMs: number;
 
   constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs = 10_000) {
@@ -256,18 +258,9 @@ export class Sandbox {
       validation.zbrtArgs(args);
       const stdinBytes = stdin ?? Buffer.alloc(0);
       validation.payloadSize(stdinBytes.byteLength, validation.MAX_ZBRT_PAYLOAD_BYTES);
-      const conn = await this.#zbrt();
-      try {
-        const exec = await conn.execute(
-          args,
-          cwd,
-          stdinBytes,
-          zbrtTimeoutMs(timeoutS),
-        );
-        return this.#execResult(exec.code, exec.stdout, exec.stderr, exec.timedOut);
-      } finally {
-        conn.close();
-      }
+      const exec = await this.#withExecConn(
+        (conn) => conn.execute(args, cwd, stdinBytes, zbrtTimeoutMs(timeoutS)));
+      return this.#execResult(exec.code, exec.stdout, exec.stderr, exec.timedOut);
     }
     // The NDJSON exec wire contract has no stdin channel: non-empty stdin
     // would run the command WITHOUT its input, so fail closed (delivered
@@ -550,6 +543,7 @@ export class Sandbox {
   async delete(): Promise<void> {
     await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
     this.#zbrtControlConn = null;
+    for (const c of this.#zbrtExecPool.splice(0)) c.close();
     await this.#client.deleteSandbox(this.id);
   }
 
@@ -565,6 +559,46 @@ export class Sandbox {
    * 未送达”的失败（写失败 / 对端关闭）换新连接重试一次；读超时
    * ('guest read timed out') 与解码/guest 错误不重试。串行化防并发交错。
    */
+  /** 借一条 exec 温连接：池里同步 pop + re-Hello 验活（死的丢弃继续找/
+   * 回退新连接）。单线程 event loop 下同步 pop 无交错风险。 */
+  async #borrowExecConn(): Promise<ZbrtConnection> {
+    while (this.#zbrtExecPool.length > 0) {
+      const conn = this.#zbrtExecPool.pop()!;
+      try {
+        await conn.hello('rfb-sdk-node');
+        return conn;
+      } catch {
+        conn.close();
+      }
+    }
+    return this.#zbrt();
+  }
+
+  /** exec turn：借 → 用 → 干净结束归还（复用）→ 故障关闭。 */
+  async #withExecConn<T>(op: (conn: ZbrtConnection) => Promise<T>): Promise<T> {
+    const conn = await this.#borrowExecConn();
+    try {
+      const out = await op(conn);
+      this.#zbrtExecPool.push(conn);
+      return out;
+    } catch (error) {
+      conn.close();
+      // 写失败 = 请求未送达：换新连接重试一次；读超时/解码/guest 错误绝不重试。
+      if (error instanceof TransportError && error.message.startsWith('zbrt write failed')) {
+        const fresh = await this.#zbrt();
+        try {
+          const out = await op(fresh);
+          this.#zbrtExecPool.push(fresh);
+          return out;
+        } catch (e2) {
+          fresh.close();
+          throw e2;
+        }
+      }
+      throw error;
+    }
+  }
+
   async #withControl<T>(op: (conn: ZbrtConnection) => Promise<T>): Promise<T> {
     const run = this.#zbrtControlLock.then(async () => {
       for (const reuse of [true, false]) {

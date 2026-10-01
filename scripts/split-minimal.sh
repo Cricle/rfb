@@ -613,6 +613,13 @@ must_replace(f"{N}/src/sandbox.ts", '''  /** health/fs 复用的控制连接（r
   #zbrtControlLock: Promise<unknown> = Promise.resolve();
 ''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #withControl<")
+drop_brace_block(f"{N}/src/sandbox.ts", "async #borrowExecConn(")
+drop_brace_block(f"{N}/src/sandbox.ts", "async #withExecConn<")
+must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活）。 */
+  #zbrtExecPool: ZbrtConnection[] = [];
+''', "")
+must_replace(f"{N}/src/sandbox.ts",
+             "    for (const c of this.#zbrtExecPool.splice(0)) c.close();\n", "")
 must_replace(f"{N}/src/sandbox.ts", '''    await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
     this.#zbrtControlConn = null;
 ''', "")
@@ -673,6 +680,19 @@ drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConn
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private <T> T zbrtControl(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private static boolean zbrtRetryable(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void dropZbrtControl(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ExecResult execViaPool(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConnection borrowExecConn(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void repayExecConn(")
+must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** exec 温连接池（已 Hello 的空闲连接）。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<ZbrtConnection>
+            zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
+''', "")
+must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
+             '''        ZbrtConnection pooled;
+        while ((pooled = zbrtExecPool.poll()) != null) {
+            pooled.close();
+        }
+''', "")
 must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
     private ZbrtConnection zbrtControl;
     private final Object zbrtControlLock = new Object();
