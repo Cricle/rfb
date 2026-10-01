@@ -95,7 +95,7 @@ impl ZbrtGuest {
     }
 
     async fn connect(&self) -> Result<TcpStream, RfbError> {
-        let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
+        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
             .map_err(|_| transport_timeout("zbrt connect timeout"))?
             .map_err(RfbError::Transport)?;
