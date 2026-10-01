@@ -28,4 +28,3 @@
 - `repl.py` — 宿主侧编排 + 交互式沙箱演示（`rfb_sdk.host` 双后端自举，
   KVM + root）：`sudo python3 repl.py --up`（`--down` 停后端）；
   制品一次性搭建 `bash setup-demo-assets.sh`（不入 git，默认 `./assets/`）。
-- `test_repl.py` — 示例单测（无需 VM）：`python3 test_repl.py`。
