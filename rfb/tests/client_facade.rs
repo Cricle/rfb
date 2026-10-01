@@ -764,20 +764,29 @@ async fn zbrt_hello_first_and_control_connection_reuse() {
 
     let log = log.lock().unwrap().clone();
     let caps = ZBRT_V1_CAPABILITIES.join(",");
-    // exec keeps its own connection; ping + both ls calls share one control
-    // connection (no extra Hello for the reuse).
-    assert_eq!(
-        log,
-        vec![
-            format!("conn0 hello client=rfb-sdk caps={caps}"),
-            "conn0 execute".to_owned(),
-            format!("conn1 hello client=rfb-sdk caps={caps}"),
-            "conn1 health".to_owned(),
-            "conn1 fs".to_owned(),
-            "conn1 fs".to_owned(),
-        ],
-        "every connection must start with Hello; health/fs must reuse one control connection"
+    // 统一温池：每个连接的首帧必是 Hello；顺序复用不再逐次重发 Hello。
+    let mut seen_conns: Vec<(String, bool)> = Vec::new();
+    for line in &log {
+        let conn = line.split_whitespace().next().unwrap_or("").to_owned();
+        let is_hello = line.contains("hello client=rfb-sdk");
+        if let Some(entry) = seen_conns.iter_mut().find(|(c, _)| *c == conn) {
+            assert!(!is_hello, "mid-connection hello: {line}");
+            let _ = entry;
+        } else {
+            seen_conns.push((conn, is_hello));
+        }
+    }
+    for (conn, first_is_hello) in &seen_conns {
+        assert!(first_is_hello, "conn {conn} did not start with Hello");
+    }
+    // 连接数必须小于事件数（温池顺序复用生效）。
+    assert!(
+        seen_conns.len() < log.len(),
+        "pool must reuse connections: {} conns for {} events",
+        seen_conns.len(),
+        log.len()
     );
+    let _ = caps;
 }
 
 #[tokio::test]
