@@ -2,7 +2,7 @@
 //!
 //! ```
 //! use rfb_runtime::session::{TerminalEvent, TerminalStream, RuntimeEvent};
-//! let event = RuntimeEvent::Output { sequence: 2, terminal: TerminalEvent { stream: TerminalStream::Stdout, data: "ok".into() } };
+//! let event = RuntimeEvent::Output { sequence: 2, terminal: TerminalEvent { stream: TerminalStream::Stdout, data: "ok".into(), data_bytes: None } };
 //! assert_eq!(event.kind_label(), "terminal.output");
 //! assert_eq!(event.sequence(), 2);
 //! assert!(!event.is_terminal());
@@ -88,8 +88,13 @@ pub enum TerminalStream {
 pub struct TerminalEvent {
     /// Which stream produced the text.
     pub stream: TerminalStream,
-    /// UTF-8 text chunk.
+    /// UTF-8 text chunk (valid-UTF-8 chunks only).
     pub data: String,
+    /// Byte-exact chunk for NON-UTF-8 output (JSON array form on the wire;
+    /// the ZBRT frame layer prefers it over `data`). postcard 兼容：不能
+    /// skip_serializing_if（线格式无自描述），None 恒编码为 null。
+    #[serde(default)]
+    pub data_bytes: Option<Vec<u8>>,
 }
 
 /// Strong typed Runtime event classification, replacing kind-string convention.

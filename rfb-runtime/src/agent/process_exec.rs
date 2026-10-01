@@ -125,6 +125,17 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     Ok((data, truncated))
 }
 
+/// Wire contract (UNIFIED_API §4 / forkd_value_bytes): exec output travels as
+/// a UTF-8 string when valid, else as a byte-value array (byte-exact; every
+/// host SDK decodes both). Binary-over-string = U+FFFD corruption (measured:
+/// 64KB of binary inflated 2x and destroyed before this existed).
+fn bytes_to_wire(data: &[u8]) -> Value {
+    match std::str::from_utf8(data) {
+        Ok(text) => Value::String(text.to_owned()),
+        Err(_) => Value::Array(data.iter().map(|b| Value::Number((*b).into())).collect()),
+    }
+}
+
 pub async fn execute(request: &Value) -> io::Result<Value> {
     // An explicit `timeout` always wins; a request without one gets the
     // default deadline instead of waiting forever (see
@@ -199,10 +210,10 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
         }
     };
     Ok(json!({
-        "out": String::from_utf8_lossy(&out),
-        "err": String::from_utf8_lossy(&err),
-        "stdout": String::from_utf8_lossy(&out),
-        "stderr": String::from_utf8_lossy(&err),
+        "out": bytes_to_wire(&out),
+        "err": bytes_to_wire(&err),
+        "stdout": bytes_to_wire(&out),
+        "stderr": bytes_to_wire(&err),
         "exit_code": status.code(),
         "error": null,
         "timed_out": false,

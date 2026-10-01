@@ -405,6 +405,7 @@ mod unix_tests {
                             payload: serde_json::to_vec(&TerminalEvent {
                                 stream: TerminalStream::Stdout,
                                 data: "hello-from-guest".into(),
+                                data_bytes: None,
                             })
                             .unwrap(),
                         }),

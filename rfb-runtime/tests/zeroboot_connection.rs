@@ -15,7 +15,7 @@ use rfb_runtime::zeroboot_connection::serve;
 use rfb_runtime::zeroboot_protocol::Exit;
 use rfb_runtime::zeroboot_protocol::{
     read_frame_async, write_frame_async, Cancel, Error as ZbrtError, Execute, Frame, Fs, Health,
-    Hello, HelloAck, Kind,
+    Hello, HelloAck, Kind, Output,
 };
 use std::fs;
 use std::sync::Arc;
@@ -117,6 +117,46 @@ async fn collect_until_terminal(
             other => panic!("unexpected frame kind {other:?} while awaiting terminal"),
         }
     }
+}
+
+#[tokio::test]
+async fn exec_output_frames_are_byte_exact_for_binary() {
+    // 修复回归：agent 的 stdout 流在 from_utf8_lossy 处损坏二进制（64KB
+    // 膨胀 2×、高位字节全毁）。真实 serve 链（帧级）必须原样搬运。
+    let root = workspace();
+    let mut host = spawn_guest(root.clone()).await;
+    handshake(&mut host).await;
+
+    let exec = Execute {
+        argv: vec![
+            "bash".into(),
+            "-c".into(),
+            "printf '\\200\\201\\202\\377'".into(),
+        ],
+        cwd: Some(".".into()),
+        stdin: vec![],
+        timeout_ms: 10_000,
+    };
+    let frame = new_frame(Kind::Execute, exec.encode().unwrap());
+    write_frame_async(&mut host, &frame).await.unwrap();
+
+    let mut stdout = Vec::new();
+    loop {
+        let reply = read_frame_async(&mut host).await.unwrap();
+        match reply.kind {
+            Kind::Output => {
+                let output = Output::decode(&reply.payload).unwrap();
+                if output.stream == 0 {
+                    stdout.extend_from_slice(&output.data);
+                }
+            }
+            Kind::Exit => break,
+            Kind::Error => panic!("error frame: {}", String::from_utf8_lossy(&reply.payload)),
+            _ => {}
+        }
+    }
+    assert_eq!(stdout, vec![0x80u8, 0x81, 0x82, 0xff]);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

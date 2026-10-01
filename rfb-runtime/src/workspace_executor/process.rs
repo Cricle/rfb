@@ -49,8 +49,17 @@ impl WorkspaceGuestExecutor {
             let cwd = value.get("cwd").and_then(Value::as_str).unwrap_or(".");
             self.policy.workspace_path(cwd).map_err(|e| e.to_string())?;
             let result = crate::builtin::builtin_result(value, kind);
-            let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
-            forward_chunk(&self.event_sink, 0, stdout.to_owned());
+            let stdout = result.get("stdout").cloned().unwrap_or(Value::Null);
+            if let Some(text) = stdout.as_str() {
+                forward_chunk(&self.event_sink, 0, text.as_bytes());
+            } else if let Some(items) = stdout.as_array() {
+                // builtin 的二进制输出（字节数组形态）——逐字节前转。
+                let bytes: Vec<u8> = items
+                    .iter()
+                    .filter_map(|v| v.as_u64().and_then(|v| u8::try_from(v).ok()))
+                    .collect();
+                forward_chunk(&self.event_sink, 0, &bytes);
+            }
             let exit_code = result.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
             return Ok(json!({
                 "stdout": stdout,
@@ -260,9 +269,9 @@ impl WorkspaceGuestExecutor {
                         match pipes[index].read(&mut buf) {
                             Ok(0) => {
                                 // True EOF: emit any withheld partial sequence.
-                                let tail = decoders[index].flush();
+                                let tail = decoders[index].flush_bytes();
                                 if !tail.is_empty() {
-                                    forward_chunk(&sinks[index], index as u8, tail);
+                                    forward_chunk(&sinks[index], index as u8, &tail);
                                 }
                                 done[index] = true;
                                 break;
@@ -426,17 +435,34 @@ fn capture_with_threads(
     }
 }
 
-/// Forward one decoded chunk to a live consumer when the transport attached
-/// one.
-fn forward_chunk(sink: &Option<Sink>, stream: u8, text: String) {
+/// Forward one chunk to a live consumer when the transport attached one.
+/// Bytes are carried EXACTLY: valid UTF-8 rides `data` (compact); anything
+/// else rides `data_bytes` (the ZBRT frame layer forwards it raw — no
+/// U+FFFD corruption on binary output).
+fn forward_chunk(sink: &Option<Sink>, stream: u8, bytes: &[u8]) {
     if let Some(sink) = sink {
-        let terminal = TerminalEvent {
-            stream: if stream == 0 {
-                TerminalStream::Stdout
-            } else {
-                TerminalStream::Stderr
+        if bytes.is_empty() {
+            return;
+        }
+        let terminal = match std::str::from_utf8(bytes) {
+            Ok(text) => TerminalEvent {
+                stream: if stream == 0 {
+                    TerminalStream::Stdout
+                } else {
+                    TerminalStream::Stderr
+                },
+                data: text.to_owned(),
+                data_bytes: None,
             },
-            data: text,
+            Err(_) => TerminalEvent {
+                stream: if stream == 0 {
+                    TerminalStream::Stdout
+                } else {
+                    TerminalStream::Stderr
+                },
+                data: String::new(),
+                data_bytes: Some(bytes.to_vec()),
+            },
         };
         let payload = serde_json::to_vec(&terminal).unwrap_or_default();
         sink(GuestEvent::new("terminal.output", payload));
@@ -457,10 +483,10 @@ fn capture_chunk(
         let take = (capture_limit - data.len()).min(chunk.len());
         data.extend_from_slice(&chunk[..take]);
     }
-    // A multi-byte character straddling a read boundary must not be split
-    // into U+FFFD replacements: the decoder withholds an incomplete trailing
-    // sequence and joins it with the next chunk.
-    forward_chunk(sink, stream, decoder.decode(chunk));
+    // A multi-byte character straddling a read boundary must not be split:
+    // the decoder withholds an incomplete trailing sequence and joins it with
+    // the next chunk (byte-exact — binary output rides data_bytes).
+    forward_chunk(sink, stream, &decoder.decode_bytes(chunk));
 }
 
 /// Minimal surface the Unix capture loop needs from a child pipe.
@@ -491,9 +517,9 @@ fn read_stream(
         let n = reader.read(&mut buf)?;
         if n == 0 {
             // True EOF: emit any withheld partial sequence.
-            let tail = decoder.flush();
+            let tail = decoder.flush_bytes();
             if !tail.is_empty() {
-                forward_chunk(&sink, stream, tail);
+                forward_chunk(&sink, stream, &tail);
             }
             break;
         }
@@ -502,16 +528,24 @@ fn read_stream(
     Ok(data)
 }
 
-fn bounded(bytes: &[u8], max: usize) -> String {
-    let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(max)]).into_owned();
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+fn bounded(bytes: &[u8], max: usize) -> Value {
+    // 线契约（UNIFIED_API §4 / forkd_value_bytes）：有效 UTF-8 → 字符串；
+    // 否则 → 字节数组（保真；U+FFFD 替换曾在 64KB 二进制上膨胀 2× 且毁数据）。
+    // cap 切在码点中间 ≠ 二进制：先按边界回退重试，真二进制才走数组。
+    let slice = &bytes[..bytes.len().min(max)];
+    match std::str::from_utf8(slice) {
+        Ok(text) => Value::String(text.to_owned()),
+        Err(_) => {
+            // cap 切在码点中间（悬空 lead/continuation）≠ 二进制：
+            // utf8_safe_split 找稳定前缀重试；仍无效 = 真二进制才走数组。
+            let mut decoder = crate::utf8_boundary::Utf8ChunkDecoder::new();
+            let stable = decoder.decode_bytes(slice);
+            match std::str::from_utf8(&stable) {
+                Ok(text) => Value::String(text.to_owned()),
+                Err(_) => Value::Array(slice.iter().map(|b| Value::Number((*b).into())).collect()),
+            }
         }
-        text.truncate(end);
     }
-    text
 }
 
 /// Owns a spawned child for the duration of `exec` and guarantees it is

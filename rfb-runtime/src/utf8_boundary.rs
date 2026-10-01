@@ -44,6 +44,25 @@ impl Utf8ChunkDecoder {
     pub fn flush(&mut self) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned()
     }
+
+    /// Byte-exact variant: the returned bytes' concatenation (plus
+    /// [`Self::flush_bytes`]) is the ORIGINAL stream — invalid sequences are
+    /// forwarded raw instead of replaced. The ZBRT frame layer uses this (its
+    /// Output frames carry bytes natively; `from_utf8_lossy` here was
+    /// corrupting every binary output — measured: 64KB inflated 2x with
+    /// U+FFFD replacing every high byte).
+    pub fn decode_bytes(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(chunk);
+        let split = utf8_safe_split(&bytes);
+        self.pending = bytes[split..].to_vec();
+        bytes[..split].to_vec()
+    }
+
+    /// End of stream for the byte-exact mode: emit any withheld bytes raw.
+    pub fn flush_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 /// The number of leading bytes of `bytes` that end on a character boundary

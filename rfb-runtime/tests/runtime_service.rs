@@ -76,6 +76,49 @@ fn temp_workspace() -> std::path::PathBuf {
 }
 
 #[test]
+fn workspace_executor_exec_output_is_byte_exact_for_binary() {
+    // 修复前的回归：exec 的输出在 agent 侧被 from_utf8_lossy（64KB 二进制
+    // 膨胀 2×、高位字节全毁成 U+FFFD）。线契约 = 有效 UTF-8 走字符串、
+    // 否则走字节数组；活流事件同理（ZBRT 帧层原样搬运）。
+    let root = temp_workspace();
+    let mut executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let request = SessionRequest {
+        session_id: "s".into(),
+        request_id: "r".into(),
+        prompt: r#"{"op":"exec","args":["bash","-c","printf '\\200\\201\\202\\377'"],"cwd":"."}"#
+            .into(),
+    };
+    let events = executor.start_turn(&request).unwrap();
+
+    // 终端结果里的 stdout = 字节数组形态（bash 的输出非 UTF-8）。
+    let completed = events.iter().find(|e| e.kind == "turn.completed").unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&completed.payload).unwrap();
+    let stdout = payload.get("stdout").expect("stdout key");
+    let bytes: Vec<u8> = match stdout {
+        serde_json::Value::Array(items) => {
+            items.iter().map(|v| v.as_u64().unwrap() as u8).collect()
+        }
+        other => panic!("binary output must ride the array form, got: {other}"),
+    };
+    assert_eq!(bytes, vec![0x80u8, 0x81, 0x82, 0xff]);
+
+    // 活流事件（ZBRT Output 帧的来源）同样保真。
+    let outputs: Vec<&GuestEvent> = events
+        .iter()
+        .filter(|e| e.kind == "terminal.output")
+        .collect();
+    assert_eq!(outputs.len(), 1, "one binary stdout event");
+    let terminal: rfb_runtime::session::TerminalEvent =
+        serde_json::from_slice(&outputs[0].payload).unwrap();
+    let data = match terminal.data_bytes {
+        Some(bytes) => bytes,
+        None => terminal.data.into_bytes(),
+    };
+    assert_eq!(data, vec![0x80u8, 0x81, 0x82, 0xff]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_executor_accepts_structured_exec_and_rejects_shell_prompt() {
     let root = temp_workspace();
     let mut executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();

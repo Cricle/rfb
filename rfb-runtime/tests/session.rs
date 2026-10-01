@@ -37,6 +37,7 @@ fn runtime_event_classification_is_stable() {
                 terminal: TerminalEvent {
                     stream: TerminalStream::Stdout,
                     data: "hello".into(),
+                    data_bytes: None,
                 },
             },
             "terminal.output",
@@ -97,6 +98,7 @@ fn runtime_event_variants_round_trip_through_postcard() {
             terminal: TerminalEvent {
                 stream: TerminalStream::Stderr,
                 data: "oops".into(),
+                data_bytes: None,
             },
         },
         RuntimeEvent::Completed {
@@ -125,10 +127,12 @@ fn terminal_schema_distinguishes_streams_and_keeps_text_utf8() {
     let stdout = TerminalEvent {
         stream: TerminalStream::Stdout,
         data: "out".into(),
+        data_bytes: None,
     };
     let stderr = TerminalEvent {
         stream: TerminalStream::Stderr,
         data: "err".into(),
+        data_bytes: None,
     };
     assert_eq!(stdout.stream, TerminalStream::Stdout);
     assert_ne!(stdout, stderr);

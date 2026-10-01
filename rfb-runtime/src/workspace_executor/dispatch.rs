@@ -45,29 +45,15 @@ impl WorkspaceGuestExecutor {
         };
         let mut events = vec![GuestEvent::new("turn.started", Vec::new())];
         if op == "exec" {
-            if let Some(data) = result.get("stdout").and_then(Value::as_str) {
-                if !data.is_empty() {
-                    events.push(GuestEvent::new(
-                        "terminal.output",
-                        serde_json::to_vec(&crate::session::TerminalEvent {
-                            stream: crate::session::TerminalStream::Stdout,
-                            data: data.to_owned(),
-                        })
-                        .map_err(|e| e.to_string())?,
-                    ));
-                }
+            if let Some(event) =
+                terminal_event(crate::session::TerminalStream::Stdout, result.get("stdout"))
+            {
+                events.push(event);
             }
-            if let Some(data) = result.get("stderr").and_then(Value::as_str) {
-                if !data.is_empty() {
-                    events.push(GuestEvent::new(
-                        "terminal.output",
-                        serde_json::to_vec(&crate::session::TerminalEvent {
-                            stream: crate::session::TerminalStream::Stderr,
-                            data: data.to_owned(),
-                        })
-                        .map_err(|e| e.to_string())?,
-                    ));
-                }
+            if let Some(event) =
+                terminal_event(crate::session::TerminalStream::Stderr, result.get("stderr"))
+            {
+                events.push(event);
             }
         }
         let result = if op == "exec" {
@@ -311,4 +297,39 @@ impl WorkspaceGuestExecutor {
 fn walk(root: &Path, pattern: &str, max: usize, out: &mut Vec<String>) -> Result<bool, String> {
     let matcher = |name: &str| crate::glob::glob_matches(pattern, name);
     crate::glob::bounded_name_walk(root, root, &matcher, max, true, out).map_err(|e| e.to_string())
+}
+
+/// `terminal.output` 事件：字符串（有效 UTF-8）或字节数组（二进制保真）；
+/// 空输出不产生事件。
+fn terminal_event(
+    stream: crate::session::TerminalStream,
+    value: Option<&Value>,
+) -> Option<GuestEvent> {
+    match value {
+        Some(Value::String(data)) if !data.is_empty() => Some(GuestEvent::new(
+            "terminal.output",
+            serde_json::to_vec(&crate::session::TerminalEvent {
+                stream,
+                data: data.clone(),
+                data_bytes: None,
+            })
+            .ok()?,
+        )),
+        Some(Value::Array(items)) if !items.is_empty() => {
+            let bytes: Option<Vec<u8>> = items
+                .iter()
+                .map(|item| item.as_u64().and_then(|v| u8::try_from(v).ok()))
+                .collect();
+            Some(GuestEvent::new(
+                "terminal.output",
+                serde_json::to_vec(&crate::session::TerminalEvent {
+                    stream,
+                    data: String::new(),
+                    data_bytes: bytes,
+                })
+                .ok()?,
+            ))
+        }
+        _ => None,
+    }
 }

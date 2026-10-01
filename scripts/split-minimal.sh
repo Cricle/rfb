@@ -1537,8 +1537,17 @@ if [ "$CHECK" = "1" ]; then
   echo "== 5. 简版编译门禁 =="
   source ~/.cargo/env 2>/dev/null || true
   # 编译门（含 --all-targets：测试树编译坏必须在这里炸，不能漏）。
-  cargo check --workspace --locked --all-targets --no-default-features --features forkd,cli 2>&1 | tail -2
-  cargo check --workspace --locked --all-targets --no-default-features 2>&1 | tail -1
+  # 日志落盘：tail 会吞掉真正的 error 行（两次踩坑）。
+  cargo check --workspace --locked --all-targets --no-default-features --features forkd,cli \
+    > /tmp/minimal-alltargets-cli.log 2>&1 || {
+    grep -E "^error" /tmp/minimal-alltargets-cli.log | head -10
+    exit 1
+  }
+  cargo check --workspace --locked --all-targets --no-default-features \
+    > /tmp/minimal-alltargets-nodefault.log 2>&1 || {
+    grep -E "^error" /tmp/minimal-alltargets-nodefault.log | head -10
+    exit 1
+  }
   # 测试门：日志落盘后检查失败标记——测试编译失败时没有 `test result` 行，
   # 靠 grep 结果行的旧写法会把编译失败吞成绿灯（|| true 兜底的教训）。
   cargo test --workspace --features forkd,cli > /tmp/minimal-test.log 2>&1 || {

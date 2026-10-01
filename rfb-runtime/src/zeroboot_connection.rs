@@ -394,11 +394,11 @@ async fn forward_event<W: AsyncWrite + Unpin>(
         TerminalStream::Stdout => 0,
         TerminalStream::Stderr => 1,
     };
-    let payload = Output {
-        stream,
-        data: terminal.data.into_bytes(),
-    }
-    .encode()?;
+    let data = match terminal.data_bytes {
+        Some(bytes) => bytes,
+        None => terminal.data.into_bytes(),
+    };
+    let payload = Output { stream, data }.encode()?;
     write_frame_async(
         writer,
         &Frame {
