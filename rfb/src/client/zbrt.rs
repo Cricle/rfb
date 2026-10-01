@@ -1,6 +1,8 @@
 //! Internal ZBRT v1 TCP adapter for the unified facade. Reuses the strict
 //! frame codecs from `rfb::protocol` (canonical implementation in
-//! `rfb-runtime::zeroboot_protocol`) over a plain tokio `TcpStream`.
+//! `rfb-runtime::zeroboot_protocol`) over a tokio `TcpStream` (through a TCP
+//! relay) or the host-side vsock directly (`guest_addr` = "cid:port" — no
+//! relay hop, on the VM host only).
 //!
 //! Session semantics follow `sdk/PROTOCOL.md` §3.4: **every connection starts
 //! with a mandatory `Hello`/`HelloAck` handshake** (client `rfb-sdk`, the full
@@ -23,11 +25,13 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -59,18 +63,77 @@ const MAX_EXEC_FRAMES: usize = 65_536;
 
 /// Long-lived ZBRT guest adapter owned by a [`GuestSandbox`](super::GuestSandbox)
 /// facade; clones share the same control connection.
+/// The guest endpoint a [`ZbrtGuest`] dials, chosen by the `guest_addr`
+/// prefix: `uds:<path>` = the Firecracker vsock relay UDS DIRECT (no TCP,
+/// no relay hop — rfb-ben's capacity shape); `vsock:<cid>:<port>` = the
+/// host-side vsock; anything else = a TCP relay address.
+#[derive(Clone)]
+pub(super) enum Endpoint {
+    Tcp(String),
+    /// FC vsock relay UDS, direct: (uds path, guest vsock port).
+    Uds(String, u32),
+    Vsock(u32, u32),
+}
+
+/// One established guest connection (TCP via a relay, or host-side vsock).
+pub(super) enum GuestConn {
+    Tcp(TcpStream),
+    Uds(tokio::net::UnixStream),
+    Vsock(tokio_vsock::VsockStream),
+}
+
+impl AsyncRead for GuestConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GuestConn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            GuestConn::Uds(s) => Pin::new(s).poll_read(cx, buf),
+            GuestConn::Vsock(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for GuestConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            GuestConn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            GuestConn::Uds(s) => Pin::new(s).poll_write(cx, buf),
+            GuestConn::Vsock(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GuestConn::Tcp(s) => Pin::new(s).poll_flush(cx),
+            GuestConn::Uds(s) => Pin::new(s).poll_flush(cx),
+            GuestConn::Vsock(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            GuestConn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            GuestConn::Uds(s) => Pin::new(s).poll_shutdown(cx),
+            GuestConn::Vsock(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ZbrtGuest {
-    address: String,
+    endpoint: Endpoint,
     timeout: Duration,
-    /// Reusable control connection for `health`/fs RPCs. `None` = (re)connect
-    /// lazily on next use; the socket is closed when the last clone of this
-    /// adapter (i.e. of the owning facade) is dropped.
-    control: Arc<Mutex<Option<TcpStream>>>,
     /// Warm exec connections: established + Hello-ed, idle. A connection may
     /// serve sequential turns (the c# precedent); concurrent execs each take
     /// their own, keeping the one-active-request-per-connection rule intact.
-    exec_pool: Arc<Mutex<Vec<TcpStream>>>,
+    exec_pool: Arc<Mutex<Vec<GuestConn>>>,
 }
 
 fn io_error(message: &'static str) -> RfbError {
@@ -91,23 +154,84 @@ fn error_frame(payload: &[u8]) -> RfbError {
 
 impl ZbrtGuest {
     pub(super) fn new(address: String, timeout: Duration) -> Self {
+        let endpoint = if let Some(rest) = address.strip_prefix("uds:") {
+            // "uds:<path>"（guest 端口缺省 5000）或 "uds:<path>@<port>"。
+            match rest.rsplit_once('@') {
+                Some((path, port)) => match port.parse::<u32>() {
+                    Ok(port) => Endpoint::Uds(path.to_owned(), port),
+                    Err(_) => Endpoint::Tcp(address),
+                },
+                None => Endpoint::Uds(rest.to_owned(), 5000),
+            }
+        } else if let Some(rest) = address.strip_prefix("vsock:") {
+            // 解析失败回退 TCP 形态（原样），让 connect 报真实的错。
+            match rest
+                .split_once(':')
+                .and_then(|(c, p)| Some((c.parse::<u32>().ok()?, p.parse::<u32>().ok()?)))
+            {
+                Some((cid, port)) => Endpoint::Vsock(cid, port),
+                None => Endpoint::Tcp(address),
+            }
+        } else {
+            Endpoint::Tcp(address)
+        };
+        Self::with_endpoint(endpoint, timeout)
+    }
+
+    fn with_endpoint(endpoint: Endpoint, timeout: Duration) -> Self {
         Self {
-            address,
+            endpoint,
             timeout,
-            control: Arc::new(Mutex::new(None)),
             exec_pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    async fn connect(&self) -> Result<TcpStream, RfbError> {
-        let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
-            .await
-            .map_err(|_| transport_timeout("zbrt connect timeout"))?
-            .map_err(RfbError::Transport)?;
-        // 无 NODELAY 时，背靠背的小帧会被 Nagle 拖住等对端 ACK（并发下变成
-        // 每请求 ~5ms 的停顿）——与其它四语言客户端对齐。
-        stream.set_nodelay(true).map_err(RfbError::Transport)?;
-        Ok(stream)
+    async fn connect(&self) -> Result<GuestConn, RfbError> {
+        match &self.endpoint {
+            Endpoint::Tcp(addr) => {
+                let stream = tokio::time::timeout(self.timeout, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| transport_timeout("zbrt connect timeout"))?
+                    .map_err(RfbError::Transport)?;
+                // 无 NODELAY 时，背靠背的小帧会被 Nagle 拖住等对端 ACK（并发
+                // 下变成每请求 ~5ms 的停顿）——与其它四语言客户端对齐。
+                stream.set_nodelay(true).map_err(RfbError::Transport)?;
+                Ok(GuestConn::Tcp(stream))
+            }
+            Endpoint::Uds(path, guest_port) => {
+                let mut stream =
+                    tokio::time::timeout(self.timeout, tokio::net::UnixStream::connect(path))
+                        .await
+                        .map_err(|_| transport_timeout("zbrt connect timeout"))?
+                        .map_err(RfbError::Transport)?;
+                // FC vsock relay UDS 不是透明字节流：先 CONNECT 前导
+                // （rfb_runtime::vsock_relay 单源实现）。
+                let deadline = std::time::Instant::now() + self.timeout;
+                rfb_runtime::vsock_relay::perform_relay_handshake(
+                    &mut stream,
+                    *guest_port,
+                    deadline,
+                )
+                .await
+                .map_err(|e| {
+                    RfbError::Transport(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("vsock relay handshake failed: {e}"),
+                    ))
+                })?;
+                Ok(GuestConn::Uds(stream))
+            }
+            Endpoint::Vsock(cid, port) => {
+                let stream = tokio::time::timeout(
+                    self.timeout,
+                    tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(*cid, *port)),
+                )
+                .await
+                .map_err(|_| transport_timeout("zbrt connect timeout"))?
+                .map_err(RfbError::Transport)?;
+                Ok(GuestConn::Vsock(stream))
+            }
+        }
     }
 
     /// Fresh 128-bit request id per request (UUID v4 bytes).
@@ -156,7 +280,7 @@ impl ZbrtGuest {
     /// Mandatory connection handshake (`sdk/PROTOCOL.md` §3.4): send `Hello`
     /// and require a matching `HelloAck` before any business frame. Failure to
     /// establish the session is a transport failure.
-    async fn handshake(&self, stream: &mut TcpStream) -> Result<(), RfbError> {
+    async fn handshake(&self, stream: &mut GuestConn) -> Result<(), RfbError> {
         match self.try_handshake(stream).await {
             Ok(()) => Ok(()),
             // Real I/O faults keep their error kind; protocol-level handshake
@@ -169,7 +293,7 @@ impl ZbrtGuest {
         }
     }
 
-    async fn try_handshake(&self, stream: &mut TcpStream) -> Result<(), RfbError> {
+    async fn try_handshake(&self, stream: &mut GuestConn) -> Result<(), RfbError> {
         let request_id = Self::request_id();
         let hello = crate::protocol::hello_frame(HELLO_CLIENT, request_id)
             .map_err(|_| io_error("failed to encode Hello payload"))?;
@@ -226,42 +350,40 @@ impl ZbrtGuest {
     /// after dropping the (now unusable) cached connection. A guest `Error`
     /// frame is a definitive answer for the request id and is returned as-is.
     async fn control_exchange(&self, request: Frame) -> Result<Frame, RfbError> {
-        let mut guard = self.control.lock().await;
-        // At most two attempts: the cached connection, then exactly one
-        // reconnect + retry (only when the failure proves non-delivery).
+        // 统一温池（rfb-ben 的容量形态）：health/fs 与 exec 共用借还，并发
+        // 请求各持一条连接。重试语义不变——只有证明请求未送达的失败才在
+        // 新连接上重试一次；读超时不重试（请求可能已在 guest 执行）。
         for attempt in 0..2 {
-            if guard.is_none() {
-                let mut stream = self.connect().await?;
-                self.handshake(&mut stream).await?;
-                *guard = Some(stream);
-            }
-            let stream = guard.as_mut().expect("control connection established");
+            let mut stream = match self.borrow_exec().await {
+                Some(s) => s,
+                None => {
+                    let mut s = self.connect().await?;
+                    self.handshake(&mut s).await?;
+                    s
+                }
+            };
             // Stage 1 — write. Any failure here means the request was never
             // delivered, so a retry is always safe.
-            if let Err(err) = Self::write_frame(stream, &request).await {
-                *guard = None;
+            if let Err(err) = Self::write_frame(&mut stream, &request).await {
                 if attempt == 1 {
                     return Err(err);
                 }
                 continue;
             }
             // Stage 2 — read + id check.
-            let frame = match Self::read_frame(stream, self.timeout).await {
+            let frame = match Self::read_frame(&mut stream, self.timeout).await {
                 Ok(frame) => match Self::check_id(&frame, request.request_id) {
                     Ok(()) => frame,
                     Err(err) => {
                         // The connection carried a frame this request id
                         // cannot claim (leftover from an earlier failed
-                        // exchange): unusable — drop it and surface the error.
-                        *guard = None;
+                        // exchange): unusable — surface the error.
                         return Err(err);
                     }
                 },
                 Err(err) => {
                     // A timed-out read leaves the connection in an unknown
-                    // framing state, so it is always dropped; whether the
-                    // request is retried depends on the error kind.
-                    *guard = None;
+                    // framing state: always dropped, never repaid.
                     if attempt == 1 || !Self::retryable_read_failure(&err) {
                         return Err(err);
                     }
@@ -270,6 +392,7 @@ impl ZbrtGuest {
                     continue;
                 }
             };
+            self.repay_exec(stream).await;
             return Ok(frame);
         }
         unreachable!("the loop returns within two attempts")
@@ -394,17 +517,20 @@ impl ZbrtGuest {
         }
     }
 
-    async fn borrow_exec(&self) -> Option<TcpStream> {
-        let mut pool = self.exec_pool.lock().await;
-        while let Some(mut stream) = pool.pop() {
+    async fn borrow_exec(&self) -> Option<GuestConn> {
+        // 锁内只 pop：验活握手是毫秒级 RTT，锁内做会把所有借出串行化。
+        loop {
+            let mut stream = {
+                let mut pool = self.exec_pool.lock().await;
+                pool.pop()
+            }?;
             if self.handshake(&mut stream).await.is_ok() {
                 return Some(stream);
             }
         }
-        None
     }
 
-    async fn repay_exec(&self, stream: TcpStream) {
+    async fn repay_exec(&self, stream: GuestConn) {
         let mut pool = self.exec_pool.lock().await;
         if pool.len() < 4 {
             pool.push(stream);
@@ -513,7 +639,7 @@ impl ZbrtGuest {
 
 /// Live ZBRT stream session on one TCP connection.
 pub(super) struct ZbrtStream {
-    stream: TcpStream,
+    stream: GuestConn,
     request_id: [u8; 16],
     timeout: Duration,
     started: bool,

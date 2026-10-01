@@ -30,8 +30,6 @@ public final class Sandbox implements AutoCloseable {
     private final InetSocketAddress guestAddress;
     private final Duration timeout;
     /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
-    private ZbrtConnection zbrtControl;
-    private final Object zbrtControlLock = new Object();
     /** exec 温连接池（已 Hello 的空闲连接）。 */
     private final java.util.concurrent.ConcurrentLinkedQueue<ZbrtConnection>
             zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
@@ -630,7 +628,6 @@ public final class Sandbox implements AutoCloseable {
      * @throws TransportError  connection/read failure or request timeout
      */
     public void delete() {
-        dropZbrtControl();
         ZbrtConnection pooled;
         while ((pooled = zbrtExecPool.poll()) != null) {
             pooled.close();
@@ -686,34 +683,30 @@ public final class Sandbox implements AutoCloseable {
         return Json.parse(zbrtControl(conn -> conn.fs(op, path, Json.write(args))));
     }
 
-    /** health/fs RPC 复用一条控制连接（rust zbrt.rs §3.4 语义）：复用连接上
-     * “请求未送达”的失败（写失败 / 对端断开 / EOF 截断）换新连接重试一次；
-     * 读超时（请求可能已执行）与解码/guest 错误不重试。 */
+    /** 统一温池（health/fs 与 exec 共用，rust zbrt.rs 的重试分类）：借出时
+     * Hello 验活；写失败 / EOF 截断 = 请求未送达，换新连接重试一次；读超时
+     * （请求可能已执行）与解码/guest 错误绝不重试。 */
     private <T> T zbrtControl(java.util.function.Function<ZbrtConnection, T> op) {
-        synchronized (zbrtControlLock) {
-            for (boolean reuse : new boolean[] {true, false}) {
-                ZbrtConnection conn;
-                if (reuse && zbrtControl != null) {
-                    conn = zbrtControl;
-                } else {
-                    dropZbrtControl();
-                    conn = openZbrt();
-                }
-                try {
-                    T out = op.apply(conn);
-                    zbrtControl = conn;
-                    return out;
-                } catch (RfbError e) {
-                    conn.close();
-                    zbrtControl = null;
-                    if (reuse && zbrtRetryable(e)) {
-                        continue;
-                    }
-                    throw e;
-                }
+        for (int attempt = 0; attempt < 2; attempt++) {
+            boolean pooled = attempt == 0;
+            ZbrtConnection conn = pooled ? borrowExecConn(timeout) : null;
+            if (conn == null) {
+                pooled = false;
+                conn = openZbrt(timeout);
             }
-            throw new TransportError("zbrt control exchange exhausted");
+            try {
+                T out = op.apply(conn);
+                repayExecConn(conn);
+                return out;
+            } catch (RfbError e) {
+                conn.close();
+                if (pooled && zbrtRetryable(e)) {
+                    continue;
+                }
+                throw e;
+            }
         }
+        throw new TransportError("zbrt exchange exhausted");
     }
 
     /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活
@@ -790,12 +783,6 @@ public final class Sandbox implements AutoCloseable {
         return false;
     }
 
-    private void dropZbrtControl() {
-        if (zbrtControl != null) {
-            zbrtControl.close();
-            zbrtControl = null;
-        }
-    }
 
     private ZbrtConnection openZbrt() {
         return openZbrt(timeout);

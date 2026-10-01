@@ -10,6 +10,7 @@ import math
 import secrets
 import socket
 import struct
+import time
 import threading
 
 from .errors import DecodeError, RemoteError, TransportError
@@ -393,7 +394,23 @@ def decode_error(payload) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def _parse_host_port(address: str) -> tuple:
+def _parse_address(address: str) -> tuple:
+    """("tcp", host, port) | ("uds", path, guest_port)。
+
+    `uds:<path>`（guest 端口缺省 5000）/ `uds:<path>@<port>` —— 直拨
+    Firecracker 的 vsock relay UDS（无 TCP/中继跳，rfb-ben 的容量形态）。
+    """
+    if address.startswith("uds:"):
+        rest = address[4:]
+        path, sep, port_text = rest.rpartition("@")
+        if not sep:
+            path, port_text = rest, "5000"
+        if not path:
+            raise DecodeError(f"invalid guest address: {address!r}")
+        try:
+            return "uds", path, int(port_text)
+        except ValueError as e:
+            raise DecodeError(f"invalid guest address: {address!r}") from e
     host, sep, port_text = address.rpartition(":")
     if not sep or not host:
         raise DecodeError(f"invalid guest address: {address!r}")
@@ -401,54 +418,65 @@ def _parse_host_port(address: str) -> tuple:
         port = int(port_text)
     except ValueError as e:
         raise DecodeError(f"invalid guest address: {address!r}") from e
+    return "tcp", host, port
+
+
+def _parse_host_port(address: str) -> tuple:
+    """NDJSON guest 的 TCP 形态（host, port）。"""
+    kind, host, port = _parse_address(address)
+    if kind != "tcp":
+        raise DecodeError(f"ndjson guest address must be host:port: {address!r}")
     return host, port
 
 
 class _ZbrtGuestClient:
-    """One-shot ZBRT v1 request client (fresh connection per request)."""
+    """ZBRT v1 guest client over a warm connection pool (rfb-ben's capacity
+    shape): every op borrows an established, Hello-ed connection, runs one
+    exchange (a connection serves sequential turns — Hello is idempotent and
+    doubles as the borrow-time liveness probe), and returns it to the pool.
+    Concurrent ops each hold their own connection (one active request per
+    connection, UNIFIED_API §3.4)."""
+
+    POOL_CAP = 8
 
     def __init__(self, address: str, timeout_s: float = 10.0):
-        self._address = _parse_host_port(address)
+        self._address = _parse_address(address)
         self._timeout_s = timeout_s
-        # health/fs RPC 复用一条控制连接（rust zbrt.rs 的 §3.4 语义）；
-        # exec/stream 保持每 turn 一条新连接（UNIFIED_API §3.4）。
-        self._control = None
-        self._control_lock = threading.Lock()
-        # exec 温连接池：新连接握手是毫秒级成本；一条连接可顺序跑多个 turn
-        # （Hello 幂等），池保住已握手的空闲连接，exec 借还即用。
-        self._exec_pool = []
+        # 归还带时间戳：空闲超过 1s 的连接在借出时才重发 Hello 验活
+        # （guest 不关空闲连接 → 热路径零额外 RTT；逐请求关连接的 fake
+        # 服务器则每次都验活，坏连接永不外借）。
+        self._pool = []
 
     def drop_control(self) -> None:
-        """Close the cached control connection (sandbox deleted / shutdown)."""
-        with self._control_lock:
-            self._drop_unlocked()
-
-    def _drop_unlocked(self) -> None:
-        if self._control is not None:
+        """Close every pooled connection (sandbox deleted / shutdown)."""
+        while self._pool:
+            sock = self._pool.pop()
             try:
-                self._control.close()
+                sock.close()
             except OSError:
                 pass
-            self._control = None
 
-    def _pop_exec_pool(self, timeout_s: float):
-        """Borrow a warm exec connection (re-Hello = liveness probe), or None."""
-        while self._exec_pool:
-            sock = self._exec_pool.pop()
+    def _borrow(self, timeout_s: float) -> socket.socket:
+        """Borrow a warm connection (re-Hello = liveness probe); fall back to
+        a fresh connection when the pool is empty / its conns are dead."""
+        while self._pool:
+            sock, last_used = self._pool.pop()
             try:
                 sock.settimeout(timeout_s)
-                self._handshake(sock)
+                if time.monotonic() - last_used > 1.0:
+                    self._handshake(sock)
                 return sock
             except (TransportError, DecodeError, OSError):
                 try:
                     sock.close()
                 except OSError:
                     pass
-        return None
+        return self._connect(timeout_s)
 
-    def _repay_exec_pool(self, sock: socket.socket) -> None:
-        if len(self._exec_pool) < 4:
-            self._exec_pool.append(sock)
+    def _repay(self, sock: socket.socket) -> None:
+        """Return a cleanly-finished connection for sequential reuse."""
+        if len(self._pool) < self.POOL_CAP:
+            self._pool.append((sock, time.monotonic()))
         else:
             try:
                 sock.close()
@@ -465,30 +493,49 @@ class _ZbrtGuestClient:
             return str(error).startswith("truncated frame")
         return True
 
-    def _control_exchange(self, send, parse):
-        """One health/fs exchange over the cached control connection."""
-        with self._control_lock:
-            for reuse in (True, False):
-                sock = self._control if reuse else None
-                if sock is None:
-                    self._drop_unlocked()
-                    sock = self._connect(self._timeout_s)
+    def _exchange(self, send, parse):
+        """One health/fs exchange over a borrowed warm connection; a retryable
+        failure (write / EOF — the request was never delivered) retries once
+        on a fresh connection; a read timeout never retries (the request may
+        have run on the guest)."""
+        for attempt in (0, 1):
+            sock = self._borrow(self._timeout_s)
+            try:
+                request_id = send(sock)
+                reply = self._read_reply(sock, request_id)
+            except TransportError as e:
                 try:
-                    request_id = send(sock)
-                    reply = self._read_reply(sock, request_id)
-                except TransportError as e:
-                    self._drop_unlocked()
-                    if reuse and self._retryable(e):
-                        continue
-                    raise
-                self._control = sock
-                return parse(reply)
-            raise TransportError("zbrt control exchange exhausted")
+                    sock.close()
+                except OSError:
+                    pass
+                if attempt == 0 and self._retryable(e):
+                    continue
+                raise
+            self._repay(sock)
+            return parse(reply)
+        raise TransportError("zbrt exchange exhausted")
 
     def _connect(self, timeout_s: float) -> socket.socket:
         try:
-            sock = socket.create_connection(self._address, timeout=timeout_s)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            kind, a, b = self._address
+            if kind == "uds":
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(timeout_s)
+                sock.connect(a)
+                # FC 的 vsock relay UDS 不是透明字节流：先 CONNECT 前导。
+                sock.sendall(f"CONNECT {b}\n".encode())
+                line = b""
+                while not line.endswith(b"\n"):
+                    byte = sock.recv(1)
+                    if not byte:
+                        raise TransportError(
+                            "vsock relay closed during handshake")
+                    line += byte
+                if not line.startswith(b"OK "):
+                    raise TransportError(f"vsock relay rejected: {line!r}")
+            else:
+                sock = socket.create_connection((a, b), timeout=timeout_s)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as e:
             raise TransportError(f"zbrt connect failed: {e}") from e
         self._handshake(sock)
@@ -558,72 +605,64 @@ class _ZbrtGuestClient:
 
     def _exec(self, argv, cwd, timeout_s, stdin) -> tuple:
         read_timeout = self._effective_timeout(timeout_s)
-        # 温连接借出（借出前已重发 Hello 验活——连接已死则回退新连接）；
-        # 写失败 = 请求未送达，换新连接重试一次；读侧失败绝不重试。
-        sock = self._pop_exec_pool(read_timeout)
-        if sock is not None:
+        for attempt in (0, 1):
+            sock = self._borrow(read_timeout)
             try:
-                return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
-                                       read_timeout, pooled=True)
+                result = self._exec_turn(sock, argv, cwd, timeout_s, stdin)
+                self._repay(sock)
+                return result
             except TransportError as e:
                 try:
                     sock.close()
                 except OSError:
                     pass
-                if str(e).startswith("zbrt write"):
-                    sock = self._connect(read_timeout)
-                    return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
-                                           read_timeout, pooled=False)
+                if attempt == 0 and self._retryable(e):
+                    continue
                 raise
-        sock = self._connect(read_timeout)
-        return self._exec_turn(sock, argv, cwd, timeout_s, stdin,
-                               read_timeout, pooled=False)
+            except BaseException:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
+        raise TransportError("zbrt exec exchange exhausted")
 
-    def _exec_turn(self, sock, argv, cwd, timeout_s, stdin, read_timeout,
-                   pooled: bool) -> tuple:
-        repaid = False
-        try:
-            request_id = new_request_id()
-            # Rust baseline (facade.rs GuestOps::exec / ::eval ZBRT branch):
-            # whole seconds (ceil, min 1) times 1000, capped at u32::MAX;
-            # timeout_s unset -> 0.
-            if timeout_s:
-                secs = max(1, math.ceil(float(timeout_s)))
-                timeout_ms = min(secs * 1000, 0xFFFFFFFF)
-            else:
-                timeout_ms = 0
-            write_frame(sock, KIND_EXECUTE, request_id, encode_execute(argv, cwd, stdin, timeout_ms))
-            stdout = bytearray()
-            stderr = bytearray()
-            total = 0
-            while True:
-                kind, _rid, payload = self._read_reply(sock, request_id)
-                if kind == KIND_OUTPUT:
-                    stream, data = decode_output(payload)
-                    # Aggregate cap across the whole turn (Rust baseline
-                    # client/zbrt.rs): exceed -> Remote-class error.
-                    total += len(data)
-                    if total > MAX_EXEC_BYTES:
-                        raise RemoteError("guest output exceeded the 16 MiB limit")
-                    if stream == STREAM_STDOUT:
-                        stdout += data
-                    elif stream == STREAM_STDERR:
-                        stderr += data
-                    else:
-                        raise DecodeError(f"invalid zbrt output stream id {stream}")
-                elif kind == KIND_EXIT:
-                    code, _signal = decode_exit(payload)
-                    # 干净结束一律归还（新连接也回池）——否则池永远是空的。
-                    self._repay_exec_pool(sock)
-                    repaid = True
-                    return int(code), bytes(stdout), bytes(stderr)
-                elif kind == KIND_ERROR:
-                    raise RemoteError(decode_error(payload)[1])
+    def _exec_turn(self, sock, argv, cwd, timeout_s, stdin) -> tuple:
+        request_id = new_request_id()
+        # Rust baseline (facade.rs GuestOps::exec / ::eval ZBRT branch):
+        # whole seconds (ceil, min 1) times 1000, capped at u32::MAX;
+        # timeout_s unset -> 0.
+        if timeout_s:
+            secs = max(1, math.ceil(float(timeout_s)))
+            timeout_ms = min(secs * 1000, 0xFFFFFFFF)
+        else:
+            timeout_ms = 0
+        write_frame(sock, KIND_EXECUTE, request_id, encode_execute(argv, cwd, stdin, timeout_ms))
+        stdout = bytearray()
+        stderr = bytearray()
+        total = 0
+        while True:
+            kind, _rid, payload = self._read_reply(sock, request_id)
+            if kind == KIND_OUTPUT:
+                stream, data = decode_output(payload)
+                # Aggregate cap across the whole turn (Rust baseline
+                # client/zbrt.rs): exceed -> Remote-class error.
+                total += len(data)
+                if total > MAX_EXEC_BYTES:
+                    raise RemoteError("guest output exceeded the 16 MiB limit")
+                if stream == STREAM_STDOUT:
+                    stdout += data
+                elif stream == STREAM_STDERR:
+                    stderr += data
                 else:
-                    raise DecodeError(f"unexpected zbrt frame kind {kind} during execute")
-        finally:
-            if not repaid:
-                sock.close()
+                    raise DecodeError(f"invalid zbrt output stream id {stream}")
+            elif kind == KIND_EXIT:
+                code, _signal = decode_exit(payload)
+                return int(code), bytes(stdout), bytes(stderr)
+            elif kind == KIND_ERROR:
+                raise RemoteError(decode_error(payload)[1])
+            else:
+                raise DecodeError(f"unexpected zbrt frame kind {kind} during execute")
 
     def exec(self, args, cwd, timeout_s, stdin=b"") -> tuple:
         return self._exec(list(args), cwd, timeout_s, bytes(stdin))
@@ -643,7 +682,7 @@ class _ZbrtGuestClient:
             healthy, _message = decode_health(payload)
             return healthy
 
-        return self._control_exchange(send, parse)
+        return self._exchange(send, parse)
 
     def fs_op(self, op: int, path: str, args: dict) -> dict:
         def send(sock):
@@ -666,7 +705,7 @@ class _ZbrtGuestClient:
                 raise DecodeError("zbrt fs result must be a JSON object")
             return value
 
-        return self._control_exchange(send, parse)
+        return self._exchange(send, parse)
 
     def open_stream(self, args, cwd) -> "_ZbrtStream":
         sock = self._connect(self._timeout_s)
@@ -677,6 +716,8 @@ class _ZbrtGuestClient:
             sock.close()
             raise
         return _ZbrtStream(sock, request_id)
+
+
 
 
 class _ZbrtStream:

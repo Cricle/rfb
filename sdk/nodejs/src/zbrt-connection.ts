@@ -7,7 +7,8 @@
  */
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { DecodeError, RemoteError, TransportError } from './errors.js';
+import { DecodeError, RemoteError, TransportError, ValidationError } from './errors.js';
+import { parseAddress } from './ndjson.js';
 import {
   KIND_CANCEL,
   KIND_CANCEL_ACK,
@@ -186,9 +187,67 @@ export class ZbrtConnection {
   #reader: ReturnType<typeof frameReader> | undefined = undefined;
   #ready: Promise<void>;
 
-  constructor(host: string, port: number, timeoutMs: number) {
+  constructor(host: string, port: number, timeoutMs: number);
+  constructor(address: string, timeoutMs: number);
+  constructor(host: string, portOrTimeout: number, timeoutMs?: number) {
+    const tcp =
+      timeoutMs !== undefined ? { host, port: portOrTimeout, timeout: timeoutMs } : null;
+    const uds = tcp === null ? (() => {
+      const parsed = parseAddress(host);
+      if (!parsed.socketPath) {
+        throw new ValidationError('expected uds:<path>[@<guestPort>]');
+      }
+      return {
+        path: parsed.socketPath,
+        guestPort: parsed.guestPort ?? 5000,
+        timeout: portOrTimeout,
+      };
+    })() : null;
     this.#ready = (async () => {
-      this.#socket = await connectSocket(host, port, timeoutMs);
+      if (uds !== null) {
+        // 直拨 FC 的 vsock relay UDS：CONNECT 前导（非透明字节流）。
+        const socket = new net.Socket();
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            socket.destroy();
+            reject(new TransportError('guest connection timed out'));
+          }, uds.timeout);
+          socket.once('error', (e) => {
+            clearTimeout(timer);
+            reject(new TransportError(`guest connect failed: ${(e as Error).message}`));
+          });
+          socket.connect({ path: uds.path }, () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+        socket.setNoDelay(true);
+        socket.setTimeout(uds.timeout);
+        const reply = await new Promise<string>((resolve, reject) => {
+          let buf = '';
+          const ondata = (d: Buffer): void => {
+            buf += d.toString('utf8');
+            const nl = buf.indexOf('\n');
+            if (nl >= 0) {
+              socket.removeListener('data', ondata);
+              resolve(buf.slice(0, nl));
+            }
+          };
+          socket.on('data', ondata);
+          socket.once('error', (e) => {
+            reject(new TransportError(`vsock relay handshake failed: ${(e as Error).message}`));
+          });
+          socket.write(`CONNECT ${uds.guestPort}\n`);
+        });
+        if (!reply.startsWith('OK ')) {
+          throw new TransportError(`vsock relay rejected: ${reply}`);
+        }
+        this.#socket = socket;
+        this.#reader = frameReader(socket);
+        await this.#handshake();
+        return;
+      }
+      this.#socket = await connectSocket(tcp!.host, tcp!.port, tcp!.timeout);
       this.#reader = frameReader(this.#socket);
       // Cross-language contract: every ZBRT connection opens with a mandatory
       // Hello handshake — the session is unusable until HelloAck validates,

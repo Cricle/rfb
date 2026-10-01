@@ -50,13 +50,19 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 | `connect(sandbox_or_id, transport=None)` | 传 `Sandbox` 原样附加（仅显式 transport 才覆盖）；传 id 则先 `list_sandboxes` 解析，未命中 → Remote（“sandbox not found”） |
 | `ping_sandbox(id)` / `delete_sandbox(id)` | controller 原样 ping 值 / **2xx 与 404 都算删除成功** |
 
-**控制连接复用（五语言一致，rust zbrt.rs 语义）**：ZBRT 下 health/fs
-RPC（ping/ls/find/grep/read/write）复用一条已 Hello 的控制连接——每条新
-连接的握手是毫秒级成本，复用使这些操作亚毫秒化；exec/stream 保持每 turn
-一条新连接（§3.4）。复用连接上"请求未送达"的失败（写失败/对端断开/EOF
-截断）换新连接重试一次；读超时（请求可能已在 guest 执行）与解码/guest
-错误绝不重试。exec/stream 五语言统一为每 turn 一条新连接（并发 exec
-因此互不干扰）。
+**统一温连接池（五语言一致，rfb-ben 的容量形态）**：ZBRT 下所有操作
+（ping/fs/exec）都从每个 Sandbox 的温连接池借还——已 Hello 的空闲连接，
+借出时空闲超 1s 才重发 Hello 验活（guest 不关空闲连接，热路径零额外
+RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn；并发 = 池中
+多条连接各服务一个操作（池深 8）。复用连接上"请求未送达"的失败（写失败/
+对端断开/EOF 截断）换新连接重试一次；读超时（请求可能已在 guest 执行）
+与解码/guest 错误绝不重试。stream 交互会话保持独占连接。
+
+**UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
+Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
+8 并发 fs ≈ 6.4k ops/s（rust 实测 6388；python/node 同形态 2.2k/3.9k，
+受语言运行时 GIL/事件循环限制）。java/c# 不支持（需原生库），走 TCP 中继
+（0.6ms/RTT，8 并发 0.8-1.0k ops/s）。
 
 **清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
 RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java

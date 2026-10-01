@@ -608,11 +608,6 @@ must_replace(f"{N}/src/sandbox.ts",
              '''/** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */
 export const DEFAULT_ZBRT_TCP = '127.0.0.1:15000';
 ''', "")
-must_replace(f"{N}/src/sandbox.ts", '''  /** health/fs 复用的控制连接（rust zbrt.rs 语义）+ 串行化锁。 */
-  #zbrtControlConn: Promise<ZbrtConnection> | null = null;
-  #zbrtControlLock: Promise<unknown> = Promise.resolve();
-''', "")
-drop_brace_block(f"{N}/src/sandbox.ts", "async #withControl<")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #borrowExecConn(")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #withExecConn<")
 must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活）。 */
@@ -620,9 +615,6 @@ must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的�
 ''', "")
 must_replace(f"{N}/src/sandbox.ts",
              "    for (const c of this.#zbrtExecPool.splice(0)) c.close();\n", "")
-must_replace(f"{N}/src/sandbox.ts", '''    await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
-    this.#zbrtControlConn = null;
-''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "export const TRANSPORT_ZBRT")
 drop_brace_block(f"{N}/src/sandbox.ts", "function zbrtTimeoutMs")
 drop_brace_block(f"{N}/src/sandbox.ts", "this.transport === TRANSPORT_ZBRT", expect_min=6)
@@ -679,7 +671,6 @@ drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private JsonNode
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConnection openZbrt(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private <T> T zbrtControl(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private static boolean zbrtRetryable(")
-drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void dropZbrtControl(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ExecResult execViaPool(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConnection borrowExecConn(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void repayExecConn(")
@@ -693,12 +684,7 @@ must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
             pooled.close();
         }
 ''', "")
-must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
-    private ZbrtConnection zbrtControl;
-    private final Object zbrtControlLock = new Object();
-''', "")
-must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
-             "        dropZbrtControl();\n", "")
+
 
 # GuestStream：整文件改写为 ndjson-only（小文件，重写最干净）。
 Path(f"{J}/src/main/java/io/rfb/sdk/GuestStream.java").write_text(

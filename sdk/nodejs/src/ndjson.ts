@@ -26,8 +26,12 @@ const TERMINAL_KEYS = new Set([
 ]);
 
 export interface GuestAddress {
-  host: string;
-  port: number;
+  host?: string;
+  port?: number;
+  /** Unix socket path (`uds:<path>` — the Firecracker vsock relay UDS). */
+  socketPath?: string;
+  /** Guest vsock port for the relay CONNECT preamble (uds form). */
+  guestPort?: number;
 }
 
 /**
@@ -41,8 +45,19 @@ export function agentAuthToken(): string | null {
   return token === undefined || token.trim().length === 0 ? null : token;
 }
 
-/** Parse "host:port" (IPv6 literals allowed); throws ValidationError. */
+/** Parse "host:port" (IPv6 literals allowed) or "uds:<path>[@<guestPort>]";
+ * throws ValidationError. */
 export function parseAddress(address: string): GuestAddress {
+  if (typeof address === 'string' && address.startsWith('uds:')) {
+    const rest = address.slice(4);
+    const at = rest.lastIndexOf('@');
+    const socketPath = at >= 0 ? rest.slice(0, at) : rest;
+    const guestPort = at >= 0 ? Number.parseInt(rest.slice(at + 1), 10) : 5000;
+    if (!socketPath || Number.isNaN(guestPort)) {
+      throw new ValidationError('invalid guest address: expected uds:<path>[@<port>]');
+    }
+    return { socketPath, guestPort };
+  }
   if (typeof address !== 'string' || address.length === 0) {
     throw new ValidationError('guest address must be host:port');
   }
