@@ -443,7 +443,10 @@ must_replace(facade, '''def _zbrt_exec_result(t: tuple) -> ExecResult:
 
 ''', "")
 must_replace(facade, '''        if self._transport == "zbrt":
-            return _ZbrtGuestClient(self.guest_addr, timeout_s)
+            if self._guest_client_cache is None:
+                self._guest_client_cache = _ZbrtGuestClient(self.guest_addr,
+                                                            timeout_s)
+            return self._guest_client_cache
 ''', "")
 must_replace(facade, '''        ZBRT carries ``args`` as-is; the NDJSON action dict drops None values
         (absent keys on the wire) to mirror the historical request shape.
@@ -605,6 +608,14 @@ must_replace(f"{N}/src/sandbox.ts",
              '''/** Default ZBRT bridge TCP endpoint (RFB_ZBRT_TCP default). */
 export const DEFAULT_ZBRT_TCP = '127.0.0.1:15000';
 ''', "")
+must_replace(f"{N}/src/sandbox.ts", '''  /** health/fs 复用的控制连接（rust zbrt.rs 语义）+ 串行化锁。 */
+  #zbrtControlConn: Promise<ZbrtConnection> | null = null;
+  #zbrtControlLock: Promise<unknown> = Promise.resolve();
+''', "")
+drop_brace_block(f"{N}/src/sandbox.ts", "async #withControl<")
+must_replace(f"{N}/src/sandbox.ts", '''    await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
+    this.#zbrtControlConn = null;
+''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "export const TRANSPORT_ZBRT")
 drop_brace_block(f"{N}/src/sandbox.ts", "function zbrtTimeoutMs")
 drop_brace_block(f"{N}/src/sandbox.ts", "this.transport === TRANSPORT_ZBRT", expect_min=6)
@@ -659,6 +670,15 @@ must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
              'throw new ValidationError("stdin is not supported over the ndjson transport");')
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private JsonNode zbrtFs(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConnection openZbrt(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private <T> T zbrtControl(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private static boolean zbrtRetryable(")
+drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void dropZbrtControl(")
+must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
+    private ZbrtConnection zbrtControl;
+    private final Object zbrtControlLock = new Object();
+''', "")
+must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
+             "        dropZbrtControl();\n", "")
 
 # GuestStream：整文件改写为 ndjson-only（小文件，重写最干净）。
 Path(f"{J}/src/main/java/io/rfb/sdk/GuestStream.java").write_text(

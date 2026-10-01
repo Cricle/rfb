@@ -29,6 +29,9 @@ public final class Sandbox implements AutoCloseable {
     private final String transport;
     private final InetSocketAddress guestAddress;
     private final Duration timeout;
+    /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
+    private ZbrtConnection zbrtControl;
+    private final Object zbrtControlLock = new Object();
 
     private Sandbox(RfbClient client, SandboxInfo info, String transport) {
         this.client = client;
@@ -118,9 +121,7 @@ public final class Sandbox implements AutoCloseable {
      */
     public boolean ping() {
         if (RfbClient.TRANSPORT_ZBRT.equals(transport)) {
-            try (ZbrtConnection conn = openZbrt()) {
-                return conn.health().healthy();
-            }
+            return zbrtControl(ZbrtConnection::health).healthy();
         }
         // Rust baseline (ndjson::ping_healthy): healthy only when the pong
         // flag is present and literally JSON-true.
@@ -629,6 +630,7 @@ public final class Sandbox implements AutoCloseable {
      * @throws TransportError  connection/read failure or request timeout
      */
     public void delete() {
+        dropZbrtControl();
         client.deleteSandbox(info.getId());
     }
 
@@ -677,9 +679,57 @@ public final class Sandbox implements AutoCloseable {
     }
 
     private JsonNode zbrtFs(int op, String path, ObjectNode args) {
-        try (ZbrtConnection conn = openZbrt()) {
-            byte[] resp = conn.fs(op, path, Json.write(args));
-            return Json.parse(resp);
+        return Json.parse(zbrtControl(conn -> conn.fs(op, path, Json.write(args))));
+    }
+
+    /** health/fs RPC 复用一条控制连接（rust zbrt.rs §3.4 语义）：复用连接上
+     * “请求未送达”的失败（写失败 / 对端断开 / EOF 截断）换新连接重试一次；
+     * 读超时（请求可能已执行）与解码/guest 错误不重试。 */
+    private <T> T zbrtControl(java.util.function.Function<ZbrtConnection, T> op) {
+        synchronized (zbrtControlLock) {
+            for (boolean reuse : new boolean[] {true, false}) {
+                ZbrtConnection conn;
+                if (reuse && zbrtControl != null) {
+                    conn = zbrtControl;
+                } else {
+                    dropZbrtControl();
+                    conn = openZbrt();
+                }
+                try {
+                    T out = op.apply(conn);
+                    zbrtControl = conn;
+                    return out;
+                } catch (RfbError e) {
+                    conn.close();
+                    zbrtControl = null;
+                    if (reuse && zbrtRetryable(e)) {
+                        continue;
+                    }
+                    throw e;
+                }
+            }
+            throw new TransportError("zbrt control exchange exhausted");
+        }
+    }
+
+    private static boolean zbrtRetryable(RfbError e) {
+        if (e instanceof RemoteError || e instanceof ValidationError) {
+            return false;
+        }
+        if (e instanceof DecodeError) {
+            return e.getMessage() != null
+                    && e.getMessage().startsWith("truncated frame");
+        }
+        if (e instanceof TransportError) {
+            return !(e.getCause() instanceof java.net.SocketTimeoutException);
+        }
+        return false;
+    }
+
+    private void dropZbrtControl() {
+        if (zbrtControl != null) {
+            zbrtControl.close();
+            zbrtControl = null;
         }
     }
 

@@ -208,6 +208,9 @@ class Sandbox:
         self.info = info
         self._client = client
         self._transport = transport
+        # 每操作重连是毫秒级握手税的主因：health/fs 复用一条控制连接
+        # （缓存 guest 客户端；exec/stream 仍每 turn 新连接）。
+        self._guest_client_cache = None
 
     @property
     def id(self) -> str:
@@ -233,7 +236,10 @@ class Sandbox:
     def _guest(self):
         timeout_s = self._client.timeout_s
         if self._transport == "zbrt":
-            return _ZbrtGuestClient(self.guest_addr, timeout_s)
+            if self._guest_client_cache is None:
+                self._guest_client_cache = _ZbrtGuestClient(self.guest_addr,
+                                                            timeout_s)
+            return self._guest_client_cache
         return _GuestNdjsonClient(self.guest_addr, timeout_s)
 
     def _fs_call(self, op: int, action: str, path: str, args: dict) -> dict:
@@ -410,6 +416,8 @@ class Sandbox:
 
     def delete(self) -> None:
         """Delete this sandbox via the controller."""
+        if self._guest_client_cache is not None:
+            self._guest_client_cache.drop_control()
         self._client.delete_sandbox(self.id)
 
     def __enter__(self) -> "Sandbox":

@@ -188,6 +188,9 @@ export class Sandbox {
   public readonly guestAddr: string;
   public readonly transport: string;
   readonly #client: { deleteSandbox(id: string): Promise<void>; };
+  /** health/fs 复用的控制连接（rust zbrt.rs 语义）+ 串行化锁。 */
+  #zbrtControlConn: Promise<ZbrtConnection> | null = null;
+  #zbrtControlLock: Promise<unknown> = Promise.resolve();
   readonly #guestTimeoutMs: number;
 
   constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs = 10_000) {
@@ -217,12 +220,7 @@ export class Sandbox {
    */
   async ping(): Promise<boolean> {
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        return (await conn.health()).healthy;
-      } finally {
-        conn.close();
-      }
+      return (await this.#withControl((conn) => conn.health())).healthy;
     }
     const { last } = await this.#guestRequest({ action: 'ping' });
     return last?.pong === true;
@@ -357,13 +355,9 @@ export class Sandbox {
   async ls(path = '.'): Promise<DirEntry[]> {
     validation.fsPath(path);
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        const payload = await conn.fs(1, path, Buffer.from(JSON.stringify({ max_results: validation.MAX_GUEST_RESULTS }), 'utf8'));
-        return this.#parseLs(this.#fsResultJson(payload));
-      } finally {
-        conn.close();
-      }
+      const payload = await this.#withControl(
+        (conn) => conn.fs(1, path, Buffer.from(JSON.stringify({ max_results: validation.MAX_GUEST_RESULTS }), 'utf8')));
+      return this.#parseLs(this.#fsResultJson(payload));
     }
     const { last } = await this.#fsRequest(1, path, {
       max_results: validation.MAX_GUEST_RESULTS,
@@ -386,13 +380,9 @@ export class Sandbox {
     validation.fsPath(path);
     validation.pattern(pattern);
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        const payload = await conn.fs(2, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS }), 'utf8'));
-        return this.#parseFind(this.#fsResultJson(payload));
-      } finally {
-        conn.close();
-      }
+      const payload = await this.#withControl(
+        (conn) => conn.fs(2, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS }), 'utf8')));
+      return this.#parseFind(this.#fsResultJson(payload));
     }
     const { last } = await this.#fsRequest(2, path, {
       max_results: validation.MAX_GUEST_RESULTS,
@@ -416,13 +406,9 @@ export class Sandbox {
     validation.fsPath(path);
     validation.pattern(pattern);
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        const payload = await conn.fs(3, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS, max_bytes: validation.MAX_GUEST_RESULT_BYTES }), 'utf8'));
-        return this.#parseGrep(this.#fsResultJson(payload));
-      } finally {
-        conn.close();
-      }
+      const payload = await this.#withControl(
+        (conn) => conn.fs(3, path, Buffer.from(JSON.stringify({ pattern, max_results: validation.MAX_GUEST_RESULTS, max_bytes: validation.MAX_GUEST_RESULT_BYTES }), 'utf8')));
+      return this.#parseGrep(this.#fsResultJson(payload));
     }
     const { last } = await this.#fsRequest(3, path, {
       max_results: validation.MAX_GUEST_RESULTS,
@@ -454,15 +440,11 @@ export class Sandbox {
     const maxBytes = options.maxBytes ?? null;
     if (maxBytes !== null) validation.limit(maxBytes, validation.MAX_GUEST_RESULT_BYTES);
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        // PROTOCOL.md §3.3: the Fs data object always carries the keys, with
-        // null for absent optionals.
-        const payload = await conn.fs(4, path, Buffer.from(JSON.stringify({ offset: options.offset ?? null, max_bytes: maxBytes }), 'utf8'));
-        return fileReadFromJson(payload);
-      } finally {
-        conn.close();
-      }
+      // PROTOCOL.md §3.3: the Fs data object always carries the keys, with
+      // null for absent optionals.
+      const payload = await this.#withControl(
+        (conn) => conn.fs(4, path, Buffer.from(JSON.stringify({ offset: options.offset ?? null, max_bytes: maxBytes }), 'utf8')));
+      return fileReadFromJson(payload);
     }
     const action: Record<string, unknown> = { action: 'read', path };
     if (options.offset !== undefined && options.offset !== null) action.offset = options.offset;
@@ -494,17 +476,13 @@ export class Sandbox {
     const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
     validation.payloadSize(bytes.length, validation.MAX_GUEST_RESULT_BYTES);
     if (this.transport === TRANSPORT_ZBRT) {
-      const conn = await this.#zbrt();
-      try {
-        const payload = await conn.fs(5, path, Buffer.from(JSON.stringify({ data: [...bytes], append: options.append ?? false, mode: null }), 'utf8'));
-        const last = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
-        if (typeof last.bytes_written !== 'number') {
-          throw new DecodeError('guest response is missing bytes_written');
-        }
-        return last.bytes_written;
-      } finally {
-        conn.close();
+      const payload = await this.#withControl(
+        (conn) => conn.fs(5, path, Buffer.from(JSON.stringify({ data: [...bytes], append: options.append ?? false, mode: null }), 'utf8')));
+      const last = JSON.parse(payload.toString('utf8')) as Record<string, unknown>;
+      if (typeof last.bytes_written !== 'number') {
+        throw new DecodeError('guest response is missing bytes_written');
       }
+      return last.bytes_written;
     }
     const { last } = await this.#guestRequest({
       action: 'write',
@@ -570,6 +548,8 @@ export class Sandbox {
    * @throws {HttpStatusError} Non-2xx, non-404 controller answer.
    */
   async delete(): Promise<void> {
+    await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
+    this.#zbrtControlConn = null;
     await this.#client.deleteSandbox(this.id);
   }
 
@@ -578,6 +558,43 @@ export class Sandbox {
     const conn = new ZbrtConnection(host, port, this.#guestTimeoutMs);
     await conn.ready();
     return conn;
+  }
+
+  /**
+   * health/fs RPC 复用一条控制连接（rust zbrt.rs 语义）：复用连接上“请求
+   * 未送达”的失败（写失败 / 对端关闭）换新连接重试一次；读超时
+   * ('guest read timed out') 与解码/guest 错误不重试。串行化防并发交错。
+   */
+  async #withControl<T>(op: (conn: ZbrtConnection) => Promise<T>): Promise<T> {
+    const run = this.#zbrtControlLock.then(async () => {
+      for (const reuse of [true, false]) {
+        let conn: ZbrtConnection;
+        if (reuse && this.#zbrtControlConn !== null) {
+          conn = await this.#zbrtControlConn;
+        } else {
+          await this.#zbrtControlConn?.then((c) => c.close()).catch(() => undefined);
+          conn = await this.#zbrt();
+        }
+        try {
+          const out = await op(conn);
+          this.#zbrtControlConn = Promise.resolve(conn);
+          return out;
+        } catch (error) {
+          conn.close();
+          this.#zbrtControlConn = null;
+          if (reuse
+              && error instanceof TransportError
+              && (error.message === 'connection closed by guest'
+                  || error.message.startsWith('zbrt write failed'))) {
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new TransportError('zbrt control exchange exhausted');
+    });
+    this.#zbrtControlLock = run.catch(() => undefined);
+    return run;
   }
 
   async #guestRequest(action: Record<string, unknown>, timeoutMs: number = this.#guestTimeoutMs): Promise<NdjsonExchange> {

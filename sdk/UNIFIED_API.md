@@ -50,6 +50,13 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 | `connect(sandbox_or_id, transport=None)` | 传 `Sandbox` 原样附加（仅显式 transport 才覆盖）；传 id 则先 `list_sandboxes` 解析，未命中 → Remote（“sandbox not found”） |
 | `ping_sandbox(id)` / `delete_sandbox(id)` | controller 原样 ping 值 / **2xx 与 404 都算删除成功** |
 
+**控制连接复用（五语言一致，rust zbrt.rs 语义）**：ZBRT 下 health/fs
+RPC（ping/ls/find/grep/read/write）复用一条已 Hello 的控制连接——每条新
+连接的握手是毫秒级成本，复用使这些操作亚毫秒化；exec/stream 保持每 turn
+一条新连接（§3.4）。复用连接上"请求未送达"的失败（写失败/对端断开/EOF
+截断）换新连接重试一次；读超时（请求可能已在 guest 执行）与解码/guest
+错误绝不重试。C# 当前 exec 也复用连接（实测可行，记入 §11 分歧）。
+
 **清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
 RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java
 `implements AutoCloseable`（try-with-resources）、C# `IAsyncDisposable`

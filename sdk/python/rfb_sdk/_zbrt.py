@@ -10,6 +10,7 @@ import math
 import secrets
 import socket
 import struct
+import threading
 
 from .errors import DecodeError, RemoteError, TransportError
 from .models import StreamEvent, StreamEventKind
@@ -409,6 +410,53 @@ class _ZbrtGuestClient:
     def __init__(self, address: str, timeout_s: float = 10.0):
         self._address = _parse_host_port(address)
         self._timeout_s = timeout_s
+        # health/fs RPC 复用一条控制连接（rust zbrt.rs 的 §3.4 语义）；
+        # exec/stream 保持每 turn 一条新连接（UNIFIED_API §3.4）。
+        self._control = None
+        self._control_lock = threading.Lock()
+
+    def drop_control(self) -> None:
+        """Close the cached control connection (sandbox deleted / shutdown)."""
+        with self._control_lock:
+            self._drop_unlocked()
+
+    def _drop_unlocked(self) -> None:
+        if self._control is not None:
+            try:
+                self._control.close()
+            except OSError:
+                pass
+            self._control = None
+
+    @staticmethod
+    def _retryable(error: TransportError) -> bool:
+        """rust zbrt.rs 的重试分类：读超时 = 请求可能已在 guest 执行，绝不
+        重试；写失败 / 连接断开（EOF、OSError）换新连接重试一次。"""
+        if str(error) == "zbrt read timeout":
+            return False
+        if isinstance(error, DecodeError):
+            return str(error).startswith("truncated frame")
+        return True
+
+    def _control_exchange(self, send, parse):
+        """One health/fs exchange over the cached control connection."""
+        with self._control_lock:
+            for reuse in (True, False):
+                sock = self._control if reuse else None
+                if sock is None:
+                    self._drop_unlocked()
+                    sock = self._connect(self._timeout_s)
+                try:
+                    request_id = send(sock)
+                    reply = self._read_reply(sock, request_id)
+                except TransportError as e:
+                    self._drop_unlocked()
+                    if reuse and self._retryable(e):
+                        continue
+                    raise
+                self._control = sock
+                return parse(reply)
+            raise TransportError("zbrt control exchange exhausted")
 
     def _connect(self, timeout_s: float) -> socket.socket:
         try:
@@ -527,27 +575,31 @@ class _ZbrtGuestClient:
         return self._exec(list(args), cwd, timeout_s, bytes(stdin))
 
     def ping(self) -> bool:
-        sock = self._connect(self._timeout_s)
-        try:
+        def send(sock):
             request_id = new_request_id()
             write_frame(sock, KIND_HEALTH, request_id, encode_health(True, None))
-            kind, _rid, payload = self._read_reply(sock, request_id)
+            return request_id
+
+        def parse(reply):
+            kind, _rid, payload = reply
             if kind == KIND_ERROR:
                 raise RemoteError(decode_error(payload)[1])
             if kind != KIND_HEALTH_ACK:
                 raise DecodeError(f"unexpected zbrt frame kind {kind} for health")
             healthy, _message = decode_health(payload)
             return healthy
-        finally:
-            sock.close()
+
+        return self._control_exchange(send, parse)
 
     def fs_op(self, op: int, path: str, args: dict) -> dict:
-        sock = self._connect(self._timeout_s)
-        try:
+        def send(sock):
             data = json.dumps(args, separators=(",", ":")).encode("utf-8")
             request_id = new_request_id()
             write_frame(sock, KIND_FS, request_id, encode_fs(op, path, data))
-            kind, _rid, payload = self._read_reply(sock, request_id)
+            return request_id
+
+        def parse(reply):
+            kind, _rid, payload = reply
             if kind == KIND_ERROR:
                 raise RemoteError(decode_error(payload)[1])
             if kind != KIND_FS_RESULT:
@@ -559,8 +611,8 @@ class _ZbrtGuestClient:
             if not isinstance(value, dict):
                 raise DecodeError("zbrt fs result must be a JSON object")
             return value
-        finally:
-            sock.close()
+
+        return self._control_exchange(send, parse)
 
     def open_stream(self, args, cwd) -> "_ZbrtStream":
         sock = self._connect(self._timeout_s)

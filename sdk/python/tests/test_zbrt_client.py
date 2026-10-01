@@ -212,9 +212,10 @@ class ZbrtHelloHandshakeTests(unittest.TestCase):
         self.assertEqual(stream.next_event().kind.value, "started")
         self.assertEqual(stream.next_event().kind.value, "stdout")
         self.assertEqual(stream.next_event().kind.value, "exit")
-        # One connection per request, and each one opened with Hello.
-        self.assertEqual(self.server.received_first_frame_kinds, [1, 1, 1, 1])
-        self.assertEqual(len(self.server.received_hellos), 4)
+        # health/fs 复用一条控制连接（rust zbrt.rs 语义），exec/stream 每
+        # turn 一条新连接；每个连接的首帧都是 Hello。
+        self.assertEqual(self.server.received_first_frame_kinds, [1, 1, 1])
+        self.assertEqual(len(self.server.received_hellos), 3)
         for client_name, caps in self.server.received_hellos:
             self.assertEqual(client_name, "rfb-sdk-python")
             self.assertEqual(caps, z.ZBRT_V1_CAPABILITIES)
