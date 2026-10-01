@@ -60,9 +60,13 @@ RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn�
 
 **UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
 Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
-8 并发 fs ≈ 6.4k ops/s（rust 实测 6388；python/node 同形态 2.2k/3.9k，
-受语言运行时 GIL/事件循环限制）。java/c# 不支持（需原生库），走 TCP 中继
-（0.6ms/RTT，8 并发 0.8-1.0k ops/s）。
+8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s；
+**c# 亦原生支持**（`UnixDomainSocketEndPoint`，net8.0 target——netstandard2.1
+抛明确错误；实测 2147 ops/s）；python/node 同形态 2.2k/3.9k，受语言运行时
+GIL/事件循环限制。java：JEP 380（Java 16+）原生有 UDS，但 SDK 基线是
+release 8（需反射）且 AF_UNIX 的 SocketChannel **无 SO_TIMEOUT 等价物**
+（挂死风险要自造看门狗）——验证过反射路径可行（relay OK），维持 TCP 中继
+（0.6ms/RTT，8 并发 ~0.8-1.0k ops/s），除非未来把基线提到 16。
 
 **清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
 RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java

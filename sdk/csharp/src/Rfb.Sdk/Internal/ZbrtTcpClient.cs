@@ -27,11 +27,17 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// host memory without bound).</summary>
     private const long MaxTurnOutputBytes = 16L * 1024 * 1024;
 
-    private readonly string _host;
+    /// <summary>TCP 形态的地址（uds 形态下为空 —— 该路径不触 TCP）。</summary>
+    private readonly string _host = "";
     private readonly int _port;
     private readonly TimeSpan _timeout;
     private readonly byte[] _header = new byte[ZbrtFrameCodec.HeaderLen];
     private TcpClient? _tcp;
+    private readonly string? _udsSocketPath;
+    /// <summary>UDS 形态（"uds:<path>[@<port>]"）的宿主侧 socket。</summary>
+    private Socket? _udsSocket;
+    /// <summary>UDS 直拨时的 guest vsock 端口（CONNECT 前导用）。</summary>
+    private int _udsGuestPort;
     private NetworkStream? _stream;
     private readonly string _address;
 
@@ -41,16 +47,41 @@ internal sealed class ZbrtTcpClient : IDisposable
 
     public ZbrtTcpClient(string address, TimeSpan timeout)
     {
-        (_host, _port) = WireJson.ParseGuestAddress(address);
+        if (address.StartsWith("uds:", StringComparison.Ordinal))
+        {
+            // 直拨 FC 的 vsock relay UDS（无 TCP/中继跳）。
+            var rest = address[4..];
+            var at = rest.LastIndexOf('@');
+            _udsSocketPath = at >= 0 ? rest[..at] : rest;
+            _udsGuestPort = at >= 0
+                ? int.Parse(rest[(at + 1)..], System.Globalization.CultureInfo.InvariantCulture)
+                : 5000;
+        }
+        else
+        {
+            (_host, _port) = WireJson.ParseGuestAddress(address);
+        }
         _address = address;
         _timeout = timeout;
     }
 
     public async Task ConnectAsync()
     {
-        if (_tcp is not null)
+        if (_tcp is not null || _stream is not null)
         {
             return;
+        }
+
+        if (_udsSocketPath is not null)
+        {
+#if NET
+            await ConnectUdsAsync(_udsSocketPath, _udsGuestPort).ConfigureAwait(false);
+            await HandshakeAsync().ConfigureAwait(false);
+            return;
+#else
+            throw new TransportException(
+                "uds: guest addresses need the net8.0 target (UnixDomainSocketEndPoint)");
+#endif
         }
 
         var tcp = new TcpClient();
@@ -79,6 +110,46 @@ internal sealed class ZbrtTcpClient : IDisposable
         // complete it is a transport failure.
         await HandshakeAsync().ConfigureAwait(false);
     }
+
+#if NET
+    /// <summary>UDS 直拨 + FC 的 CONNECT 前导（net8.0+：UnixDomainSocketEndPoint）。</summary>
+    private async Task ConnectUdsAsync(string path, int guestPort)
+    {
+        using var cts = new CancellationTokenSource(_timeout);
+        var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        try
+        {
+            await socket.ConnectAsync(new UnixDomainSocketEndPoint(path), cts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            socket.Dispose();
+            throw new TransportException("guest connect timeout");
+        }
+        catch (SocketException e)
+        {
+            socket.Dispose();
+            throw new TransportException($"guest connect failed: {e.Message}", e);
+        }
+
+        // AF_UNIX 不支持 TCP_NODELAY（uds 本无 Nagle）；SO_RCVTIMEO/SO_SNDTIMEO 可用。
+        socket.ReceiveTimeout = (int)_timeout.TotalMilliseconds;
+        socket.SendTimeout = (int)_timeout.TotalMilliseconds;
+        _stream = new NetworkStream(socket, ownsSocket: true);
+        _udsSocket = socket;
+        // FC 的 vsock relay UDS 不是透明字节流：先 CONNECT 前导。
+        var command = System.Text.Encoding.ASCII.GetBytes("CONNECT " + guestPort + "\n");
+        await _stream.WriteAsync(command).ConfigureAwait(false);
+        var line = new byte[64];
+        var read = await _stream.ReadAsync(line, cts.Token).ConfigureAwait(false);
+        var reply = System.Text.Encoding.ASCII.GetString(line, 0, Math.Max(read - 1, 0));
+        if (read <= 0 || !reply.StartsWith("OK ", StringComparison.Ordinal))
+        {
+            throw new TransportException($"vsock relay rejected: {reply.Trim()}");
+        }
+    }
+#endif
 
     /// <summary>
     /// Mandatory Hello → HelloAck handshake (PROTOCOL.md §3.4). Any failure —
@@ -346,6 +417,8 @@ internal sealed class ZbrtTcpClient : IDisposable
         _stream = null;
         _tcp?.Dispose();
         _tcp = null;
+        _udsSocket?.Dispose();
+        _udsSocket = null;
     }
 
     internal async Task WriteFrameAsync(ZbrtFrame frame)
