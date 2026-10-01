@@ -65,21 +65,20 @@ const MAX_EXEC_FRAMES: usize = 65_536;
 /// facade; clones share the same control connection.
 /// The guest endpoint a [`ZbrtGuest`] dials, chosen by the `guest_addr`
 /// prefix: `uds:<path>` = the Firecracker vsock relay UDS DIRECT (no TCP,
-/// no relay hop — rfb-ben's capacity shape); `vsock:<cid>:<port>` = the
-/// host-side vsock; anything else = a TCP relay address.
+/// no relay hop — rfb-ben's capacity shape); anything else = a TCP relay
+/// address. (FC 的 vsock 设备只以 UDS relay 实现 —— spec 明言 "backed by
+/// a set of Unix Domain Sockets"，没有 vhost-vsock 模式。)
 #[derive(Clone)]
 pub(super) enum Endpoint {
     Tcp(String),
     /// FC vsock relay UDS, direct: (uds path, guest vsock port).
     Uds(String, u32),
-    Vsock(u32, u32),
 }
 
 /// One established guest connection (TCP via a relay, or host-side vsock).
 pub(super) enum GuestConn {
     Tcp(TcpStream),
     Uds(tokio::net::UnixStream),
-    Vsock(tokio_vsock::VsockStream),
 }
 
 impl AsyncRead for GuestConn {
@@ -91,7 +90,6 @@ impl AsyncRead for GuestConn {
         match self.get_mut() {
             GuestConn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             GuestConn::Uds(s) => Pin::new(s).poll_read(cx, buf),
-            GuestConn::Vsock(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -105,7 +103,6 @@ impl AsyncWrite for GuestConn {
         match self.get_mut() {
             GuestConn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             GuestConn::Uds(s) => Pin::new(s).poll_write(cx, buf),
-            GuestConn::Vsock(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -113,7 +110,6 @@ impl AsyncWrite for GuestConn {
         match self.get_mut() {
             GuestConn::Tcp(s) => Pin::new(s).poll_flush(cx),
             GuestConn::Uds(s) => Pin::new(s).poll_flush(cx),
-            GuestConn::Vsock(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -121,7 +117,6 @@ impl AsyncWrite for GuestConn {
         match self.get_mut() {
             GuestConn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             GuestConn::Uds(s) => Pin::new(s).poll_shutdown(cx),
-            GuestConn::Vsock(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -162,15 +157,6 @@ impl ZbrtGuest {
                     Err(_) => Endpoint::Tcp(address),
                 },
                 None => Endpoint::Uds(rest.to_owned(), 5000),
-            }
-        } else if let Some(rest) = address.strip_prefix("vsock:") {
-            // 解析失败回退 TCP 形态（原样），让 connect 报真实的错。
-            match rest
-                .split_once(':')
-                .and_then(|(c, p)| Some((c.parse::<u32>().ok()?, p.parse::<u32>().ok()?)))
-            {
-                Some((cid, port)) => Endpoint::Vsock(cid, port),
-                None => Endpoint::Tcp(address),
             }
         } else {
             Endpoint::Tcp(address)
@@ -220,16 +206,6 @@ impl ZbrtGuest {
                     ))
                 })?;
                 Ok(GuestConn::Uds(stream))
-            }
-            Endpoint::Vsock(cid, port) => {
-                let stream = tokio::time::timeout(
-                    self.timeout,
-                    tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(*cid, *port)),
-                )
-                .await
-                .map_err(|_| transport_timeout("zbrt connect timeout"))?
-                .map_err(RfbError::Transport)?;
-                Ok(GuestConn::Vsock(stream))
             }
         }
     }

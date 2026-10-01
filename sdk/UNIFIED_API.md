@@ -57,10 +57,14 @@ RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn�
 多条连接各服务一个操作（池深 8）。复用连接上"请求未送达"的失败（写失败/
 对端断开/EOF 截断）换新连接重试一次；读超时（请求可能已在 guest 执行）
 与解码/guest 错误绝不重试。stream 交互会话保持独占连接。
+（AF_VSOCK 直连不可用：Firecracker 的 vsock 设备**只以 UDS relay 实现**——
+官方 spec "backed by a set of Unix Domain Sockets"，v1.16/v1.17 的 /vsock
+都强制 uds_path，宿主内核没有 guest CID 的路由；`/dev/vhost-vsock` 是其它
+VMM 的机制。uds:/ 与 TCP 中继是仅有的两条宿主路径。）
 
 **UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
 Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
-8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s；
+8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s（idle 阈值优化后 11479 ops/s）；
 **c# 亦原生支持**（`UnixDomainSocketEndPoint`，net8.0 target——netstandard2.1
 抛明确错误；实测 2147 ops/s）；python/node 同形态 2.2k/3.9k，受语言运行时
 GIL/事件循环限制。java：JEP 380（Java 16+）原生有 UDS，但 SDK 基线是
