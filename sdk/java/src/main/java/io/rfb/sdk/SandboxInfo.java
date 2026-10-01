@@ -34,6 +34,9 @@ public class SandboxInfo {
     @JsonProperty("branch_count")
     private long branchCount = 0L;
 
+    /** Default constructor (Jackson deserialization; explicit no-arg form). */
+    public SandboxInfo() {}
+
     /** Convenience constructor for a direct attach (see {@code Sandbox.attach}). */
     public SandboxInfo(String id, String guestAddr) {
         this.id = id == null ? "" : id;
