@@ -133,7 +133,7 @@ pub(super) struct ZbrtGuest {
     /// Warm exec connections: established + Hello-ed, idle. A connection may
     /// serve sequential turns (the c# precedent); concurrent execs each take
     /// their own, keeping the one-active-request-per-connection rule intact.
-    exec_pool: Arc<Mutex<Vec<GuestConn>>>,
+    exec_pool: Arc<Mutex<Vec<(GuestConn, std::time::Instant)>>>,
 }
 
 fn io_error(message: &'static str) -> RfbError {
@@ -518,12 +518,16 @@ impl ZbrtGuest {
     }
 
     async fn borrow_exec(&self) -> Option<GuestConn> {
-        // 锁内只 pop：验活握手是毫秒级 RTT，锁内做会把所有借出串行化。
+        // 锁内只 pop；验活握手（毫秒级 RTT）只对空闲超过 1s 的连接做——
+        // 热路径（背靠背操作）零额外 RTT。
         loop {
-            let mut stream = {
+            let (mut stream, last_used) = {
                 let mut pool = self.exec_pool.lock().await;
-                pool.pop()
-            }?;
+                pool.pop()?
+            };
+            if std::time::Instant::now().duration_since(last_used) < Duration::from_secs(1) {
+                return Some(stream);
+            }
             if self.handshake(&mut stream).await.is_ok() {
                 return Some(stream);
             }
@@ -532,8 +536,8 @@ impl ZbrtGuest {
 
     async fn repay_exec(&self, stream: GuestConn) {
         let mut pool = self.exec_pool.lock().await;
-        if pool.len() < 4 {
-            pool.push(stream);
+        if pool.len() < 8 {
+            pool.push((stream, std::time::Instant::now()));
         }
         // else: dropped = closed
     }

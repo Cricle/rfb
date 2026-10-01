@@ -188,8 +188,8 @@ export class Sandbox {
   public readonly guestAddr: string;
   public readonly transport: string;
   readonly #client: { deleteSandbox(id: string): Promise<void>; };
-  /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活）。 */
-  #zbrtExecPool: ZbrtConnection[] = [];
+  /** exec 温连接池：已 Hello 的空闲连接，借还复用（空闲 >1s 才验活）。 */
+  #zbrtExecPool: { conn: ZbrtConnection; lastUsed: number }[] = [];
   readonly #guestTimeoutMs: number;
 
   constructor(info: SandboxInfo, client: { deleteSandbox(id: string): Promise<void> }, transport: string, guestTimeoutMs = 10_000) {
@@ -538,7 +538,7 @@ export class Sandbox {
    * @throws {HttpStatusError} Non-2xx, non-404 controller answer.
    */
   async delete(): Promise<void> {
-    for (const c of this.#zbrtExecPool.splice(0)) c.close();
+    for (const { conn } of this.#zbrtExecPool.splice(0)) conn.close();
     await this.#client.deleteSandbox(this.id);
   }
 
@@ -555,7 +555,11 @@ export class Sandbox {
    * 回退新连接）。单线程 event loop 下同步 pop 无交错风险。 */
   async #borrowExecConn(): Promise<ZbrtConnection> {
     while (this.#zbrtExecPool.length > 0) {
-      const conn = this.#zbrtExecPool.pop()!;
+      const { conn, lastUsed } = this.#zbrtExecPool.pop()!;
+      // 热路径（背靠背操作）零额外 RTT：只对空闲 >1s 的连接验活。
+      if (performance.now() - lastUsed < 1000) {
+        return conn;
+      }
       try {
         await conn.hello('rfb-sdk-node');
         return conn;
@@ -571,7 +575,7 @@ export class Sandbox {
     const conn = await this.#borrowExecConn();
     try {
       const out = await op(conn);
-      this.#zbrtExecPool.push(conn);
+      this.#zbrtExecPool.push({ conn, lastUsed: performance.now() });
       return out;
     } catch (error) {
       conn.close();
@@ -580,7 +584,7 @@ export class Sandbox {
         const fresh = await this.#zbrt();
         try {
           const out = await op(fresh);
-          this.#zbrtExecPool.push(fresh);
+          this.#zbrtExecPool.push({ conn: fresh, lastUsed: performance.now() });
           return out;
         } catch (e2) {
           fresh.close();

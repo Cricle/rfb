@@ -610,11 +610,11 @@ export const DEFAULT_ZBRT_TCP = '127.0.0.1:15000';
 ''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #borrowExecConn(")
 drop_brace_block(f"{N}/src/sandbox.ts", "async #withExecConn<")
-must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的空闲连接，借还复用（借出先重发 Hello 验活）。 */
-  #zbrtExecPool: ZbrtConnection[] = [];
+must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的空闲连接，借还复用（空闲 >1s 才验活）。 */
+  #zbrtExecPool: { conn: ZbrtConnection; lastUsed: number }[] = [];
 ''', "")
 must_replace(f"{N}/src/sandbox.ts",
-             "    for (const c of this.#zbrtExecPool.splice(0)) c.close();\n", "")
+             "    for (const { conn } of this.#zbrtExecPool.splice(0)) conn.close();\n", "")
 drop_brace_block(f"{N}/src/sandbox.ts", "export const TRANSPORT_ZBRT")
 drop_brace_block(f"{N}/src/sandbox.ts", "function zbrtTimeoutMs")
 drop_brace_block(f"{N}/src/sandbox.ts", "this.transport === TRANSPORT_ZBRT", expect_min=6)
@@ -674,14 +674,15 @@ drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private static b
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ExecResult execViaPool(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private ZbrtConnection borrowExecConn(")
 drop_brace_block(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", "private void repayExecConn(")
-must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** exec 温连接池（已 Hello 的空闲连接）。 */
-    private final java.util.concurrent.ConcurrentLinkedQueue<ZbrtConnection>
+must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java", '''    /** exec 温连接池（已 Hello 的空闲连接；空闲 >1s 借出时才验活）。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<
+            java.util.AbstractMap.SimpleEntry<ZbrtConnection, Long>>
             zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
 ''', "")
 must_replace(f"{J}/src/main/java/io/rfb/sdk/Sandbox.java",
-             '''        ZbrtConnection pooled;
+             '''        java.util.AbstractMap.SimpleEntry<ZbrtConnection, Long> pooled;
         while ((pooled = zbrtExecPool.poll()) != null) {
-            pooled.close();
+            pooled.getKey().close();
         }
 ''', "")
 

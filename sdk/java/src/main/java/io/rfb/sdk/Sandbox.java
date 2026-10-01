@@ -30,8 +30,9 @@ public final class Sandbox implements AutoCloseable {
     private final InetSocketAddress guestAddress;
     private final Duration timeout;
     /** health/fs RPC 复用的控制连接（rust zbrt.rs 语义）。 */
-    /** exec 温连接池（已 Hello 的空闲连接）。 */
-    private final java.util.concurrent.ConcurrentLinkedQueue<ZbrtConnection>
+    /** exec 温连接池（已 Hello 的空闲连接；空闲 >1s 借出时才验活）。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<
+            java.util.AbstractMap.SimpleEntry<ZbrtConnection, Long>>
             zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private Sandbox(RfbClient client, SandboxInfo info, String transport) {
@@ -628,9 +629,9 @@ public final class Sandbox implements AutoCloseable {
      * @throws TransportError  connection/read failure or request timeout
      */
     public void delete() {
-        ZbrtConnection pooled;
+        java.util.AbstractMap.SimpleEntry<ZbrtConnection, Long> pooled;
         while ((pooled = zbrtExecPool.poll()) != null) {
-            pooled.close();
+            pooled.getKey().close();
         }
         client.deleteSandbox(info.getId());
     }
@@ -748,9 +749,15 @@ public final class Sandbox implements AutoCloseable {
 
     private ZbrtConnection borrowExecConn(Duration socketBudget) {
         while (true) {
-            ZbrtConnection conn = zbrtExecPool.poll();
-            if (conn == null) {
+            java.util.AbstractMap.SimpleEntry<ZbrtConnection, Long> entry =
+                    zbrtExecPool.poll();
+            if (entry == null) {
                 return null;
+            }
+            ZbrtConnection conn = entry.getKey();
+            // 热路径（背靠背操作）零额外 RTT：只对空闲 >1s 的连接验活。
+            if (System.nanoTime() - entry.getValue() < 1_000_000_000L) {
+                return conn;
             }
             try {
                 conn.hello(ZbrtConnection.CLIENT_NAME);
@@ -762,8 +769,9 @@ public final class Sandbox implements AutoCloseable {
     }
 
     private void repayExecConn(ZbrtConnection conn) {
-        if (zbrtExecPool.size() < 4) {
-            zbrtExecPool.offer(conn);
+        if (zbrtExecPool.size() < 8) {
+            zbrtExecPool.offer(new java.util.AbstractMap.SimpleEntry<>(
+                    conn, System.nanoTime()));
         } else {
             conn.close();
         }
