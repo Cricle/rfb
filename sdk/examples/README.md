@@ -25,8 +25,7 @@
 
 ## python/ 目录的其它内容
 
-- `host_quickstart.py` — 宿主侧自己拉后端（KVM + root，无控制器/TAP/
-  CLI）：`sudo python3 host_quickstart.py`，制品目录 `RFB_DEMO_ASSETS`。
-- `repl.py` — 交互式沙箱演示（双后端自举）：`sudo python3 repl.py --up`；
+- `repl.py` — 宿主侧编排 + 交互式沙箱演示（`rfb_sdk.host` 双后端自举，
+  KVM + root）：`sudo python3 repl.py --up`（`--down` 停后端）；
   制品一次性搭建 `bash setup-demo-assets.sh`（不入 git，默认 `./assets/`）。
 - `test_repl.py` — 示例单测（无需 VM）：`python3 test_repl.py`。

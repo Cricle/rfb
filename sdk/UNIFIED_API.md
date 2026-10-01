@@ -131,7 +131,7 @@ Python/Java/C# 均为基类单继承结构，按类别 catch 基类即可全覆�
 | `FORKD_TOKEN` | 四语言 `RfbClient` 缺省构造 | controller Bearer token（非空才发头） |
 | `FORKD_AGENT_TOKEN` | forkd agent（guest 侧，启用连接认证）；Python/Node.js/Java SDK guest 客户端（配置后每连接先发 auth 首帧）；Rust/C# 客户端尚未接入 | guest NDJSON 连接认证；非空 = 强制首帧 `{"action":"auth","token":…}`，10 s 超时（`PROTOCOL.md §2.6`） |
 | `RFB_ZBRT_TCP` | 五语言 quickstart 的 `--backend zeroboot`；rfbsample | 已运行 ZBRT 桥的 TCP 地址（默认 `127.0.0.1:15000`） |
-| `RFB_DEMO_ASSETS` | `examples/python/host_quickstart.py` | 宿主侧演示的制品目录（firecracker/vmlinux/zeroboot-zbrt.ext4） |
+| `RFB_DEMO_ASSETS` | `examples/python/repl.py` | 宿主侧演示的制品目录（firecracker/vmlinux/zeroboot-zbrt.ext4） |
 | `FORKD_KERNEL` / `FORKD_ROOTFS` / `FORKD_BIN` | `rfb-cli forkd snapshot-*` | 快照创建的内核 / rootfs / 官方 forkd 二进制路径覆盖 |
 | `RFB_RUNTIME_BIN` | 部署流水线（约定注入点，仓库内代码不读） | 预编译静态 rfb-runtime 二进制路径 |
 | `RFB_AGENT_WORKSPACE` | rfb-runtime agent | guest 工作区根覆盖（默认 `/workspace`，供宿主侧契约测试用） |
