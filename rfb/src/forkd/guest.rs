@@ -11,9 +11,11 @@ pub use crate::guest::{
     MAX_GUEST_PATH_BYTES, MAX_GUEST_PATTERN_BYTES, MAX_GUEST_RESULTS, MAX_GUEST_RESULT_BYTES,
 };
 
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
@@ -66,6 +68,10 @@ pub struct ForkdGuestClient {
     pub address: String,
     /// Request timeout.
     pub timeout: Duration,
+    /// 统一温连接池：agent 的 serve 循环可顺序承载多个请求，每操作新建
+    /// TCP 连接的握手/拆除 ≈ 0.4ms/次。条目 = (reader, writer, 最后使用)。
+    /// 并发 = 池中多条连接各服务一个操作（每连接同时一个请求）。
+    pool: Arc<Mutex<Vec<(BufReader<OwnedReadHalf>, OwnedWriteHalf, std::time::Instant)>>>,
 }
 
 /// A bidirectional newline-delimited JSON forkd guest session.
@@ -84,7 +90,14 @@ impl ForkdGuestClient {
         Self {
             address: address.into(),
             timeout: Duration::from_secs(10),
+            pool: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Set the request timeout (builder style; the pool is untouched).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Send a raw action JSON value and collect the response lines.
@@ -109,8 +122,37 @@ impl ForkdGuestClient {
         action: Value,
         read_timeout: Duration,
     ) -> Result<Vec<Value>, ForkdGuestError> {
-        const MAX_RESPONSE_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
-        const MAX_RESPONSE_LINES: usize = 65_536;
+        // 统一温池：锁内只 pop；空闲 <1s 的连接直接用（agent 不关空闲连接，
+        // 热路径零额外开销）；超龄连接直接丢弃重连（ndjson 无握手、TCP
+        // connect 本身就是验证，~0.2ms）。借出的连接上失败 = 请求可能已在
+        // guest 执行，绝不重试（连接丢弃，错误原样返回）。
+        loop {
+            let borrowed = {
+                let mut pool = self.pool.lock().await;
+                pool.pop()
+            };
+            match borrowed {
+                Some((mut reader, mut write, last_used)) => {
+                    if std::time::Instant::now().duration_since(last_used) < Duration::from_secs(1)
+                    {
+                        let result = self
+                            .exchange(&mut reader, &mut write, action, read_timeout)
+                            .await;
+                        if result.is_ok() {
+                            let mut pool = self.pool.lock().await;
+                            if pool.len() < 8 {
+                                pool.push((reader, write, std::time::Instant::now()));
+                            } // else: dropped = closed
+                        }
+                        return result;
+                    }
+                    // 超龄：shutdown 写半边（reader 随 drop 关闭），试下一条。
+                    let _ = write.shutdown().await;
+                    continue;
+                }
+                None => break,
+            }
+        }
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
             .map_err(|_| timed_out("guest connect timeout"))??;
@@ -120,11 +162,34 @@ impl ForkdGuestClient {
         // the business frame, or a token-gated agent answers
         // {"error":"authentication required"} and closes the connection.
         authenticate(&mut reader, &mut write, self.timeout).await?;
-        write_json(&mut write, &action, self.timeout).await?;
+        let result = self
+            .exchange(&mut reader, &mut write, action, read_timeout)
+            .await?;
+        {
+            let mut pool = self.pool.lock().await;
+            if pool.len() < 8 {
+                pool.push((reader, write, std::time::Instant::now()));
+            }
+        }
+        return Ok(result);
+    }
+
+    /// One request/response exchange over an established (authenticated)
+    /// connection. Errors leave the connection unusable (caller drops it).
+    async fn exchange(
+        &self,
+        reader: &mut BufReader<OwnedReadHalf>,
+        write: &mut OwnedWriteHalf,
+        action: Value,
+        read_timeout: Duration,
+    ) -> Result<Vec<Value>, ForkdGuestError> {
+        const MAX_RESPONSE_BYTES: usize = crate::core::MAX_GUEST_PAYLOAD_BYTES;
+        const MAX_RESPONSE_LINES: usize = 65_536;
+        write_json(write, &action, self.timeout).await?;
         let mut responses = Vec::new();
         let mut collected_bytes = 0usize;
         loop {
-            let value = match read_json_line(&mut reader, read_timeout).await? {
+            let value = match read_json_line(reader, read_timeout).await? {
                 Some(value) => value,
                 None => {
                     return Err(ForkdGuestError::Remote(

@@ -442,12 +442,14 @@ must_replace(facade, '''def _zbrt_exec_result(t: tuple) -> ExecResult:
 
 
 ''', "")
-must_replace(facade, '''        if self._transport == "zbrt":
-            if self._guest_client_cache is None:
-                self._guest_client_cache = _ZbrtGuestClient(self.guest_addr,
-                                                            timeout_s)
-            return self._guest_client_cache
-''', "")
+must_replace(facade, '''        if self._guest_client_cache is None:
+            self._guest_client_cache = (
+                _ZbrtGuestClient(self.guest_addr, timeout_s)
+                if self._transport == "zbrt"
+                else _GuestNdjsonClient(self.guest_addr, timeout_s))
+        return self._guest_client_cache
+''', '''        return _GuestNdjsonClient(self.guest_addr, timeout_s)
+''')
 must_replace(facade, '''        ZBRT carries ``args`` as-is; the NDJSON action dict drops None values
         (absent keys on the wire) to mirror the historical request shape.
         """

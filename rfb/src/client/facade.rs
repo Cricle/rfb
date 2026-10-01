@@ -386,10 +386,10 @@ impl GuestSandbox {
 
     fn ops(&self) -> GuestOps {
         match self.transport {
-            GuestTransport::Ndjson => GuestOps::Ndjson(crate::forkd_guest::ForkdGuestClient {
-                address: self.info.guest_addr.clone(),
-                timeout: self.timeout,
-            }),
+            GuestTransport::Ndjson => GuestOps::Ndjson(
+                crate::forkd_guest::ForkdGuestClient::new(self.info.guest_addr.clone())
+                    .with_timeout(self.timeout),
+            ),
             #[cfg(feature = "zeroboot")]
             GuestTransport::Zbrt => GuestOps::Zbrt(self.zbrt.clone()),
         }

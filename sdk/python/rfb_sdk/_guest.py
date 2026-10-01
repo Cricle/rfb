@@ -8,6 +8,7 @@ import json
 import math
 import os
 import socket
+import time
 
 from .errors import DecodeError, RemoteError, TransportError
 from ._zbrt import _parse_host_port
@@ -76,6 +77,10 @@ class _GuestNdjsonClient:
     def __init__(self, address: str, timeout_s: float = 10.0):
         self._address = _parse_host_port(address)
         self._timeout_s = timeout_s
+        # NDJSON 温连接池：agent 的 serve 是循环的（一条连接可顺序承载多个
+        # 请求）；每操作新建 TCP 连接的握手/拆除 ≈ 0.4ms/次。连接私有于
+        # 一次操作期间；失败即弃（不重试——exec 的双重执行不可接受）。
+        self._pool = []
 
     def _effective_timeout(self, timeout_s):
         # Mirrors the Rust baseline (forkd/guest.rs): client timeout + exec
@@ -149,6 +154,17 @@ class _GuestNdjsonClient:
 
     def _request(self, action: dict, timeout_s=None) -> list:
         timeout = self._effective_timeout(timeout_s)
+        while self._pool:
+            sock, rfile, _ts = self._pool.pop()
+            try:
+                sock.settimeout(timeout)
+                return self._exchange(sock, rfile, action)
+            except BaseException:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
         try:
             sock = socket.create_connection(self._address, timeout=timeout)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -158,6 +174,15 @@ class _GuestNdjsonClient:
             sock.settimeout(timeout)
             rfile = sock.makefile("rb")
             self._authenticate(sock, rfile)
+            result = self._exchange(sock, rfile, action)
+        except BaseException:
+            sock.close()
+            raise
+        self._repay(sock, rfile)
+        return result
+
+    def _exchange(self, sock, rfile, action) -> list:
+        try:
             line = json.dumps(action, separators=(",", ":")).encode("utf-8") + b"\n"
             try:
                 sock.sendall(line)
@@ -172,7 +197,17 @@ class _GuestNdjsonClient:
                 responses.append(value)
                 if any(key in value for key in TERMINAL_KEYS):
                     return responses
-        finally:
+        except BaseException:
+            try:
+                rfile.close()
+            except OSError:
+                pass
+            raise
+
+    def _repay(self, sock, rfile) -> None:
+        if len(self._pool) < 8:
+            self._pool.append((sock, rfile, time.monotonic()))
+        else:
             sock.close()
 
     def ping(self) -> dict:

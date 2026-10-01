@@ -446,13 +446,11 @@ async fn typed_filesystem_and_stream_operations_use_sandbox_trait() {
 #[tokio::test]
 async fn mock_guest_ping() {
     let (address, server) = mock_ndjson_once("{\"pong\":true}\n".to_owned()).await;
-    let result = ForkdGuest {
-        address,
-        timeout: Duration::from_secs(2),
-    }
-    .ping()
-    .await
-    .unwrap();
+    let result = ForkdGuest::new(address)
+        .with_timeout(Duration::from_secs(2))
+        .ping()
+        .await
+        .unwrap();
     assert_eq!(result["pong"], true);
     let request = server.await.unwrap();
     assert_eq!(request["action"], "ping");

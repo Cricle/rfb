@@ -235,12 +235,12 @@ class Sandbox:
 
     def _guest(self):
         timeout_s = self._client.timeout_s
-        if self._transport == "zbrt":
-            if self._guest_client_cache is None:
-                self._guest_client_cache = _ZbrtGuestClient(self.guest_addr,
-                                                            timeout_s)
-            return self._guest_client_cache
-        return _GuestNdjsonClient(self.guest_addr, timeout_s)
+        if self._guest_client_cache is None:
+            self._guest_client_cache = (
+                _ZbrtGuestClient(self.guest_addr, timeout_s)
+                if self._transport == "zbrt"
+                else _GuestNdjsonClient(self.guest_addr, timeout_s))
+        return self._guest_client_cache
 
     def _fs_call(self, op: int, action: str, path: str, args: dict) -> dict:
         """Run one filesystem RPC over the active transport.
