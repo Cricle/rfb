@@ -61,6 +61,9 @@ pub enum ForkdGuestError {
     UnsupportedGuestRpc(String),
 }
 
+/// 池条目：reader + writer 半边 + 最后使用时刻。
+type PooledNdjsonConn = (BufReader<OwnedReadHalf>, OwnedWriteHalf, std::time::Instant);
+
 /// TCP client for a forkd guest speaking newline-delimited JSON.
 #[derive(Clone, Debug)]
 pub struct ForkdGuestClient {
@@ -71,7 +74,7 @@ pub struct ForkdGuestClient {
     /// 统一温连接池：agent 的 serve 循环可顺序承载多个请求，每操作新建
     /// TCP 连接的握手/拆除 ≈ 0.4ms/次。条目 = (reader, writer, 最后使用)。
     /// 并发 = 池中多条连接各服务一个操作（每连接同时一个请求）。
-    pool: Arc<Mutex<Vec<(BufReader<OwnedReadHalf>, OwnedWriteHalf, std::time::Instant)>>>,
+    pool: Arc<Mutex<Vec<PooledNdjsonConn>>>,
 }
 
 /// A bidirectional newline-delimited JSON forkd guest session.
@@ -171,7 +174,7 @@ impl ForkdGuestClient {
                 pool.push((reader, write, std::time::Instant::now()));
             }
         }
-        return Ok(result);
+        Ok(result)
     }
 
     /// One request/response exchange over an established (authenticated)
