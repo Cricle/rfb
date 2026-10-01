@@ -236,33 +236,33 @@ def boot_firecracker(fc_bin: str, kernel: str, rootfs: str, work_dir: str, *,
 # ---------------------------------------------------------------------------
 
 
-def _pump_bidirectional(a: socket.socket, b: socket.socket,
-                        stop: threading.Event) -> None:
-    """Copy between two sockets until either side ends or `stop` is set."""
-    selector = selectors.DefaultSelector()
-    a.setblocking(False)
-    b.setblocking(False)
-    selector.register(a, selectors.EVENT_READ)
-    selector.register(b, selectors.EVENT_READ)
-    peers = {a: b, b: a}
-    try:
-        while not stop.is_set():
-            for key, _ in selector.select(0.5):
-                source = key.fileobj
-                try:
-                    data = source.recv(65536)
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except OSError:
-                    return
+def _pump_bidirectional(a: socket.socket, b: socket.socket) -> None:
+    """Blocking two-thread copy: a select loop costs a poll syscall per
+    direction switch; blocking recv/sendall release the GIL and ride the
+    kernel directly — lower per-op latency under concurrency. EOF propagates
+    via shutdown(SHUT_WR) so the peer pump ends too."""
+
+    def _copy(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
                 if not data:
                     return
-                try:
-                    peers[source].sendall(data)
-                except OSError:
-                    return
+                dst.sendall(data)
+        except OSError:
+            return
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_copy, args=(b, a), daemon=True)
+    t.start()
+    try:
+        _copy(a, b)
     finally:
-        selector.close()
+        t.join(timeout=5)
 
 
 class TcpVsockRelay:
@@ -280,6 +280,7 @@ class TcpVsockRelay:
         self.guest_port = guest_port
         self._stop = threading.Event()
         self._listener = None
+        self._live = set()  # 活连接登记：stop 时强拆，泵的阻塞 recv 才能醒
 
     def start(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -297,6 +298,11 @@ class TcpVsockRelay:
                 self._listener.close()
             except OSError:
                 pass
+        for sock in list(self._live):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _accept_loop(self) -> None:
         while not self._stop.is_set():
@@ -310,12 +316,15 @@ class TcpVsockRelay:
                              daemon=True).start()
 
     def _bridge(self, client: socket.socket) -> None:
-        with client:
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._live.add(client)
+        try:
             # The with-block covers the WHOLE handshake: every failure path
             # (relay not ready, rejected preamble, timeout) closes the UDS —
             # the boot window alone tries ~60 connects, one leaked fd per
             # attempt adds up fast.
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as uds:
+                self._live.add(uds)
                 try:
                     uds.settimeout(10)
                     uds.connect(self.uds_path)
@@ -332,7 +341,14 @@ class TcpVsockRelay:
                         return  # relay rejected (guest not listening, ...)
                 except OSError:
                     return
-                _pump_bidirectional(client, uds, self._stop)
+                _pump_bidirectional(client, uds)
+            self._live.discard(uds)
+        finally:
+            self._live.discard(client)
+            try:
+                client.close()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

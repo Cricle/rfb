@@ -95,10 +95,14 @@ impl ZbrtGuest {
     }
 
     async fn connect(&self) -> Result<TcpStream, RfbError> {
-        tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
+        let mut stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.address))
             .await
             .map_err(|_| transport_timeout("zbrt connect timeout"))?
-            .map_err(RfbError::Transport)
+            .map_err(RfbError::Transport)?;
+        // 无 NODELAY 时，背靠背的小帧会被 Nagle 拖住等对端 ACK（并发下变成
+        // 每请求 ~5ms 的停顿）——与其它四语言客户端对齐。
+        stream.set_nodelay(true).map_err(RfbError::Transport)?;
+        Ok(stream)
     }
 
     /// Fresh 128-bit request id per request (UUID v4 bytes).
