@@ -12,7 +12,7 @@ public sealed class Sandbox : IAsyncDisposable
     private readonly RfbClient _client;
     private readonly TimeSpan _timeout;
     private readonly Lazy<ForkdGuestNdjson> _ndjson;
-    private readonly Lazy<ZbrtTcpClient> _zbrt;
+    private readonly Lazy<ZbrtPool> _zbrt;
 
     /// <summary>Attach a sandbox at a KNOWN guest address with an explicit
     /// transport — the entry point for direct ZBRT bridges (no controller
@@ -46,7 +46,7 @@ public sealed class Sandbox : IAsyncDisposable
         // Plain Lazy<T>: the constructors are synchronous, so Task.FromResult
         // wrappers (and the .Result unwrap they forced) added nothing.
         _ndjson = new Lazy<ForkdGuestNdjson>(() => new ForkdGuestNdjson(info.GuestAddr, timeout));
-        _zbrt = new Lazy<ZbrtTcpClient>(() => new ZbrtTcpClient(info.GuestAddr, timeout));
+        _zbrt = new Lazy<ZbrtPool>(() => new ZbrtPool(info.GuestAddr, timeout));
     }
 
     /// <summary>Sandbox id (controller-assigned).</summary>
@@ -66,7 +66,7 @@ public sealed class Sandbox : IAsyncDisposable
         ? _ndjson.Value
         : throw new InvalidOperationException("ndjson transport not active");
 
-    private ZbrtTcpClient Zbrt => Transport == "zbrt"
+    private ZbrtPool Zbrt => Transport == "zbrt"
         ? _zbrt.Value
         : throw new InvalidOperationException("zbrt transport not active");
 
@@ -84,7 +84,7 @@ public sealed class Sandbox : IAsyncDisposable
                 && pong.ValueKind == JsonValueKind.True;
         }
 
-        return await Zbrt.HealthAsync().ConfigureAwait(false);
+        return await Zbrt.Run(c => c.HealthAsync()).ConfigureAwait(false);
     }
 
     /// <summary>Run <paramref name="args"/> in the guest; stdin is ZBRT-only
@@ -127,7 +127,7 @@ public sealed class Sandbox : IAsyncDisposable
         // locally, with zero frames and no TCP connection (UNIFIED_API.md §4).
         GuestValidation.ZbrtArgc(args.Count);
         GuestValidation.PayloadSize((stdin ?? []).Length, GuestValidation.MaxZbrtPayloadBytes);
-        var outcome = await Zbrt.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS)).ConfigureAwait(false);
+        var outcome = await Zbrt.Run(c => c.ExecuteAsync(args, cwd, stdin ?? [], TimeoutMs(timeoutS))).ConfigureAwait(false);
         // ZBRT v1 has no timed-out wire flag: the guest's executor surfaces a
         // deadline miss as an Error frame (an exception here), so the flag is
         // structurally false on this transport (mirrors the Rust baseline).
@@ -186,7 +186,7 @@ public sealed class Sandbox : IAsyncDisposable
             return GuestResults.ParseLs(v);
         }
 
-        var result = await Zbrt.FsAsync(FsOp.Ls, path, LsJson).ConfigureAwait(false);
+        var result = await Zbrt.Run(c => c.FsAsync(FsOp.Ls, path, LsJson)).ConfigureAwait(false);
         return GuestResults.ParseLs(result);
     }
 
@@ -231,7 +231,7 @@ public sealed class Sandbox : IAsyncDisposable
             ["pattern"] = pattern,
             ["max_results"] = GuestValidation.MaxResults,
         });
-        var result = await Zbrt.FsAsync(FsOp.Find, path, json).ConfigureAwait(false);
+        var result = await Zbrt.Run(c => c.FsAsync(FsOp.Find, path, json)).ConfigureAwait(false);
         return GuestResults.ParseFind(result);
     }
 
@@ -278,7 +278,7 @@ public sealed class Sandbox : IAsyncDisposable
             ["max_results"] = GuestValidation.MaxResults,
             ["max_bytes"] = GuestValidation.MaxResultBytes,
         });
-        var result = await Zbrt.FsAsync(FsOp.Grep, path, json).ConfigureAwait(false);
+        var result = await Zbrt.Run(c => c.FsAsync(FsOp.Grep, path, json)).ConfigureAwait(false);
         return GuestResults.ParseGrep(result);
     }
 
@@ -319,7 +319,7 @@ public sealed class Sandbox : IAsyncDisposable
             ["offset"] = offset,
             ["max_bytes"] = maxBytes,
         });
-        var result = await Zbrt.FsAsync(FsOp.Read, path, json).ConfigureAwait(false);
+        var result = await Zbrt.Run(c => c.FsAsync(FsOp.Read, path, json)).ConfigureAwait(false);
         return GuestResults.ParseRead(result);
     }
 
@@ -358,7 +358,7 @@ public sealed class Sandbox : IAsyncDisposable
             ["append"] = append,
             ["mode"] = mode,
         });
-        var result = await Zbrt.FsAsync(FsOp.Write, path, json).ConfigureAwait(false);
+        var result = await Zbrt.Run(c => c.FsAsync(FsOp.Write, path, json)).ConfigureAwait(false);
         return GuestResults.ParseWrite(result);
     }
 
@@ -410,7 +410,7 @@ public sealed class Sandbox : IAsyncDisposable
         // no TCP connection (PROTOCOL.md §3.2).
         GuestValidation.ZbrtArgc(args.Count);
 
-        var zbrtSession = await Zbrt.StreamAsync(args, cwd).ConfigureAwait(false);
+        var zbrtSession = await Zbrt.BorrowStreamAsync(args, cwd).ConfigureAwait(false);
         return new GuestStream(zbrtSession);
     }
 

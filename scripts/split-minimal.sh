@@ -850,8 +850,8 @@ must_replace(f"{C}/src/Rfb.Sdk/RfbClient.cs",
     public const string DefaultZbrtTcp = "127.0.0.1:15000";
 ''', "")
 drop_lines_csharp = [
-    "    private readonly Lazy<ZbrtTcpClient> _zbrt;",
-    "        _zbrt = new Lazy<ZbrtTcpClient>(() => new ZbrtTcpClient(info.GuestAddr, timeout));",
+    "    private readonly Lazy<ZbrtPool> _zbrt;",
+    "        _zbrt = new Lazy<ZbrtPool>(() => new ZbrtPool(info.GuestAddr, timeout));",
 ]
 p = Path(sb)
 t = p.read_text(encoding="utf-8")
@@ -860,7 +860,7 @@ for line in drop_lines_csharp:
     t = t.replace(line + "\n", "")
 new, n = re.subn(r'\n    /// <summary>Guest transport in use[^<]*</summary>\n', "\n", t)
 t = new
-new, n = re.subn(r'\n    private ZbrtTcpClient Zbrt => Transport == "zbrt"\n        \? _zbrt\.Value\n        : throw new InvalidOperationException\("zbrt transport not active"\);\n',
+new, n = re.subn(r'\n    private ZbrtPool Zbrt => Transport == "zbrt"\n        \? _zbrt\.Value\n        : throw new InvalidOperationException\("zbrt transport not active"\);\n',
                  "\n", t)
 if n != 1:
     raise SystemExit(f"Sandbox.cs: Zbrt property match n={n}")

@@ -16,7 +16,7 @@ internal sealed record ZbrtExecOutcome(int ExitCode, byte[] Stdout, byte[] Stder
 internal sealed class ZbrtTcpClient : IDisposable
 {
     /// <summary>Client name sent in the mandatory connection Hello.</summary>
-    private const string HelloClientName = "rfb-sdk-csharp";
+    internal const string HelloClientName = "rfb-sdk-csharp";
 
     /// <summary>ZBRT v1 capabilities declared by this SDK (PROTOCOL.md §3.4).</summary>
     internal static readonly string[] V1Capabilities =
@@ -34,16 +34,13 @@ internal sealed class ZbrtTcpClient : IDisposable
     private readonly byte[] _header = new byte[ZbrtFrameCodec.HeaderLen];
     private TcpClient? _tcp;
     private readonly string? _udsSocketPath;
-    /// <summary>UDS 形态（"uds:<path>[@<port>]"）的宿主侧 socket。</summary>
+    /// <summary>UDS 形态（uds:路径[@端口]）的宿主侧 socket。</summary>
     private Socket? _udsSocket;
     /// <summary>UDS 直拨时的 guest vsock 端口（CONNECT 前导用）。</summary>
     private int _udsGuestPort;
     private NetworkStream? _stream;
     private readonly string _address;
 
-    /// <summary>Serializes health/fs on the shared control connection
-    /// (rust zbrt.rs parity: one active request per connection).</summary>
-    private readonly SemaphoreSlim _controlLock = new(1, 1);
 
     public ZbrtTcpClient(string address, TimeSpan timeout)
     {
@@ -207,19 +204,7 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Execute: 0..n Output frames then exactly one terminal Exit (or Error frame).</summary>
     public async Task<ZbrtExecOutcome> ExecuteAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
     {
-        // rust zbrt.rs §3.4: exec keeps one-turn-per-connection — a fresh
-        // (Hello-ed) connection per turn also lets concurrent execs proceed
-        // without corrupting the shared control connection.
-        var turn = new ZbrtTcpClient(_address, _timeout);
-        try
-        {
-            await turn.ConnectAsync().ConfigureAwait(false);
-            return await turn.ExecuteTurnAsync(argv, cwd, stdin, timeoutMs).ConfigureAwait(false);
-        }
-        finally
-        {
-            turn.Dispose();
-        }
+        return await ExecuteTurnAsync(argv, cwd, stdin, timeoutMs).ConfigureAwait(false);
     }
 
     private async Task<ZbrtExecOutcome> ExecuteTurnAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
@@ -285,70 +270,59 @@ internal sealed class ZbrtTcpClient : IDisposable
         }
     }
 
-    /// <summary>Health → HealthAck; returns the guest's healthy flag.
-    /// Serialized: the shared control connection carries one request at a
-    /// time (concurrent callers queue instead of corrupting the framing).</summary>
+    /// <summary>Health → HealthAck; returns the guest's healthy flag. The
+    /// connection is pool-private for the call's duration.</summary>
     public async Task<bool> HealthAsync()
     {
-        await _controlLock.WaitAsync().ConfigureAwait(false);
-        try
+        await ConnectAsync().ConfigureAwait(false);
+        var payload = ZbrtFrameCodec.EncodeHealth(healthy: true, message: null);
+        var request = new ZbrtFrame { Kind = ZbrtKind.Health, RequestId = NewRequestId(), Payload = payload };
+        var reply = await RoundTripAsync(request).ConfigureAwait(false);
+        if (reply.Kind != ZbrtKind.HealthAck)
         {
-            await ConnectAsync().ConfigureAwait(false);
-            var payload = ZbrtFrameCodec.EncodeHealth(healthy: true, message: null);
-            var request = new ZbrtFrame { Kind = ZbrtKind.Health, RequestId = NewRequestId(), Payload = payload };
-            var reply = await RoundTripAsync(request).ConfigureAwait(false);
-            if (reply.Kind != ZbrtKind.HealthAck)
-            {
-                throw UnexpectedKind(reply, ZbrtKind.HealthAck);
-            }
+            throw UnexpectedKind(reply, ZbrtKind.HealthAck);
+        }
 
-            var (healthy, _) = ZbrtFrameCodec.DecodeHealth(reply.Payload);
-            return healthy;
-        }
-        finally
-        {
-            _controlLock.Release();
-        }
+        var (healthy, _) = ZbrtFrameCodec.DecodeHealth(reply.Payload);
+        return healthy;
+    }
+
+    /// <summary>借出验活：重发一次 Hello（幂等），失败 = 连接已死。</summary>
+    internal async Task HelloProbeAsync()
+    {
+        await HelloAsync(HelloClientName, V1Capabilities).ConfigureAwait(false);
     }
 
     /// <summary>Route one filesystem RPC: Fs frame → FsResult JSON (or Error frame).
-    /// Serialized: the shared control connection carries one request at a time.</summary>
+    /// The connection is pool-private for the call's duration.</summary>
     public async Task<JsonElement> FsAsync(byte op, string path, byte[] jsonArgs)
     {
-        await _controlLock.WaitAsync().ConfigureAwait(false);
+        await ConnectAsync().ConfigureAwait(false);
+        var payload = ZbrtFrameCodec.EncodeFs(op, path, jsonArgs);
+        var request = new ZbrtFrame { Kind = ZbrtKind.Fs, RequestId = NewRequestId(), Payload = payload };
+        var reply = await RoundTripAsync(request).ConfigureAwait(false);
+        if (reply.Kind == ZbrtKind.Error)
+        {
+            throw RemoteError(reply);
+        }
+
+        if (reply.Kind != ZbrtKind.FsResult)
+        {
+            throw UnexpectedKind(reply, ZbrtKind.FsResult);
+        }
+
+        if (reply.Payload.Length == 0)
+        {
+            throw new DecodeException("empty fs result");
+        }
+
         try
         {
-            await ConnectAsync().ConfigureAwait(false);
-            var payload = ZbrtFrameCodec.EncodeFs(op, path, jsonArgs);
-            var request = new ZbrtFrame { Kind = ZbrtKind.Fs, RequestId = NewRequestId(), Payload = payload };
-            var reply = await RoundTripAsync(request).ConfigureAwait(false);
-            if (reply.Kind == ZbrtKind.Error)
-            {
-                throw RemoteError(reply);
-            }
-
-            if (reply.Kind != ZbrtKind.FsResult)
-            {
-                throw UnexpectedKind(reply, ZbrtKind.FsResult);
-            }
-
-            if (reply.Payload.Length == 0)
-            {
-                throw new DecodeException("empty fs result");
-            }
-
-            try
-            {
-                return JsonDocument.Parse(reply.Payload).RootElement.Clone();
-            }
-            catch (JsonException e)
-            {
-                throw new DecodeException($"invalid fs result JSON: {e.Message}");
-            }
+            return JsonDocument.Parse(reply.Payload).RootElement.Clone();
         }
-        finally
+        catch (JsonException e)
         {
-            _controlLock.Release();
+            throw new DecodeException($"invalid fs result JSON: {e.Message}");
         }
     }
 
@@ -520,6 +494,124 @@ internal sealed class ZbrtTcpClient : IDisposable
     {
         _stream?.Dispose();
         _tcp?.Dispose();
+        _udsSocket?.Dispose();
+    }
+}
+
+/// <summary>统一温连接池（rust zbrt.rs / rfb-ben 的容量形态）：每条连接同一
+/// 时刻承载一个操作、可顺序复用；空闲 >1s 的连接在借出时重发 Hello 验活；
+/// 并发 = 池中多条连接各服务一个操作（池深 8）。写失败/连接类读失败（请求
+/// 未送达）换新连接重试一次；读超时与解码/guest 错误绝不重试。</summary>
+internal sealed class ZbrtPool
+{
+    private readonly string _address;
+    private readonly TimeSpan _timeout;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<
+        (ZbrtTcpClient Client, long LastUsed)> _pool = new();
+
+    internal ZbrtPool(string address, TimeSpan timeout)
+    {
+        _address = address;
+        _timeout = timeout;
+    }
+
+    private async Task<ZbrtTcpClient> BorrowAsync()
+    {
+        while (_pool.TryDequeue(out var entry))
+        {
+            var (client, lastUsed) = entry;
+            // 热路径（背靠背操作）零额外 RTT：只对空闲 >1s 的连接验活。
+            if (System.Diagnostics.Stopwatch.GetTimestamp() - lastUsed
+                < System.Diagnostics.Stopwatch.Frequency)
+            {
+                return client;
+            }
+            try
+            {
+                await client.HelloProbeAsync().ConfigureAwait(false);
+                return client;
+            }
+            catch (TransportException)
+            {
+                client.Dispose();
+            }
+        }
+
+        var fresh = new ZbrtTcpClient(_address, _timeout);
+        await fresh.ConnectAsync().ConfigureAwait(false);
+        return fresh;
+    }
+
+    private void Repay(ZbrtTcpClient client)
+    {
+        if (_pool.Count < 8)
+        {
+            _pool.Enqueue((client, System.Diagnostics.Stopwatch.GetTimestamp()));
+        }
+        else
+        {
+            client.Dispose();
+        }
+    }
+
+    /// <summary>Run one request/response exchange over a borrowed connection.</summary>
+    internal async Task<T> Run<T>(Func<ZbrtTcpClient, Task<T>> op)
+    {
+        var client = await BorrowAsync().ConfigureAwait(false);
+        try
+        {
+            var result = await op(client).ConfigureAwait(false);
+            Repay(client);
+            return result;
+        }
+        catch (TransportException e)
+        {
+            client.Dispose();
+            // 写失败 / 连接类读失败 = 请求未送达：换新连接重试一次；
+            // 读超时（"guest response timeout"）与解码/guest 错误绝不重试。
+            var retryable = e.Message.StartsWith("guest write failed", StringComparison.Ordinal)
+                || e.Message.StartsWith("guest read failed", StringComparison.Ordinal)
+                || e.Message == "guest closed connection";
+            if (!retryable)
+            {
+                throw;
+            }
+
+            var fresh = new ZbrtTcpClient(_address, _timeout);
+            try
+            {
+                await fresh.ConnectAsync().ConfigureAwait(false);
+                var result = await op(fresh).ConfigureAwait(false);
+                Repay(fresh);
+                return result;
+            }
+            catch
+            {
+                fresh.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Stream 会话独占借出（不归还——一连接一 turn，会话结束关闭）。</summary>
+    internal async Task<ZbrtStreamSession> BorrowStreamAsync(
+        IReadOnlyList<string> argv, string? cwd)
+    {
+        var client = await BorrowAsync().ConfigureAwait(false);
+        try
+        {
+            return await client.StreamAsync(argv, cwd).ConfigureAwait(false);
+        }
+        catch
+        {
+            client.Dispose();
+            throw;
+        }
     }
 }
 
@@ -703,5 +795,5 @@ internal sealed class ZbrtStreamSession : IDisposable
     /// client's single turn, so after disposal the socket state is unknown;
     /// closing it makes the next operation reconnect cleanly.
     /// </summary>
-    public void Dispose() => _client.ResetConnection();
+    public void Dispose() => _client.Dispose();
 }
