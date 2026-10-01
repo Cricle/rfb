@@ -50,8 +50,8 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 | `connect(sandbox_or_id, transport=None)` | 传 `Sandbox` 原样附加（仅显式 transport 才覆盖）；传 id 则先 `list_sandboxes` 解析，未命中 → Remote（“sandbox not found”） |
 | `ping_sandbox(id)` / `delete_sandbox(id)` | controller 原样 ping 值 / **2xx 与 404 都算删除成功** |
 
-**统一温连接池（五语言一致，rfb-ben 的容量形态）**：ZBRT 下所有操作
-（ping/fs/exec）都从每个 Sandbox 的温连接池借还——已 Hello 的空闲连接，
+**统一温连接池（五语言一致，rfb-ben 的容量形态）**：ZBRT 与 NDJSON 下
+所有 guest 操作（ping/fs/exec）都从每个 Sandbox 的温连接池借还——已 Hello 的空闲连接，
 借出时空闲超 1s 才重发 Hello 验活（guest 不关空闲连接，热路径零额外
 RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn；并发 = 池中
 多条连接各服务一个操作（池深 8）。复用连接上"请求未送达"的失败（写失败/
@@ -62,11 +62,21 @@ RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn�
 都强制 uds_path，宿主内核没有 guest CID 的路由；`/dev/vhost-vsock` 是其它
 VMM 的机制。uds:/ 与 TCP 中继是仅有的两条宿主路径。）
 
+**NDJSON 池语义**（无握手可验活）：借出时空闲 >1s 的连接直接丢弃重拨
+（不重发任何探测）；复用连接上写失败 = 请求未送达 = 换新连接重试一次；
+读超时/解码/guest 错误绝不重试。**内存基准（同一 forkd 沙箱，ping+ls
+×N，VmRSS）**：rust 3.2MB 恒定；python 22.7MB 恒定；java GC 后 120MB
+低于基线（无泄漏）；c# 池化后 4000 ops +15.9MB 平台（修复前逐请求新连
++21MB）；node 修复监听器泄漏前 2000 ops 留驻 1.3GB（GC 不回落）——修复
+后 2000→8000 ops 均稳定 +16MB。教训：node 的事件套接字复用必须
+`removeAllListeners()` 再挂新监听，否则每次借出都累积旧闭包。
+
 **UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
 Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
 8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s（idle 阈值优化后 11479 ops/s）；
 **c# 亦原生支持**（`UnixDomainSocketEndPoint`，net8.0 target——netstandard2.1
-抛明确错误；实测 2147 ops/s）；python/node 同形态 2.2k/3.9k，受语言运行时
+抛明确错误；实测 2147 ops/s；NDJSON TCP 池化后 8579 ops/s）；python/node 同形态
+2.2k/3.9k，受语言运行时
 GIL/事件循环限制。java：JEP 380（Java 16+）原生有 UDS，但 SDK 基线是
 release 8（需反射）且 AF_UNIX 的 SocketChannel **无 SO_TIMEOUT 等价物**
 （挂死风险要自造看门狗）——验证过反射路径可行（relay OK），维持 TCP 中继
