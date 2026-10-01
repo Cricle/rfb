@@ -33,10 +33,16 @@ internal sealed class ZbrtTcpClient : IDisposable
     private readonly byte[] _header = new byte[ZbrtFrameCodec.HeaderLen];
     private TcpClient? _tcp;
     private NetworkStream? _stream;
+    private readonly string _address;
+
+    /// <summary>Serializes health/fs on the shared control connection
+    /// (rust zbrt.rs parity: one active request per connection).</summary>
+    private readonly SemaphoreSlim _controlLock = new(1, 1);
 
     public ZbrtTcpClient(string address, TimeSpan timeout)
     {
         (_host, _port) = WireJson.ParseGuestAddress(address);
+        _address = address;
         _timeout = timeout;
     }
 
@@ -130,7 +136,23 @@ internal sealed class ZbrtTcpClient : IDisposable
     /// <summary>Execute: 0..n Output frames then exactly one terminal Exit (or Error frame).</summary>
     public async Task<ZbrtExecOutcome> ExecuteAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
     {
-        await ConnectAsync().ConfigureAwait(false);
+        // rust zbrt.rs §3.4: exec keeps one-turn-per-connection — a fresh
+        // (Hello-ed) connection per turn also lets concurrent execs proceed
+        // without corrupting the shared control connection.
+        var turn = new ZbrtTcpClient(_address, _timeout);
+        try
+        {
+            await turn.ConnectAsync().ConfigureAwait(false);
+            return await turn.ExecuteTurnAsync(argv, cwd, stdin, timeoutMs).ConfigureAwait(false);
+        }
+        finally
+        {
+            turn.Dispose();
+        }
+    }
+
+    private async Task<ZbrtExecOutcome> ExecuteTurnAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
+    {
         var payload = ZbrtFrameCodec.EncodeExecute(argv, cwd, stdin, timeoutMs);
         var request = new ZbrtFrame { Kind = ZbrtKind.Execute, RequestId = NewRequestId(), Payload = payload };
         try
@@ -192,51 +214,70 @@ internal sealed class ZbrtTcpClient : IDisposable
         }
     }
 
-    /// <summary>Health → HealthAck; returns the guest's healthy flag.</summary>
+    /// <summary>Health → HealthAck; returns the guest's healthy flag.
+    /// Serialized: the shared control connection carries one request at a
+    /// time (concurrent callers queue instead of corrupting the framing).</summary>
     public async Task<bool> HealthAsync()
     {
-        await ConnectAsync().ConfigureAwait(false);
-        var payload = ZbrtFrameCodec.EncodeHealth(healthy: true, message: null);
-        var request = new ZbrtFrame { Kind = ZbrtKind.Health, RequestId = NewRequestId(), Payload = payload };
-        var reply = await RoundTripAsync(request).ConfigureAwait(false);
-        if (reply.Kind != ZbrtKind.HealthAck)
-        {
-            throw UnexpectedKind(reply, ZbrtKind.HealthAck);
-        }
-
-        var (healthy, _) = ZbrtFrameCodec.DecodeHealth(reply.Payload);
-        return healthy;
-    }
-
-    /// <summary>Route one filesystem RPC: Fs frame → FsResult JSON (or Error frame).</summary>
-    public async Task<JsonElement> FsAsync(byte op, string path, byte[] jsonArgs)
-    {
-        await ConnectAsync().ConfigureAwait(false);
-        var payload = ZbrtFrameCodec.EncodeFs(op, path, jsonArgs);
-        var request = new ZbrtFrame { Kind = ZbrtKind.Fs, RequestId = NewRequestId(), Payload = payload };
-        var reply = await RoundTripAsync(request).ConfigureAwait(false);
-        if (reply.Kind == ZbrtKind.Error)
-        {
-            throw RemoteError(reply);
-        }
-
-        if (reply.Kind != ZbrtKind.FsResult)
-        {
-            throw UnexpectedKind(reply, ZbrtKind.FsResult);
-        }
-
-        if (reply.Payload.Length == 0)
-        {
-            throw new DecodeException("empty fs result");
-        }
-
+        await _controlLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            return JsonDocument.Parse(reply.Payload).RootElement.Clone();
+            await ConnectAsync().ConfigureAwait(false);
+            var payload = ZbrtFrameCodec.EncodeHealth(healthy: true, message: null);
+            var request = new ZbrtFrame { Kind = ZbrtKind.Health, RequestId = NewRequestId(), Payload = payload };
+            var reply = await RoundTripAsync(request).ConfigureAwait(false);
+            if (reply.Kind != ZbrtKind.HealthAck)
+            {
+                throw UnexpectedKind(reply, ZbrtKind.HealthAck);
+            }
+
+            var (healthy, _) = ZbrtFrameCodec.DecodeHealth(reply.Payload);
+            return healthy;
         }
-        catch (JsonException e)
+        finally
         {
-            throw new DecodeException($"invalid fs result JSON: {e.Message}");
+            _controlLock.Release();
+        }
+    }
+
+    /// <summary>Route one filesystem RPC: Fs frame → FsResult JSON (or Error frame).
+    /// Serialized: the shared control connection carries one request at a time.</summary>
+    public async Task<JsonElement> FsAsync(byte op, string path, byte[] jsonArgs)
+    {
+        await _controlLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await ConnectAsync().ConfigureAwait(false);
+            var payload = ZbrtFrameCodec.EncodeFs(op, path, jsonArgs);
+            var request = new ZbrtFrame { Kind = ZbrtKind.Fs, RequestId = NewRequestId(), Payload = payload };
+            var reply = await RoundTripAsync(request).ConfigureAwait(false);
+            if (reply.Kind == ZbrtKind.Error)
+            {
+                throw RemoteError(reply);
+            }
+
+            if (reply.Kind != ZbrtKind.FsResult)
+            {
+                throw UnexpectedKind(reply, ZbrtKind.FsResult);
+            }
+
+            if (reply.Payload.Length == 0)
+            {
+                throw new DecodeException("empty fs result");
+            }
+
+            try
+            {
+                return JsonDocument.Parse(reply.Payload).RootElement.Clone();
+            }
+            catch (JsonException e)
+            {
+                throw new DecodeException($"invalid fs result JSON: {e.Message}");
+            }
+        }
+        finally
+        {
+            _controlLock.Release();
         }
     }
 

@@ -55,7 +55,8 @@ RPC（ping/ls/find/grep/read/write）复用一条已 Hello 的控制连接——
 连接的握手是毫秒级成本，复用使这些操作亚毫秒化；exec/stream 保持每 turn
 一条新连接（§3.4）。复用连接上"请求未送达"的失败（写失败/对端断开/EOF
 截断）换新连接重试一次；读超时（请求可能已在 guest 执行）与解码/guest
-错误绝不重试。C# 当前 exec 也复用连接（实测可行，记入 §11 分歧）。
+错误绝不重试。exec/stream 五语言统一为每 turn 一条新连接（并发 exec
+因此互不干扰）。
 
 **清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
 RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java
