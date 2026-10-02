@@ -340,9 +340,9 @@ class TcpVsockRelay:
                     if not line.startswith(b"OK "):
                         return  # relay rejected (guest not listening, ...)
                     # 握手的 10s 预算不能留在数据泵上：长静默 exec（如
-                    # sleep 20）的 ZBRT 连接会在第 10s 被这个超时杀掉
-                    #（实测：客户端看到 "zbrt connection closed before
-                    # reply"）。泵走阻塞语义，寿命由两端的断连驱动。
+                    # sleep 20）的连接会在第 10s 被这个超时杀掉（实测：
+                    # 客户端看到 "connection closed before reply"）。泵走
+                    # 阻塞语义，寿命由两端的断连驱动。
                     uds.settimeout(None)
                 except OSError:
                     return
