@@ -98,6 +98,10 @@ fn agent_token_from_env() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// 并发连接上限：无 token 模式下 guest 内任何进程都能零成本建立海量空闲
+/// 连接；VM 内风险本就低，这里只是给失控调用方一个确定的刹车。
+const MAX_CONNECTIONS: usize = 64;
+
 /// Run the forkd NDJSON guest agent with an explicit token gate (`None` keeps
 /// the historical open-access behavior). Host-side contract tests use this to
 /// exercise both modes without mutating process-wide state.
@@ -108,10 +112,19 @@ fn agent_token_from_env() -> Option<String> {
 pub async fn run_with_token(addr: &str, token: Option<&str>) -> io::Result<()> {
     std::fs::create_dir_all(transport::workspace_root())?;
     let listener = TcpListener::bind(addr).await?;
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, _) = listener.accept().await?;
+        // accept 循环持有 permit 直到任务被调度：满载时新连接在 accept 处
+        // 排队（内核 backlog 兜底），而不是无界 spawn。
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let expected = token.map(str::to_owned);
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = Box::pin(handle_connection(stream, expected)).await;
         });
     }

@@ -201,6 +201,11 @@ pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
     vsock_uds_path: Option<String>,
+    /// 裸恢复共享 baked 的 vsock UDS 名：这个名字属于"最后绑定者"（每次
+    /// 裸恢复 unlink→bind 换名）。任何一个裸恢复 VM Drop 时都删这个名字，
+    /// 会把活着的新 VM 的名字删掉（已建立的连接靠 inode 存活，新会话
+    /// ENOENT）——共享名的清理归快照目录删除/scavenger。
+    vsock_uds_shared: bool,
 }
 
 /// Firecracker vsock device configuration: the guest-visible CID and the
@@ -605,6 +610,7 @@ impl FirecrackerVm {
             &snapshot_load_body(vmstate_path, mem_file_path),
         )?;
         vm.set_vsock_uds_path(baked);
+        vm.vsock_uds_shared = true;
         Ok(vm)
     }
 
@@ -693,6 +699,7 @@ impl FirecrackerVm {
             process: process.take()?,
             socket_path,
             vsock_uds_path: None,
+            vsock_uds_shared: false,
         })
     }
 }
@@ -769,7 +776,10 @@ impl Drop for FirecrackerVm {
         self.kill();
         let _ = std::fs::remove_file(&self.socket_path);
         if let Some(path) = &self.vsock_uds_path {
-            let _ = std::fs::remove_file(path);
+            // 裸恢复共享的名字不删——见 vsock_uds_shared。
+            if !self.vsock_uds_shared {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }

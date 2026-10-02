@@ -175,7 +175,9 @@ export class ZbrtStreamSession {
     // buffered for the caller (PROTOCOL.md §3.4) and a first-arriving Exit
     // marks the turn terminal and is cached — dropping it would leave the
     // next nextEvent() waiting on a frame that already arrived.
-    const ack = await this.#host.cancelRoundTrip(null, this.requestId, (frame) => {
+    // reason="stop"：与 rust/python/java/c# 的 stop 同形（跨语言 cancel
+    // wire 一致——golden vector 才能同时命中四语言字节）。
+    const ack = await this.#host.cancelRoundTrip('stop', this.requestId, (frame) => {
       if (frame.kind === KIND_OUTPUT) {
         const output = codec.decodeOutput(frame.payload);
         this.#pending.push(this.#takeOutput(output.stream, output.data));

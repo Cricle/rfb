@@ -463,7 +463,27 @@ impl ZeroBootSession {
         let result = loop {
             let frame = match await_frame(&mut rx, deadline).await {
                 Ok(frame) => frame,
-                Err(error) => break Err(error),
+                Err(error) => {
+                    // 宿主超时（请求仍登记在 inflight/active_turn）：定向
+                    // cancel + 有界排到终帧，再让 guard 归还槽位。否则
+                    // guest 侧的 turn 还在跑——下一个无辜命令吃
+                    // "turn already active"，且 cancel 永远打不中它。guest
+                    // 已死时连接关闭，drain 自然结束（有界）。
+                    if matches!(error, SessionError::Timeout) {
+                        let _ = self
+                            .send_cancel_target(request_id, Some("exec host timeout".into()))
+                            .await;
+                        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while let Ok(frame) = await_frame(&mut rx, drain_deadline).await {
+                            if frame.request_id == request_id
+                                && matches!(frame.kind, Kind::Exit | Kind::Error)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    break Err(error);
+                }
             };
             if frame.request_id != request_id {
                 break Err(SessionError::Protocol("request_id mismatch".into()));
@@ -1930,7 +1950,7 @@ async fn open_extra_sessions(uds: &str, port: u32) -> Result<Vec<Arc<ZeroBootSes
 const SNAPSHOT_IDENTITY_VERSION: u32 = 2;
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-fn file_sha256(path: &Path) -> String {
+fn file_sha256(path: &Path) -> std::result::Result<String, std::io::Error> {
     use sha2::{Digest, Sha256};
     // Process-level (len, mtime) cache: hot creates re-fingerprint the same
     // 3 assets (kernel/rootfs/firecracker) on every boot_and_open /
@@ -1950,20 +1970,21 @@ fn file_sha256(path: &Path) -> String {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((cached_len, cached_mtime, hash)) = cache.get(key_path) {
             if *cached_len == *len && *cached_mtime == *mtime {
-                return hash.clone();
+                return Ok(hash.clone());
             }
         }
     }
     let mut hasher = Sha256::new();
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return "unreadable".to_owned(),
-    };
+    // 不可读/读中断 = Err（fail closed）——"unreadable" 曾作为稳定指纹参与
+    // 身份比较：rootfs 变为不可读时会误判"与旧快照匹配"，静默放行一个
+    // 本应失效的配置；读中断会把部分内容哈希当全量指纹。
+    let mut file = std::fs::File::open(path)?;
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         match std::io::Read::read(&mut file, &mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => hasher.update(&chunk[..n]),
+            Err(e) => return Err(e),
         }
     }
     let hash: String = hasher
@@ -1977,7 +1998,7 @@ fn file_sha256(path: &Path) -> String {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key_path, (len, mtime, hash.clone()));
     }
-    hash
+    Ok(hash)
 }
 
 /// Nanosecond modification time of `meta`, 0 when the platform cannot report
@@ -1992,21 +2013,21 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> u128 {
 }
 
 #[cfg(all(feature = "zeroboot", target_os = "linux"))]
-fn snapshot_identity(config: &Config) -> String {
+fn snapshot_identity(config: &Config) -> std::result::Result<String, std::io::Error> {
     let hash = |path: &Option<PathBuf>| match path {
         Some(p) if p.is_file() => file_sha256(p),
-        _ => "missing".to_owned(),
+        _ => Ok("missing".to_owned()),
     };
     let identity = serde_json::json!({
         "version": SNAPSHOT_IDENTITY_VERSION,
-        "kernel_sha256": hash(&config.kernel),
-        "rootfs_sha256": hash(&config.rootfs),
-        "firecracker_sha256": hash(&config.firecracker),
+        "kernel_sha256": hash(&config.kernel)?,
+        "rootfs_sha256": hash(&config.rootfs)?,
+        "firecracker_sha256": hash(&config.firecracker)?,
         "guest_port": config.guest_port,
         "mem_mib": vm_mem_mib(),
         "vcpus": vm_vcpu(),
     });
-    identity.to_string()
+    Ok(identity.to_string())
 }
 
 /// Serialize the provider's VM configuration for every boot/restore path. All
@@ -2411,8 +2432,10 @@ async fn ensure_parent_snapshot(
         // files, so it doubles as the completeness marker for an interrupted
         // prepare. The caller holds the dir lock, so the check+delete is
         // race-free.
+        let identity = snapshot_identity(config)
+            .map_err(|e| Error::Backend(format!("snapshot identity: {e}")))?;
         let matches = std::fs::read_to_string(&identity_path)
-            .map(|stored| stored == snapshot_identity(config))
+            .map(|stored| stored == identity)
             .unwrap_or(false);
         if matches {
             return Ok((vmstate, mem));
@@ -2474,8 +2497,11 @@ async fn ensure_parent_snapshot(
     // after both snapshot files). Harden BEFORE checking the write result: a
     // failed prepare must not leave a readable half-snapshot behind either —
     // the chmod is fail-closed, the write error is reported only after it.
-    let identity_result = std::fs::write(&identity_path, snapshot_identity(config))
-        .map_err(|e| Error::Backend(e.to_string()));
+    let identity_result = std::fs::write(
+        &identity_path,
+        snapshot_identity(config).map_err(|e| Error::Backend(e.to_string()))?,
+    )
+    .map_err(|e| Error::Backend(e.to_string()));
     harden_snapshot_permissions(&parent)?;
     identity_result?;
     Ok((vmstate, mem))
@@ -2926,13 +2952,17 @@ impl ZeroBootSandbox {
         // checkpoint dir must not leak: pool (the VM) drops with `pool`,
         // the dir with `checkpoint_guard`.
         let checkpoint_result = vm.create_snapshot(&vmstate_str, &mem_str).and_then(|()| {
-            std::fs::write(checkpoint.join("identity.json"), snapshot_identity(&config)).map_err(
-                |e| {
+            std::fs::write(
+                checkpoint.join("identity.json"),
+                snapshot_identity(&config).map_err(|e| {
                     crate::firecracker::FirecrackerError::Protocol(format!(
-                        "write fork identity: {e}"
+                        "snapshot identity: {e}"
                     ))
-                },
+                })?,
             )
+            .map_err(|e| {
+                crate::firecracker::FirecrackerError::Protocol(format!("write fork identity: {e}"))
+            })
         });
         if let Err(error) = checkpoint_result {
             let _ = std::fs::remove_dir_all(&fork_dir);

@@ -316,6 +316,8 @@ pub fn verify_installed_file(
     source: &Path,
     destination: &str,
 ) -> Result<(), CliError> {
+    // 先开源文件再 spawn：open 失败的早退路径上子进程无人收尸。
+    let mut expected = fs::File::open(source).map_err(|error| io(error.to_string()))?;
     let mut child = Command::new("debugfs")
         .args(["-R", &format!("cat {}", debugfs_quote(destination))])
         .arg(image)
@@ -332,7 +334,6 @@ pub fn verify_installed_file(
         let _ = std::io::Read::read_to_end(&mut { stderr_handle }, &mut buffer);
         buffer
     });
-    let mut expected = fs::File::open(source).map_err(|error| io(error.to_string()))?;
     const CHUNK: usize = 64 * 1024;
     let mut expected_buf = vec![0u8; CHUNK];
     let mut actual_buf = vec![0u8; CHUNK];

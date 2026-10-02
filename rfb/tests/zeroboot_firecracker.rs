@@ -26,6 +26,7 @@ mod firecracker {
                 process: child,
                 socket_path: path.to_owned(),
                 vsock_uds_path: None,
+                vsock_uds_shared: false,
             }
         }
 

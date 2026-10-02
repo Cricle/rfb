@@ -487,7 +487,11 @@ pub fn snapshot_create(args: &ForkdSnapshotCreateArgs) -> Result<SnapshotOutput,
     argv.push("--daemon-url".into());
     argv.push(url.clone());
 
-    run_forkd_checked(&bin, &argv, "snapshot")?;
+    run_forkd_checked(&bin, &argv, "snapshot").inspect_err(|_| {
+        // 委托失败时清掉私有拷贝：残留在快照目录里会误导 provenance
+        // 量测，且对"重试一次成功"的语义是垃圾文件。
+        let _ = std::fs::remove_file(&rootfs_copy);
+    })?;
 
     let mut value = json!({
         "ok": true,
