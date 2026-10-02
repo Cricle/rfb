@@ -437,7 +437,7 @@ class _ZbrtGuestClient:
     Concurrent ops each hold their own connection (one active request per
     connection, UNIFIED_API §3.4)."""
 
-    POOL_CAP = 8
+    POOL_CAP = 16
 
     def __init__(self, address: str, timeout_s: float = 10.0):
         self._address = _parse_address(address)

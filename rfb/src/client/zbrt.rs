@@ -549,7 +549,7 @@ impl ZbrtGuest {
 
     async fn repay_exec(&self, stream: GuestConn) {
         let mut pool = self.exec_pool.lock().await;
-        if pool.len() < 8 {
+        if pool.len() < 16 {
             pool.push((stream, std::time::Instant::now()));
         }
         // else: dropped = closed

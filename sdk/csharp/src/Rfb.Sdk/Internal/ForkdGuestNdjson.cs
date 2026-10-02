@@ -221,7 +221,7 @@ internal sealed class ForkdGuestNdjson
 
     private void Repay(TcpClient tcp, NetworkStream stream)
     {
-        if (_pool.Count < 8)
+        if (_pool.Count < 16)
         {
             _pool.Enqueue((tcp, stream, System.Diagnostics.Stopwatch.GetTimestamp()));
         }

@@ -590,7 +590,7 @@ internal sealed class ZbrtPool
 
     private void Repay(ZbrtTcpClient client)
     {
-        if (_pool.Count < 8)
+        if (_pool.Count < 16)
         {
             _pool.Enqueue((client, System.Diagnostics.Stopwatch.GetTimestamp()));
         }

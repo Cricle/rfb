@@ -54,7 +54,7 @@ guest 连接每请求新建。环境变量总表见 §10。guest 侧可选的 ag
 所有 guest 操作（ping/fs/exec）都从每个 Sandbox 的温连接池借还——已 Hello 的空闲连接，
 借出时空闲超 1s 才重发 Hello 验活（guest 不关空闲连接，热路径零额外
 RTT）；一条连接可顺序跑多个 turn，同时只承载一个活跃 turn；并发 = 池中
-多条连接各服务一个操作（池深 8）。复用连接上"请求未送达"的失败（写失败/
+多条连接各服务一个操作（池深 16）。复用连接上"请求未送达"的失败（写失败/
 对端断开/EOF 截断）换新连接重试一次；读超时（请求可能已在 guest 执行）
 与解码/guest 错误绝不重试。stream 交互会话保持独占连接。
 （AF_VSOCK 直连不可用：Firecracker 的 vsock 设备**只以 UDS relay 实现**——
@@ -72,6 +72,9 @@ VMM 的机制。uds:/ 与 TCP 中继是仅有的两条宿主路径。）
 后 2000→8000 ops 均稳定 +16MB。教训：node 的事件套接字复用必须
 `removeAllListeners()` 再挂新监听，否则每次借出都累积旧闭包。
 
+**池深 = 16（连接数扩展曲线实测）**：8 连接 16k ops/s → 16 连接
+26k（+65%，= 裸帧地板 27269 的 96%）→ 32 平台（25.7k）→ 64 过度订阅
+回落（8k）；16 = 拐点。并发度由调用方驱动（每线程借一条连接）。
 **UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
 Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
 8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s（idle 阈值优化后 11479 ops/s）；
@@ -82,6 +85,19 @@ GIL/事件循环限制。java：JEP 380（Java 16+）原生有 UDS，但 SDK 基
 release 8（需反射）且 AF_UNIX 的 SocketChannel **无 SO_TIMEOUT 等价物**
 （挂死风险要自造看门狗）——验证过反射路径可行（relay OK），维持 TCP 中继
 （0.6ms/RTT，8 并发 ~0.8-1.0k ops/s），除非未来把基线提到 16。
+
+**guest→host（vsock 反向方向）**：guest 里连 vsock `(CID 2, port)`
+——Firecracker 转发到宿主 `<uds>_<port>` 的 AF_UNIX 监听，**裸字节流**
+（无 CONNECT 前导——那是 host→guest 方向的协议）。两件套：
+- **guest 侧**：镜像烤入的 `/bin/vsockdial <port> [cid] [linger_ms]`
+  applet（双向泵，stdin↔vsock↔stdout）。**FC 不支持半关闭**（写端
+  shutdown = 整条转发连接终结），所以 stdin EOF 后泵安静退出、由
+  `linger_ms`（缺省 1000）收尾：socket 空闲该毫秒数即优雅退出；
+  `0` = 严格等 EOF（服务端会关连接的用法）。消息边界由载荷自带。
+- **宿主侧**：python `ZerobootHost.expose(guest_port, target)` 把
+  `<uds>_<guest_port>` 桥到宿主 TCP 目标（`unexpose`/`down()` 收掉）。
+  逐端口显式暴露：guest 只能到达运营者点名的东西（no-egress 合同不破
+  坏——通道只到宿主本机的 target，不通外网）。
 
 **attach 句柄的 delete 语义**：rust/java/c# 的直连 `attach()`（已知
 guest 地址、无控制器参与，VM 生命周期归桥的 runner 所有）返回的句柄是

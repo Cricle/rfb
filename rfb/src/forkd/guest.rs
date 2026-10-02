@@ -143,7 +143,7 @@ impl ForkdGuestClient {
                             .await;
                         if result.is_ok() && reader.buffer().is_empty() {
                             let mut pool = self.pool.lock().await;
-                            if pool.len() < 8 {
+                            if pool.len() < 16 {
                                 pool.push((reader, write, std::time::Instant::now()));
                             } // else: dropped = closed（缓冲有残余 = 不可复用）
                         }
@@ -171,7 +171,7 @@ impl ForkdGuestClient {
             .await?;
         if reader.buffer().is_empty() {
             let mut pool = self.pool.lock().await;
-            if pool.len() < 8 {
+            if pool.len() < 16 {
                 pool.push((reader, write, std::time::Instant::now()));
             }
         }

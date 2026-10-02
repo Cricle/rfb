@@ -217,7 +217,7 @@ class _GuestNdjsonClient:
             raise
 
     def _repay(self, sock, rfile) -> None:
-        if len(self._pool) < 8:
+        if len(self._pool) < 16:
             self._pool.append((sock, rfile, time.monotonic()))
         else:
             sock.close()

@@ -801,7 +801,7 @@ public final class Sandbox implements AutoCloseable {
     }
 
     private void repayExecConn(ZbrtConnection conn) {
-        if (zbrtExecPool.size() < 8) {
+        if (zbrtExecPool.size() < 16) {
             zbrtExecPool.offer(new java.util.AbstractMap.SimpleEntry<>(
                     conn, System.nanoTime()));
         } else {
