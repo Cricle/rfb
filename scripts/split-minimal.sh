@@ -502,6 +502,14 @@ must_replace(facade, '''        # uds: 是 FC vsock relay 的 ZBRT 直拨形态�
 ''', "")
 assert "zbrt" not in Path(facade).read_text(encoding="utf-8").lower(), "facade.py zbrt leftover"
 
+# test_host.py 的 ExposeTest 引用 ZerobootHost/_pump_to_tcp（bundle 删类、
+# _pump_to_tcp 的 on_open 参数由保留段承接）——整类删（它是文件最后一个类）。
+_th = Path("sdk/python/tests/test_host.py")
+_ct = _th.read_text(encoding="utf-8")
+_ct = _ct.replace("    ZerobootHost,\n", "").replace("    _pump_to_tcp,\n", "")
+_cut = _ct.index("class ExposeTest")
+_th.write_text(_ct[:_cut].rstrip("\n") + "\n", encoding="utf-8", newline="")
+
 init_py = f"{S}/rfb_sdk/__init__.py"
 p = Path(init_py)
 t = p.read_text(encoding="utf-8")
