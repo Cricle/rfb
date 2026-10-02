@@ -1338,22 +1338,21 @@ fn workspace_executor_write_honors_append_and_fails_closed_on_mode() {
         "append must preserve the previous content (P1-1)"
     );
 
-    // mode is not implemented here: fail closed, file untouched.
-    let responses = write(
+    // mode 现在落地（chmod 语义）：420 = 0o644。
+    write(
         &mut service,
         "w3",
         serde_json::json!({"path": "log.txt", "data": b"x".to_vec(), "mode": 420}),
     );
-    assert!(
-        matches!(responses.as_slice(), [RuntimeMessage::Error { message, .. }]
-            if message.contains("mode is not supported over this transport")),
-        "got {responses:?}"
-    );
-    assert_eq!(
-        fs::read(root.join("log.txt")).unwrap(),
-        b"one+two",
-        "the mode rejection must not touch the file"
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.join("log.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "the requested mode must be applied");
+    }
     let _ = fs::remove_dir_all(root);
 }
 

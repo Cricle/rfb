@@ -101,10 +101,19 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(path)?
+                    .open(&path)?
                     .write_all(&bytes)?;
             } else {
-                std::fs::write(path, &bytes)?;
+                std::fs::write(&path, &bytes)?;
+            }
+            // mode（SDK write(mode=) 一直在传）：此前被静默丢弃——上传的
+            // 可执行文件永远 0644，无法 exec。chmod 语义：提供即设置。
+            if let Some(mode) = request.get("mode").and_then(Value::as_u64) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode as u32))?;
+                }
             }
             Ok(json!({"bytes_written":bytes.len()}))
         }

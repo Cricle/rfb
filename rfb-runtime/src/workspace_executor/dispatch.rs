@@ -100,11 +100,9 @@ impl WorkspaceGuestExecutor {
             .and_then(Value::as_str)
             .ok_or("path is required")?;
         // PROTOCOL.md §2.2: the write contract carries `append` and `mode`.
-        // `mode` has no implementation over this transport — fail closed
-        // instead of silently dropping a permission-tightening request.
-        if a.get("mode").is_some_and(|m| !m.is_null()) {
-            return Err("mode is not supported over this transport".into());
-        }
+        // mode 此前在此拒收（fail closed），在 NDJSON 侧被静默丢弃——两头
+        // 都让 write(mode=) 永远不生效。现在实现（chmod 语义；wire 不变，
+        // mode 本来就在 JSON 里）。
         let append = a.get("append").and_then(Value::as_bool).unwrap_or(false);
         if a.get("append")
             .is_some_and(|v| !v.is_null() && v.as_bool().is_none())
@@ -127,10 +125,22 @@ impl WorkspaceGuestExecutor {
         let n = data.len();
         self.filesystem_write(&crate::session::FileWriteRequest {
             request_id: "fs".into(),
-            path: path.into(),
+            path: path.to_owned(),
             content: data,
             append,
         })?;
+        if let Some(mode) = a.get("mode").and_then(Value::as_u64) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let resolved = self
+                    .policy
+                    .workspace_path(path)
+                    .map_err(|e| e.to_string())?;
+                std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(mode as u32))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(json!({"bytes_written": n}))
     }
 

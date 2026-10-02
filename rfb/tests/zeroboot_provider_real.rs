@@ -158,9 +158,10 @@ fn filesystem_roundtrip_and_escape_rejection() {
             .expect("read");
         assert_eq!(read.data, payload);
 
-        // mode fail-closed over the ZBRT transport (workspace executor
-        // contract): rejected, not silently dropped.
-        let mode_error = sandbox
+        // the mode rides the JSON Fs op and is now APPLIED (chmod
+        // semantics; it used to be rejected over ZBRT while NDJSON silently
+        // dropped it — write(mode=) never took effect anywhere).
+        sandbox
             .write(WriteRequest {
                 path: "/workspace/e2e-probe.txt".into(),
                 data: b"x".to_vec(),
@@ -168,11 +169,7 @@ fn filesystem_roundtrip_and_escape_rejection() {
                 mode: Some(0o644),
             })
             .await
-            .expect_err("a mode-carrying write must be rejected over ZBRT");
-        assert!(
-            mode_error.to_string().contains("mode is not supported"),
-            "unexpected rejection: {mode_error}"
-        );
+            .expect("a mode-carrying write must succeed over ZBRT");
 
         // ls sees the file.
         let ls = sandbox
