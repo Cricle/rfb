@@ -5,14 +5,14 @@
 //! `stream`, and the structured, read-only filesystem RPCs (`ls`/`find`/`grep`)
 //! plus `read`/`write`/`eval`/`cancel`.
 //!
-//! Every request type carries a [`validate`](crate::ContractError) method and
+//! Every request type carries a [`validate`] method and
 //! enforces guest-side limits. Paths are always interpreted inside the guest
 //! and are never converted to host paths. The public API never leaks
 //! `serde_json::Value`; all payloads are typed DTOs.
 //!
 //! A backend that does not implement an operation keeps the corresponding
 //! [`Sandbox`](crate::Sandbox) default, which returns
-//! [`SandboxError::UnsupportedCapability`](crate::SandboxError).
+//! [`SandboxError::UnsupportedCapability`].
 
 mod cancel;
 mod eval;
