@@ -79,7 +79,8 @@ class _GuestNdjsonClient:
         self._timeout_s = timeout_s
         # NDJSON 温连接池：agent 的 serve 是循环的（一条连接可顺序承载多个
         # 请求）；每操作新建 TCP 连接的握手/拆除 ≈ 0.4ms/次。连接私有于
-        # 一次操作期间；失败即弃（不重试——exec 的双重执行不可接受）。
+        # 一次操作期间；成功归还、失败即弃（任何失败都不重试——exec 的
+        # 双重执行不可接受，rust guest.rs 参考语义）。
         self._pool = []
 
     def _effective_timeout(self, timeout_s):
@@ -155,16 +156,27 @@ class _GuestNdjsonClient:
     def _request(self, action: dict, timeout_s=None) -> list:
         timeout = self._effective_timeout(timeout_s)
         while self._pool:
-            sock, rfile, _ts = self._pool.pop()
+            sock, rfile, ts = self._pool.pop()
+            if time.monotonic() - ts >= 1.0:
+                # NDJSON 无握手可验活：超龄连接直接丢弃重拨（同 rust
+                # guest.rs 的池语义——热路径背靠背复用，空闲超龄不猜生死）。
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                continue
             try:
                 sock.settimeout(timeout)
-                return self._exchange(sock, rfile, action)
+                result = self._exchange(sock, rfile, action)
             except BaseException:
                 try:
                     sock.close()
                 except OSError:
                     pass
                 raise
+            # 成功路径必须归还，否则池每借一条就少一条（实测退化成隔次重拨）。
+            self._repay(sock, rfile)
+            return result
         try:
             sock = socket.create_connection(self._address, timeout=timeout)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

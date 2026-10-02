@@ -126,29 +126,12 @@ internal sealed class ForkdGuestNdjson
     private async Task<List<JsonElement>> RequestAsync(Dictionary<string, object?> action, TimeSpan? readBudget = null)
     {
         var serialized = JsonSerializer.Serialize(action);
-        var undeliveredRetry = false;
         while (true)
         {
-            var (tcp, stream) = await BorrowAsync(undeliveredRetry).ConfigureAwait(false);
+            var (tcp, stream) = await BorrowAsync().ConfigureAwait(false);
             try
             {
                 await WriteLineAsync(stream, serialized).ConfigureAwait(false);
-            }
-            catch
-            {
-                // 写失败 = 请求未送达：丢弃本连接，换新连接重试一次。
-                tcp.Dispose();
-                if (undeliveredRetry)
-                {
-                    throw;
-                }
-
-                undeliveredRetry = true;
-                continue;
-            }
-
-            try
-            {
                 var responses = await ExchangeAsync(
                     new NdjsonLineReader(stream, readBudget ?? _timeout)).ConfigureAwait(false);
                 Repay(tcp, stream);
@@ -156,30 +139,28 @@ internal sealed class ForkdGuestNdjson
             }
             catch
             {
-                // 已送达后的失败（读超时/解码/guest 错误/对端断开）：连接不可信，
-                // 丢弃但绝不重试——重发可能让 exec 执行两次。
+                // rust guest.rs 参考语义：借出连接上的任何失败（含写失败）
+                // 都丢弃连接并原样抛出，绝不重试——exec 的双重执行不可接受，
+                // NDJSON 又无握手可区分"未送达"与"已执行"。
                 tcp.Dispose();
                 throw;
             }
         }
     }
 
-    /// <summary>借一条温连接：池中空闲 &lt;1s 的直接复用（零额外 RTT），空闲超时
-    /// 或写死的直接丢弃（NDJSON 无握手可用作验活，语义同 rust guest.rs）。</summary>
-    private async Task<(TcpClient, NetworkStream)> BorrowAsync(bool forceFresh)
+    /// <summary>借一条温连接：池中空闲 &lt;1s 的直接复用（零额外 RTT），空闲
+    /// 超龄的直接丢弃重拨（NDJSON 无握手可用作验活，语义同 rust guest.rs）。</summary>
+    private async Task<(TcpClient, NetworkStream)> BorrowAsync()
     {
-        if (!forceFresh)
+        while (_pool.TryDequeue(out var entry))
         {
-            while (_pool.TryDequeue(out var entry))
+            if (System.Diagnostics.Stopwatch.GetTimestamp() - entry.LastUsed
+                < System.Diagnostics.Stopwatch.Frequency)
             {
-                if (System.Diagnostics.Stopwatch.GetTimestamp() - entry.LastUsed
-                    < System.Diagnostics.Stopwatch.Frequency)
-                {
-                    return (entry.Tcp, entry.Stream);
-                }
-
-                entry.Tcp.Dispose();
+                return (entry.Tcp, entry.Stream);
             }
+
+            entry.Tcp.Dispose();
         }
 
         var tcp = new TcpClient();

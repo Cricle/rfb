@@ -432,6 +432,14 @@ internal sealed class ZbrtTcpClient : IDisposable
         return ZbrtFrameCodec.Decode(full);
     }
 
+    /// <summary>rust zbrt.rs 的连接死亡白名单：这些读侧错误才允许在新连接
+    /// 上重试一次（对端已消失，功能正常的 guest 不可能再应答）。EPIPE 在
+    /// .NET 里以 ConnectionReset/ConnectionAborted 浮现，无独立枚举。</summary>
+    private static bool IsConnectionDeath(SocketError code) =>
+        code == SocketError.ConnectionReset
+        || code == SocketError.ConnectionAborted
+        || code == SocketError.NotConnected;
+
     private async Task ReadExactlyAsync(Memory<byte> buffer, CancellationToken token)
     {
         var offset = 0;
@@ -446,9 +454,17 @@ internal sealed class ZbrtTcpClient : IDisposable
             {
                 throw new TransportException("guest response timeout");
             }
+            catch (SocketException e) when (IsConnectionDeath(e.SocketErrorCode))
+            {
+                // 连接死亡类读失败：rust zbrt.rs 白名单（reset/aborted/
+                // broken-pipe/not-connected）——可在新连接上重试一次。
+                throw new TransportException($"guest read failed: {e.Message}");
+            }
             catch (SocketException e)
             {
-                throw new TransportException($"guest read failed: {e.Message}");
+                // 其它读侧 IO 错误：请求已送达，结果未知——与读超时同等
+                // 对待，绝不重试。
+                throw new TransportException($"guest read error: {e.Message}");
             }
 
             if (n == 0)
