@@ -1291,7 +1291,10 @@ fn validate_tool_args(tool: &str, args: &serde_json::Value) -> Result<(), VsockC
     if let Some(path) = object.get("path").and_then(|v| v.as_str()) {
         validate_relative_path(path)?;
     }
-    for key in ["pattern"] {
+    {
+        // CI 的 clippy（1.99）禁止单元素 for（single_element_loop）——本循环
+        // 曾为多 key 而写，现只校验 pattern 一个键，直接展开。
+        let key = "pattern";
         if let Some(value) = object.get(key) {
             let s = value.as_str().ok_or_else(|| {
                 VsockClientError::InvalidArgument(format!("{key} must be a string"))
