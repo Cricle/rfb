@@ -251,6 +251,13 @@ Python SDK 额外携带**宿主侧编排**（`rfb_sdk/host.py`，纯标准库）
 
 ## 11. 已知的有意分歧（documented divergences）
 
+- **ZBRT 的 exec deadline 命中**：NDJSON 返回 `ExecResult(timed_out=True,
+  exit_code=-1)`；ZBRT 走 guest `Error` 帧（"command timed out"）→ 五 SDK
+  一致抛 Remote/guest 错误——ZBRT v1 没有 timed-out 线标志，按消息文本
+  反推 timed_out 会分叉传输语义（rust 基线 `client/zbrt.rs` P2 决定，
+  实战 2026-10 验证五语言行为一致）。deadline 的**截断本身**两种传输都
+  真实生效（子进程被杀）。
+
 - **旧键回退顺序**：~~C# 优先旧键~~（已过时）——实测四语言（Python/Node/Java/C#）与 Rust 基准
   一致，都是**当前键优先**（`stdout`/`output`，见 `GuestResults.cs` 的
   `Prop(v, "stdout") ?? Prop(v, "out")`）。分歧清单保留此条以记录勘误。
