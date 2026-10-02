@@ -285,11 +285,64 @@ fn resolve_tap(explicit: Option<&str>) -> Result<String, CliError> {
 /// placed on the command line; it is inherited via `FORKD_TOKEN` in the child
 /// environment (matching the official `forkd` `--daemon-token` env contract).
 fn run_forkd(bin: &Path, args: &[String]) -> Result<Output, CliError> {
-    Command::new(bin).args(args).output().map_err(|error| {
-        external(format!(
-            "failed to run forkd binary {}: {error}",
-            bin.display()
-        ))
+    /// 墙钟上限：forkd snapshot 内部会真机 boot（--boot-wait-secs 至 300s+），
+    /// 卡死的 forkd（如 TAP 抢占）曾让 CLI 永久挂起。10 分钟 > 任何合法
+    /// 路径的最坏时长。
+    const WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(600);
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            external(format!(
+                "failed to run forkd binary {}: {error}",
+                bin.display()
+            ))
+        })?;
+    // 双管道各自线程排空（piped 子进程在缓冲满时会阻塞——不能等退出后再读）。
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out_pipe, &mut buffer);
+        buffer
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buffer);
+        buffer
+    });
+    let deadline = std::time::Instant::now() + WALL_CLOCK;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(external(format!(
+                        "forkd binary did not finish within {}s",
+                        WALL_CLOCK.as_secs()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(external(format!("forkd wait failed: {error}")));
+            }
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
     })
 }
 

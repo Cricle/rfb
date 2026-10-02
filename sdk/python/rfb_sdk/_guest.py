@@ -282,6 +282,7 @@ class _GuestNdjsonClient:
             sock.sendall(line)
         except OSError as e:
             sock.close()
+            rfile.close()
             raise TransportError(f"guest write failed: {e}") from e
         except BaseException:
             # Auth failures (RemoteError for a rejected token) escaped the

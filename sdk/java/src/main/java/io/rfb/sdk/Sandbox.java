@@ -36,11 +36,20 @@ public final class Sandbox implements AutoCloseable {
             zbrtExecPool = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     private Sandbox(RfbClient client, SandboxInfo info, String transport) {
+        this(client, info, transport, true);
+    }
+
+    /** controllerBacked=false（公共 attach）的句柄没有控制器生命周期：
+     * delete() 只清理本地连接池，不发请求——对占位控制器发真删除会在
+     * 本机恰有 forkd 时误删同 id 沙箱。控制器创建的句柄必须仍走真删除。 */
+    private Sandbox(RfbClient client, SandboxInfo info, String transport,
+                    boolean controllerBacked) {
         this.client = client;
         this.info = info;
         this.transport = transport;
         this.guestAddress = GuestNdjson.parseAddress(info.getGuestAddr());
         this.timeout = Duration.ofMillis((long) (client.getTimeoutS() * 1000));
+        this.controllerBacked = controllerBacked;
         // 急建：无 IO；懒建的 check-then-act 竞争会泄漏整个池。
         this.ndjsonPool = new GuestNdjson.Pool(this.guestAddress, this.timeout);
     }
@@ -55,7 +64,14 @@ public final class Sandbox implements AutoCloseable {
      * @return a facade over the sandbox's guest
      */
     public static Sandbox attach(RfbClient client, SandboxInfo info, String transport) {
-        return new Sandbox(client, info, transport);
+        // 直连句柄：delete() 只做本地清理（见 controllerBacked）。
+        return new Sandbox(client, info, transport, false);
+    }
+
+    /** 控制器创建/列出的 id（delete 走真删除）——包内工厂，供
+     * RfbClient.attachAll 使用；直连 attach 的句柄必须保持 inert。 */
+    static Sandbox controllerBacked(RfbClient client, SandboxInfo info, String transport) {
+        return new Sandbox(client, info, transport, true);
     }
 
     /**
@@ -643,7 +659,9 @@ public final class Sandbox implements AutoCloseable {
         if (pool != null) {
             pool.drain();
         }
-        client.deleteSandbox(info.getId());
+        if (controllerBacked) {
+            client.deleteSandbox(info.getId());
+        }
     }
 
     /** AutoCloseable — deletes the sandbox (2xx/404 both succeed);
@@ -831,6 +849,7 @@ public final class Sandbox implements AutoCloseable {
     }
 
     private final GuestNdjson.Pool ndjsonPool;
+    private final boolean controllerBacked;
 
     /** Fixed margin on top of the exec read budget (Python {@code _guest.py} baseline). */
     private static final long NDJSON_EXEC_READ_MARGIN_MS = 5_000L;

@@ -319,6 +319,10 @@ pub struct GuestSandbox {
     /// connection pool. A per-call `ForkdGuestClient::new` would empty the
     /// pool on every operation (the pool is behind an Arc on this struct).
     ndjson: crate::forkd_guest::ForkdGuestClient,
+    /// 直连句柄（`attach`）：沙箱的 VM 生命周期归桥的 runner 所有——控制器
+    /// 上根本没有这个 id，`delete()` 只做本地清理；对占位控制器发真删除
+    /// 会在本机恰有 forkd 时误删同 id 沙箱。
+    attached: bool,
 }
 
 impl GuestSandbox {
@@ -337,7 +341,9 @@ impl GuestSandbox {
         timeout: Duration,
     ) -> Result<Self, RfbError> {
         let http = crate::controller::ForkdClient::new("http://127.0.0.1:8889", None, timeout)?;
-        Ok(Self::new(http, info, transport, timeout))
+        let mut handle = Self::new(http, info, transport, timeout);
+        handle.attached = true;
+        Ok(handle)
     }
 
     pub(super) fn new(
@@ -357,6 +363,7 @@ impl GuestSandbox {
             #[cfg(feature = "zeroboot")]
             zbrt,
             ndjson,
+            attached: false,
         }
     }
 
@@ -575,6 +582,11 @@ impl GuestSandbox {
     ///
     /// Returns `Err` when the operation fails; the error type carries the cause.
     pub async fn delete(&self) -> Result<(), RfbError> {
+        // attach 的直连句柄没有控制器生命周期（桥的 runner 拥有 VM）——
+        // 只做本地清理（连接池随句柄 drop 关闭），不发请求。
+        if self.attached {
+            return Ok(());
+        }
         Ok(self.http.delete_sandbox(&self.info.id).await?)
     }
 }

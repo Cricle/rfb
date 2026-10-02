@@ -162,6 +162,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// when the host process is SIGKILLed. The single shared helper concentrates
 /// the unsafe.
 ///
+/// 线程绑定约束：PDEATHSIG 在**创建子进程的那个线程**退出时触发（Linux 语义
+/// 是父"线程"而非父进程）。所有 FC spawn 都在 `spawn_blocking` 线程上——
+/// tokio 运行时关停会回收阻塞线程并对仍存活的 VM 发 SIGKILL。当前 CLI /
+/// 一次性进程场景无害（关停即 teardown）；长驻服务复用此代码时，需把
+/// spawn 移到专职生命周期线程或 spawn 后重父化。
+///
 /// # Errors
 ///
 /// Returns `Err` when the prctl setup fails (the child must not be spawned

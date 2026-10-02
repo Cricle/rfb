@@ -342,7 +342,8 @@ public final class RfbClient {
     private List<Sandbox> attachAll(List<SandboxInfo> infos, String transport) {
         List<Sandbox> sandboxes = new ArrayList<>(infos.size());
         for (SandboxInfo info : infos) {
-            sandboxes.add(Sandbox.attach(this, info, transport));
+            // 控制器创建/列出的 id 有真实生命周期——delete 必须走真删除。
+            sandboxes.add(Sandbox.controllerBacked(this, info, transport));
         }
         return sandboxes;
     }

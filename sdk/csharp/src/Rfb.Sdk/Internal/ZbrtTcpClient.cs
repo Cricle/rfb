@@ -137,11 +137,32 @@ internal sealed class ZbrtTcpClient : IDisposable
         _udsSocket = socket;
         // FC 的 vsock relay UDS 不是透明字节流：先 CONNECT 前导。
         var command = System.Text.Encoding.ASCII.GetBytes("CONNECT " + guestPort + "\n");
-        await _stream.WriteAsync(command).ConfigureAwait(false);
-        var line = new byte[64];
-        var read = await _stream.ReadAsync(line, cts.Token).ConfigureAwait(false);
-        var reply = System.Text.Encoding.ASCII.GetString(line, 0, Math.Max(read - 1, 0));
-        if (read <= 0 || !reply.StartsWith("OK ", StringComparison.Ordinal))
+        using var writeCts = new CancellationTokenSource(_timeout);
+        await _stream.WriteAsync(command, writeCts.Token).ConfigureAwait(false);
+        // 读到换行为止（一次 ReadAsync 只保证"有字节"，"OK 200\n" 可能被
+        // 拆成多次到达）；行上限 256（host.py 同款——失控 relay 不能逐
+        // 字节撑内存）。
+        var preamble = new System.Text.StringBuilder();
+        var byteBuf = new byte[1];
+        while (true)
+        {
+            var read = await _stream.ReadAsync(byteBuf, cts.Token).ConfigureAwait(false);
+            if (read <= 0)
+            {
+                throw new TransportException("vsock relay closed during handshake");
+            }
+            if (byteBuf[0] == (byte)'\n')
+            {
+                break;
+            }
+            preamble.Append((char)byteBuf[0]);
+            if (preamble.Length > 256)
+            {
+                throw new TransportException("vsock relay preamble too long");
+            }
+        }
+        var reply = preamble.ToString();
+        if (!reply.StartsWith("OK ", StringComparison.Ordinal))
         {
             throw new TransportException($"vsock relay rejected: {reply.Trim()}");
         }

@@ -177,7 +177,7 @@ impl WorkspaceGuestExecutor {
             .ok_or("pattern is required")?;
         let max = a.get("max_results").and_then(Value::as_u64).unwrap_or(100) as usize;
         let mut out = Vec::new();
-        let truncated = walk(&root, pattern, max, &mut out)?;
+        let truncated = walk(&root, pattern, max, &mut out, &self.cancel_requested)?;
         // Host `FindResult` expects {matches, truncated}; the bounded walk's
         // real truncation flag is surfaced so hosts can tell "no more
         // matches" from "results were dropped" (a max_results cap silently
@@ -208,6 +208,14 @@ impl WorkspaceGuestExecutor {
         let mut stack = vec![root.clone()];
         let mut visited = std::collections::HashSet::new();
         'outer: while let Some(current) = stack.pop() {
+            // 结构化 fs 扫描同样响应取消（此前只有 exec 的循环看标志——
+            // 取消一个大 grep 要等它扫完整个 workspace）。
+            if self
+                .cancel_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("request cancelled".into());
+            }
             // Use symlink_metadata to detect symlinks without following them,
             // preventing symlink-cycle hangs.
             let meta = match fs::symlink_metadata(&current) {
@@ -294,9 +302,16 @@ impl WorkspaceGuestExecutor {
 /// over the shared bounded walk, with symlink skipping as the cycle guard.
 /// The walk's truncation flag is surfaced verbatim into the find result's
 /// `truncated` field.
-fn walk(root: &Path, pattern: &str, max: usize, out: &mut Vec<String>) -> Result<bool, String> {
+fn walk(
+    root: &Path,
+    pattern: &str,
+    max: usize,
+    out: &mut Vec<String>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool, String> {
     let matcher = |name: &str| crate::glob::glob_matches(pattern, name);
-    crate::glob::bounded_name_walk(root, root, &matcher, max, true, out).map_err(|e| e.to_string())
+    crate::glob::bounded_name_walk(root, root, &matcher, max, true, out, Some(cancel))
+        .map_err(|e| e.to_string())
 }
 
 /// `terminal.output` 事件：字符串（有效 UTF-8）或字节数组（二进制保真）；

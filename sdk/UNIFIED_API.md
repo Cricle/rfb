@@ -83,6 +83,18 @@ release 8（需反射）且 AF_UNIX 的 SocketChannel **无 SO_TIMEOUT 等价物
 （挂死风险要自造看门狗）——验证过反射路径可行（relay OK），维持 TCP 中继
 （0.6ms/RTT，8 并发 ~0.8-1.0k ops/s），除非未来把基线提到 16。
 
+**attach 句柄的 delete 语义**：rust/java/c# 的直连 `attach()`（已知
+guest 地址、无控制器参与，VM 生命周期归桥的 runner 所有）返回的句柄是
+**inert delete**——`delete()` 只清理本地连接池、**不向控制器发请求**
+（对占位控制器发真删除会在本机恰有 forkd 时误删同 id 沙箱）。控制器
+创建/列出的句柄 delete 照常走真删除。python/node 没有独立的 attach 入口
+（直接构造与控制器创建同形），delete 行为不变，由调用方保证（quickstart
+的 zeroboot 分支自行跳过 delete）。
+
+**create 的独立预算**：五语言的 `create_sandbox` 对 POST /v1/sandboxes
+使用 60s 的独立预算（快照恢复 restore+resume 实测可超 10s 基础超时——
+超时会孤儿一个已落地的沙箱）；其余控制器请求保持客户端默认。
+
 **清理兜底（异常情况由框架收尾）**：`Sandbox` 的删除在四个语言里都有
 RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java
 `implements AutoCloseable`（try-with-resources）、C# `IAsyncDisposable`

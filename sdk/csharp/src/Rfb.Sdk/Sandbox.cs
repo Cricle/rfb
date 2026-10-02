@@ -10,6 +10,7 @@ namespace Rfb.Sdk;
 public sealed class Sandbox : IAsyncDisposable
 {
     private readonly RfbClient _client;
+    private readonly bool _controllerBacked;
     private readonly TimeSpan _timeout;
     private readonly Lazy<ForkdGuestNdjson> _ndjson;
     private readonly Lazy<ZbrtPool> _zbrt;
@@ -28,12 +29,17 @@ public sealed class Sandbox : IAsyncDisposable
         {
             throw new ValidationException($"invalid transport: {transport}");
         }
+        // 直连句柄：没有控制器生命周期——delete 只做本地清理。
         return new Sandbox(client, info, transport,
-            TimeSpan.FromSeconds(client.TimeoutS));
+            TimeSpan.FromSeconds(client.TimeoutS), controllerBacked: false);
     }
 
     internal Sandbox(RfbClient client, SandboxInfo info, string transport, TimeSpan timeout)
+        : this(client, info, transport, timeout, controllerBacked: true) { }
+
+    private Sandbox(RfbClient client, SandboxInfo info, string transport, TimeSpan timeout, bool controllerBacked)
     {
+        _controllerBacked = controllerBacked;
         if (transport is not ("ndjson" or "zbrt"))
         {
             throw new ValidationException("transport must be \"ndjson\" or \"zbrt\"");
@@ -430,7 +436,10 @@ public sealed class Sandbox : IAsyncDisposable
         {
             _zbrt.Value.Drain();
         }
-        await _client.DeleteSandbox(Id).ConfigureAwait(false);
+        if (_controllerBacked)
+        {
+            await _client.DeleteSandbox(Id).ConfigureAwait(false);
+        }
     }
 
     /// <summary>Async disposal — deletes the sandbox (2xx/404 both succeed);

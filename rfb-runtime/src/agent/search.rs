@@ -126,11 +126,17 @@ pub async fn structured(request: &Value) -> io::Result<Value> {
             let result = Box::pin(execute(&r)).await?;
             // Eval has its own typed wire contract. Keep `exec`'s historical
             // out/err/exit_code fields intact, but expose output/status here.
-            let output = result["out"]
-                .as_str()
-                .unwrap_or_default()
-                .as_bytes()
-                .to_vec();
+            // 字节数组形态（bytes_to_wire 的二进制）原样收字节——as_str 对
+            // 数组返回 None，二进制 eval 输出曾静默变空。
+            let output = match result.get("out") {
+                Some(Value::String(text)) => text.as_bytes().to_vec(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|v| v.as_u64().and_then(|v| u8::try_from(v).ok()))
+                    .collect::<Option<Vec<u8>>>()
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
             Ok(json!({
                 "output": output,
                 "status": result["exit_code"].clone(),
@@ -162,6 +168,7 @@ fn find_walk(
         max,
         false,
         out,
+        None,
     )
 }
 

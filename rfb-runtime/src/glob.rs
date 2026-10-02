@@ -56,9 +56,17 @@ pub(crate) fn bounded_name_walk(
     max: usize,
     skip_symlinks: bool,
     out: &mut Vec<String>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<bool> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
+        // 取消检查（每目录项一次，原子读 ~ns）：取消一个大扫描不再要等它
+        // 扫完整个 workspace。
+        if let Some(flag) = cancel {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("request cancelled"));
+            }
+        }
         let file_type = e.file_type()?;
         if skip_symlinks && file_type.is_symlink() {
             continue;
@@ -75,7 +83,9 @@ pub(crate) fn bounded_name_walk(
                     .replace('\\', "/"),
             );
         }
-        if file_type.is_dir() && bounded_name_walk(root, &p, matcher, max, skip_symlinks, out)? {
+        if file_type.is_dir()
+            && bounded_name_walk(root, &p, matcher, max, skip_symlinks, out, cancel)?
+        {
             return Ok(true);
         }
     }
