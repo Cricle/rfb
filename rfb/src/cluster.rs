@@ -880,6 +880,9 @@ fn admissible(node: &NodeState, now_ms: u64) -> bool {
 
 /// Decrement without wrapping: a stray extra release leaves zero at zero.
 fn saturating_decrement(counter: &AtomicUsize) {
+    // clippy 1.99 弃用 fetch_update（更名 try_update），但 MSRV 1.93 尚无
+    // 新名——显式 allow 双版本兼容。
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         Some(value.saturating_sub(1))
     });
