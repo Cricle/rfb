@@ -361,22 +361,31 @@ class TcpVsockRelay:
 # ---------------------------------------------------------------------------
 
 
-def _pump_to_tcp(conn: "socket.socket", target: str, stop_event) -> None:
+def _pump_to_tcp(conn: "socket.socket", target: str, stop_event,
+                 on_open=None) -> None:
     """桥一条 guest→host 的 vsock 连接到宿主 TCP 目标：vsock 侧字节 →
-    TCP 发送、TCP 回包 → vsock 侧。任一侧 EOF/错误即双向收尾。"""
+    TCP 发送、TCP 回包 → vsock 侧。任一侧 EOF/错误即双向收尾；
+    `on_open(upstream, conn)` 供调用方登记连接（unexpose 强拆用）。"""
     try:
-        host, _, port = target.rpartition(":")
+        host, _, port_text = target.rpartition(":")
+        port = int(port_text)
+        if not 0 <= port <= 65535:
+            raise ValueError("port out of range")
         upstream = socket.create_connection(
-            (host or "127.0.0.1", int(port)), timeout=5)
-    except OSError as e:
+            (host or "127.0.0.1", port), timeout=5)
+    except (OSError, ValueError) as e:
+        # guest 只见通用文案——宿主侧拓扑（target/errno）不外泄；数值端口
+        # 错误（ValueError/OverflowError 家族）与网络错误同路收尾。
         try:
-            conn.sendall(f"host target unreachable: {e}\n".encode())
+            conn.sendall(b"host target unreachable\n")
         except OSError:
             pass
         conn.close()
         return
     upstream.settimeout(None)
     conn.settimeout(None)
+    if on_open:
+        on_open(upstream, conn)
     stop = stop_event.is_set
 
     def tcp_to_vsock() -> None:
@@ -405,17 +414,19 @@ def _pump_to_tcp(conn: "socket.socket", target: str, stop_event) -> None:
     except OSError:
         pass
     finally:
+        # 先 SHUT_RDWR upstream（唤醒阻塞在 recv 的 pump——SHUT_WR 与
+        # close 都唤醒不了：阻塞 syscall 持有引用），再 join，最后关
+        # vsock 侧。截断只发生在真异常路径。
         try:
-            upstream.shutdown(socket.SHUT_WR)
+            upstream.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        pump.join(timeout=5)
         try:
             upstream.close()
         except OSError:
             pass
-        pump.join(timeout=5)
         conn.close()
-
 
 
 class ZerobootHost:
