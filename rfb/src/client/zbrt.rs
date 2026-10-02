@@ -431,6 +431,12 @@ impl ZbrtGuest {
             }
         };
         Self::write_frame(&mut stream, &request).await?;
+        // 长静默 exec：客户端逐帧读预算必须盖住 guest 自己的死线（与 forkd
+        // guest.rs exec_in 同款：基础 + 死线 + margin），否则合法的长命令会
+        // 先撞客户端读超时——命令还在 guest 里跑，客户端却已报错。
+        let read_budget = self.timeout
+            + Duration::from_millis(u64::from(timeout_ms))
+            + crate::forkd_guest::EXEC_READ_MARGIN;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut total = 0usize;
@@ -442,7 +448,7 @@ impl ZbrtGuest {
                     "guest output exceeded {MAX_EXEC_FRAMES} frames"
                 )));
             }
-            let frame = Self::read_frame(&mut stream, self.timeout).await?;
+            let frame = Self::read_frame(&mut stream, read_budget).await?;
             Self::check_id(&frame, request_id)?;
             match frame.kind {
                 Kind::Output => {

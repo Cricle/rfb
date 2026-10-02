@@ -207,10 +207,16 @@ internal sealed class ZbrtTcpClient : IDisposable
         return await ExecuteTurnAsync(argv, cwd, stdin, timeoutMs).ConfigureAwait(false);
     }
 
+    /// <summary>长静默 exec 的读预算加成（rust EXEC_READ_MARGIN 同款）：
+    /// 逐帧读预算必须盖住 guest 自己的死线，否则合法的长命令先撞客户端
+    /// 读超时——命令还在 guest 里跑，客户端却已报错。</summary>
+    internal static readonly TimeSpan ExecReadMargin = TimeSpan.FromSeconds(5);
+
     private async Task<ZbrtExecOutcome> ExecuteTurnAsync(IReadOnlyList<string> argv, string? cwd, byte[] stdin, uint timeoutMs)
     {
         var payload = ZbrtFrameCodec.EncodeExecute(argv, cwd, stdin, timeoutMs);
         var request = new ZbrtFrame { Kind = ZbrtKind.Execute, RequestId = NewRequestId(), Payload = payload };
+        var readBudget = _timeout + TimeSpan.FromMilliseconds(timeoutMs) + ExecReadMargin;
         try
         {
             await WriteFrameAsync(request).ConfigureAwait(false);
@@ -220,7 +226,7 @@ internal sealed class ZbrtTcpClient : IDisposable
             var totalOutput = 0L;
             while (true)
             {
-                var frame = await ReadFrameAsync().ConfigureAwait(false);
+                var frame = await ReadFrameAsync(readBudget).ConfigureAwait(false);
                 RequireRequestId(frame, request.RequestId);
                 switch (frame.Kind)
                 {
@@ -414,9 +420,9 @@ internal sealed class ZbrtTcpClient : IDisposable
         }
     }
 
-    internal async Task<ZbrtFrame> ReadFrameAsync()
+    internal async Task<ZbrtFrame> ReadFrameAsync(TimeSpan? readBudget = null)
     {
-        using var cts = new CancellationTokenSource(_timeout);
+        using var cts = new CancellationTokenSource(readBudget ?? _timeout);
         await ReadExactlyAsync(_header, cts.Token).ConfigureAwait(false);
         var payloadLen = BinaryPrimitives.ReadUInt32BigEndian(_header.AsSpan(24, 4));
         if (payloadLen > ZbrtFrameCodec.MaxPayload)

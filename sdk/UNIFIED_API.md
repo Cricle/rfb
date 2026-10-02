@@ -95,7 +95,7 @@ RAII 式入口——python `with sandbox:`（`__exit__` 调 `delete`）、java
 | 方法 | 签名要点 | 行为要点 |
 |---|---|---|
 | `ping()` | → `bool` | NDJSON：仅 `pong==true` 算健康（`healthy` 字段不作数；应答另含附加键 `protocol_version`=1，客户端忽略未知键）；ZBRT：HealthAck 的 `healthy` |
-| `exec(args, cwd="/workspace", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；ZBRT 的 `argc` 是单字节，`>255` 本地 Validation（零帧，连 TCP 都不建）；单 turn stdout+stderr 聚合 `>16 MiB` → Remote；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**） |
+| `exec(args, cwd="/workspace", timeout_s=60.0, stdin=b"")` | argv 非空，cwd/timeout 先本地校验 | NDJSON wire 无 stdin 通道，非空 stdin **本地 fail closed**（ValidationError，零帧：静默丢弃=命令无输入运行）；仅 ZBRT 送达；ZBRT 的 `argc` 是单字节，`>255` 本地 Validation（零帧，连 TCP 都不建）；单 turn stdout+stderr 聚合 `>16 MiB` → Remote；`exit_code` 缺失/非整数 → `-1`；旧 agent 的 `out`/`err` 键与 `stdout`/`stderr` 等价（并存时**当前键优先**）。**客户端读预算** = 基础超时 + exec 死线 + 5s margin（五语言一致）：长静默命令（如 `sleep 60`）不会先撞客户端超时——guest 自己的死线才是权威 |
 | `eval(code, cwd=None, timeout_s=None)` | code 去空白非空、≤ 1 MiB；timeout > 0 | 输出映射 `stdout`（`output`，旧 `out` 等价），`stderr` 恒空，exit 取 `status`（旧 `exit_code` 等价，缺省 0）；**ZBRT 下本地 fail closed**（ValidationError，零帧上线：v1 无 eval opcode，见 `sdk/shared/README.md §1`） |
 | `ls(path=".")` / `find(path, pattern)` / `grep(path, pattern)` | fs 路径 + pattern 校验 | `max_results=1000`（grep 另 `max_bytes=51200`）；find 返回 `[str]`，grep 返回 `[GrepMatch]` |
 | `read(path, offset=None, max_bytes=None)` | `max_bytes` 必须 `1..=51200` | → `FileRead{data, truncated, total_bytes}` |

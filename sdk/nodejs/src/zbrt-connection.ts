@@ -182,10 +182,17 @@ export class ZbrtStreamSession {
   }
 }
 
+/** Extra read budget over the client timeout + the exec turn's guest-side
+ * deadline (Rust `EXEC_READ_MARGIN`); mirrors sandbox.ts's NDJSON constant —
+ * duplicated rather than imported so the forkd-only split bundle (which drops
+ * this module) keeps compiling. */
+export const EXEC_READ_MARGIN_MS = 5_000;
+
 export class ZbrtConnection {
   #socket: net.Socket | null = null;
   #reader: ReturnType<typeof frameReader> | undefined = undefined;
   #ready: Promise<void>;
+  #timeoutMs: number = 10_000;
 
   constructor(host: string, port: number, timeoutMs: number);
   constructor(address: string, timeoutMs: number);
@@ -203,6 +210,7 @@ export class ZbrtConnection {
         timeout: portOrTimeout,
       };
     })() : null;
+    this.#timeoutMs = uds !== null ? uds.timeout : tcp!.timeout;
     this.#ready = (async () => {
       if (uds !== null) {
         // 直拨 FC 的 vsock relay UDS：CONNECT 前导（非透明字节流）。
@@ -396,36 +404,44 @@ export class ZbrtConnection {
         codec.encodeExecute(argv, cwd ?? null, stdin, timeoutMs),
       ),
     );
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let outputBytes = 0;
-    while (true) {
-      const frame = await this.#reader?.next();
-      if (frame === null || frame === undefined) throw new TransportError('connection closed by guest');
-      await this.requireId(frame, id);
-      if (frame.kind === KIND_OUTPUT) {
-        const output = codec.decodeOutput(frame.payload);
-        // Per-turn aggregate cap: an unbounded turn would let one runaway
-        // guest exhaust host memory; 16 MiB mirrors the frame payload cap.
-        outputBytes += output.data.length;
-        if (outputBytes > MAX_TURN_OUTPUT_BYTES) {
-          throw new RemoteError(`zbrt turn output exceeded ${MAX_TURN_OUTPUT_BYTES} bytes`);
+    // 长静默 exec：读停顿预算 = 基础超时 + guest 死线 + margin，turn 结束
+    // 恢复基础值——否则合法的长命令先撞客户端 socket 超时（连接被销毁），
+    // 而命令还在 guest 里跑（rust/java/python 同款）。
+    this.#socket?.setTimeout(this.#timeoutMs + timeoutMs + EXEC_READ_MARGIN_MS);
+    try {
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let outputBytes = 0;
+      while (true) {
+        const frame = await this.#reader?.next();
+        if (frame === null || frame === undefined) throw new TransportError('connection closed by guest');
+        await this.requireId(frame, id);
+        if (frame.kind === KIND_OUTPUT) {
+          const output = codec.decodeOutput(frame.payload);
+          // Per-turn aggregate cap: an unbounded turn would let one runaway
+          // guest exhaust host memory; 16 MiB mirrors the frame payload cap.
+          outputBytes += output.data.length;
+          if (outputBytes > MAX_TURN_OUTPUT_BYTES) {
+            throw new RemoteError(`zbrt turn output exceeded ${MAX_TURN_OUTPUT_BYTES} bytes`);
+          }
+          (output.stream === 0 ? stdout : stderr).push(output.data);
+        } else if (frame.kind === KIND_EXIT) {
+          const exit = codec.decodeExit(frame.payload);
+          return {
+            code: exit.code,
+            stdout: Buffer.concat(stdout),
+            stderr: Buffer.concat(stderr),
+            signal: exit.signal,
+            timedOut: false,
+          };
+        } else if (frame.kind === KIND_ERROR) {
+          throw this.errorFromFrame(frame);
+        } else {
+          throw this.unexpectedFrame(frame, 'Output/Exit');
         }
-        (output.stream === 0 ? stdout : stderr).push(output.data);
-      } else if (frame.kind === KIND_EXIT) {
-        const exit = codec.decodeExit(frame.payload);
-        return {
-          code: exit.code,
-          stdout: Buffer.concat(stdout),
-          stderr: Buffer.concat(stderr),
-          signal: exit.signal,
-          timedOut: false,
-        };
-      } else if (frame.kind === KIND_ERROR) {
-        throw this.errorFromFrame(frame);
-      } else {
-        throw this.unexpectedFrame(frame, 'Output/Exit');
       }
+    } finally {
+      this.#socket?.setTimeout(this.#timeoutMs);
     }
   }
 
