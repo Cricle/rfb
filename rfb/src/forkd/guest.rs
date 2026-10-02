@@ -141,12 +141,13 @@ impl ForkdGuestClient {
                         let result = self
                             .exchange(&mut reader, &mut write, action, read_timeout)
                             .await;
-                        if result.is_ok() {
+                        if result.is_ok() && reader.buffer().is_empty() {
                             let mut pool = self.pool.lock().await;
                             if pool.len() < 8 {
                                 pool.push((reader, write, std::time::Instant::now()));
-                            } // else: dropped = closed
+                            } // else: dropped = closed（缓冲有残余 = 不可复用）
                         }
+                        // 失败或缓冲残留：连接丢弃（drop = 关闭）
                         return result;
                     }
                     // 超龄：shutdown 写半边（reader 随 drop 关闭），试下一条。
@@ -168,7 +169,7 @@ impl ForkdGuestClient {
         let result = self
             .exchange(&mut reader, &mut write, action, read_timeout)
             .await?;
-        {
+        if reader.buffer().is_empty() {
             let mut pool = self.pool.lock().await;
             if pool.len() < 8 {
                 pool.push((reader, write, std::time::Instant::now()));
@@ -386,8 +387,13 @@ impl ForkdGuestClient {
         timeout_secs: u64,
     ) -> Result<Value, ForkdGuestError> {
         // Guest-side deadline + margin: the response may legitimately take the
-        // full exec timeout to arrive.
-        let read_timeout = self.timeout + Duration::from_secs(timeout_secs) + EXEC_READ_MARGIN;
+        // full exec timeout to arrive. saturating：validation 只保证 >0，
+        // 超大 f64 饱和转 u64 后加法曾 panic —— 预算饱和到 MAX（不设限，
+        // guest 死线权威）而不是 panic。
+        let read_timeout = self
+            .timeout
+            .saturating_add(Duration::from_secs(timeout_secs))
+            .saturating_add(EXEC_READ_MARGIN);
         self.request_with_read_timeout(
             serde_json::json!({"action":"exec","cwd":guest_cwd,"args":args,"timeout":timeout_secs}),
             read_timeout,
@@ -446,7 +452,9 @@ impl ForkdGuestClient {
             action["timeout"] = Value::Number(seconds.into());
         }
         let read_timeout = request.timeout.map_or(self.timeout, |timeout| {
-            self.timeout + timeout + EXEC_READ_MARGIN
+            self.timeout
+                .saturating_add(timeout)
+                .saturating_add(EXEC_READ_MARGIN)
         });
         self.request_with_read_timeout(action, read_timeout)
             .await?

@@ -41,6 +41,8 @@ public final class Sandbox implements AutoCloseable {
         this.transport = transport;
         this.guestAddress = GuestNdjson.parseAddress(info.getGuestAddr());
         this.timeout = Duration.ofMillis((long) (client.getTimeoutS() * 1000));
+        // 急建：无 IO；懒建的 check-then-act 竞争会泄漏整个池。
+        this.ndjsonPool = new GuestNdjson.Pool(this.guestAddress, this.timeout);
     }
 
     /**
@@ -306,7 +308,11 @@ public final class Sandbox implements AutoCloseable {
         if (timeoutSecs > 0) {
             action.put("timeout", timeoutSecs);
         }
-        JsonNode v = ndjsonRequest(action);
+        // eval 的死线上 wire（guest 按它执行）——读预算必须同宽，否则
+        // guest 还在跑、客户端已超时（guest 自己的超时错误永远浮不出来）。
+        JsonNode v = timeoutSecs > 0
+                ? ndjsonRequest(action, timeoutSecs)
+                : ndjsonRequest(action);
         return new ExecResult(
                 statusCode(v, 0, "status", "exit_code"),
                 Json.valueBytes(firstOf(v, "output", "out")),
@@ -633,6 +639,10 @@ public final class Sandbox implements AutoCloseable {
         while ((pooled = zbrtExecPool.poll()) != null) {
             pooled.getKey().close();
         }
+        GuestNdjson.Pool pool = ndjsonPool;
+        if (pool != null) {
+            pool.drain();
+        }
         client.deleteSandbox(info.getId());
     }
 
@@ -728,9 +738,9 @@ public final class Sandbox implements AutoCloseable {
                     exec.timedOut());
         } catch (RfbError e) {
             conn.close();
-            if (pooled && e instanceof TransportError
-                    && e.getMessage() != null
-                    && e.getMessage().startsWith("zbrt write")) {
+            // 与 zbrtControl/rust/c# 同合同：写失败 + 连接死亡类读失败
+            // 重试一次新连接；读超时/解码/guest 错误绝不重试。
+            if (zbrtRetryable(e)) {
                 ZbrtConnection fresh = openZbrt(execReadBudget(timeoutS));
                 try {
                     ZbrtConnection.Exec exec = fresh.execute(
@@ -756,10 +766,14 @@ public final class Sandbox implements AutoCloseable {
             }
             ZbrtConnection conn = entry.getKey();
             // 热路径（背靠背操作）零额外 RTT：只对空闲 >1s 的连接验活。
+            // 两条路径都要刷新 SoTimeout——exec 的宽预算不能被上一操作的
+            // 基础预算钉死，反之归还后的挂住读也不该阻塞 75s。
             if (System.nanoTime() - entry.getValue() < 1_000_000_000L) {
+                conn.setSocketBudget(socketBudget);
                 return conn;
             }
             try {
+                conn.setSocketBudget(socketBudget);
                 conn.hello(ZbrtConnection.CLIENT_NAME);
                 return conn;
             } catch (RfbError e) {
@@ -811,13 +825,12 @@ public final class Sandbox implements AutoCloseable {
 
     /** NDJSON 温连接池（每 Sandbox 一个，懒建）。 */
     private GuestNdjson.Pool ndjsonPool() {
-        if (ndjsonPool == null) {
-            ndjsonPool = new GuestNdjson.Pool(guestAddress, timeout);
-        }
+        // 构造器急建（无 IO，构造很轻）：懒建的 check-then-act 竞争会让
+        // 两个首操作各建一个池，输家的空闲连接永远无人排水。
         return ndjsonPool;
     }
 
-    private GuestNdjson.Pool ndjsonPool;
+    private final GuestNdjson.Pool ndjsonPool;
 
     /** Fixed margin on top of the exec read budget (Python {@code _guest.py} baseline). */
     private static final long NDJSON_EXEC_READ_MARGIN_MS = 5_000L;

@@ -538,7 +538,16 @@ class _ZbrtGuestClient:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as e:
             raise TransportError(f"zbrt connect failed: {e}") from e
-        self._handshake(sock)
+        try:
+            self._handshake(sock)
+        except BaseException:
+            # 握手失败的连接必须关闭：冷连接上的每次 Hello 拒绝都泄漏一个
+            # fd（_borrow 的 close 只覆盖池内借出的连接）。
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
         return sock
 
     @staticmethod
@@ -589,7 +598,10 @@ class _ZbrtGuestClient:
     def _effective_timeout(self, timeout_s) -> float:
         if not timeout_s:
             return self._timeout_s
-        return max(self._timeout_s, float(timeout_s) + 5.0)
+        # 契约 = 基础超时 + 死线 + 5s margin（rust/node/java/python-NDJSON
+        # 同款求和）：max() 会在 base=10s、deadline=60s 时少给 10s，请求已
+        # 在 guest 执行（绝不重试类）的读就会提前超时。
+        return self._timeout_s + float(timeout_s) + 5.0
 
     def _read_reply(self, sock, request_id: bytes):
         frame = read_frame(sock)

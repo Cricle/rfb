@@ -132,7 +132,12 @@ export class ZbrtStreamSession {
     if (this.#pending.length > 0) return this.#pending.shift() as ZbrtStreamEvent;
     if (this.terminal) return null;
     const frame = await this.#host.nextFrame();
-    if (frame === null) return null;
+    if (frame === null) {
+      // 流结束：置 terminal，否则消费 null 后的任何 nextEvent() 都会在
+      // 已销毁 socket 的 frameReader 上永远 pending。
+      this.terminal = true;
+      return null;
+    }
     await this.#host.requireId(frame, this.requestId);
     if (frame.kind === KIND_OUTPUT) {
       const output = codec.decodeOutput(frame.payload);
@@ -144,8 +149,12 @@ export class ZbrtStreamSession {
       return { stream: -1, data: Buffer.alloc(0), code: exit.code };
     }
     if (frame.kind === KIND_ERROR) {
+      // Error = 终态：置 terminal（ facade 随后 close 连接——参照
+      // python _ZbrtStream 的 Error 处理）。
+      this.terminal = true;
       throw this.#host.errorFromFrame(frame);
     }
+    this.terminal = true;
     throw this.#host.unexpectedFrame(frame, 'Output/Exit');
   }
 
@@ -231,6 +240,11 @@ export class ZbrtConnection {
         });
         socket.setNoDelay(true);
         socket.setTimeout(uds.timeout);
+        // 读停顿合同（§3.4）：TCP 路径由 connectSocket 注册 timeout 监听，
+        // uds 路径原本没有任何监听——停顿/对端死亡 = 永久 hang。
+        socket.once('timeout', () => {
+          socket.destroy(new TransportError('guest read timed out'));
+        });
         const reply = await new Promise<string>((resolve, reject) => {
           let buf = '';
           const ondata = (d: Buffer): void => {
@@ -244,6 +258,11 @@ export class ZbrtConnection {
           socket.on('data', ondata);
           socket.once('error', (e) => {
             reject(new TransportError(`vsock relay handshake failed: ${(e as Error).message}`));
+          });
+          // 干净 FIN（无换行）只触发 close，不触发 error：不监听 close 则
+          // reply 永远 pending。
+          socket.once('close', () => {
+            reject(new TransportError('vsock relay handshake failed: connection closed'));
           });
           socket.write(`CONNECT ${uds.guestPort}\n`);
         });
@@ -262,6 +281,9 @@ export class ZbrtConnection {
       // and any handshake failure is a Transport-class error.
       await this.#handshake();
     })();
+    // 握手失败后 socket 已赋值但无人引用：destroy 掉，否则它带着事件
+    // 循环引用活到 GC（uds relay 回 ERR 的分支同样受益）。
+    this.#ready.catch(() => this.#socket?.destroy());
   }
 
   /** Resolves once the TCP connection is up and Hello has been acknowledged. */
@@ -290,6 +312,9 @@ export class ZbrtConnection {
           `zbrt hello handshake failed: unexpected frame kind ${frame.kind} while awaiting HelloAck`,
         );
       }
+      // 池借出验活依赖这条校验区分"活连接"与"串线帧"：乱入的陈旧
+      // HelloAck（任意 id）必须被拒。
+      await this.requireId(frame, id);
       codec.decodeHelloAck(frame.payload);
     } catch (error) {
       if (error instanceof TransportError) throw error;
@@ -380,6 +405,7 @@ export class ZbrtConnection {
         `zbrt hello handshake failed: unexpected frame kind ${frame.kind} while awaiting HelloAck`,
       );
     }
+    await this.requireId(frame, id);
     return codec.decodeHelloAck(frame.payload);
   }
 

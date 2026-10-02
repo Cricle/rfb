@@ -524,31 +524,80 @@ fn expected_entries() -> Vec<DirEntry> {
     ]
 }
 
+/// 回归测试：facade 的 NDJSON 温池必须真的复用——`ops()` 曾每次调用都
+/// new 一个 ForkdGuestClient（池在 Arc 后面），每个操作各建一条连接而
+/// 无人发现（ZBRT 有复用断言、NDJSON 没有）。
+#[tokio::test]
+async fn facade_ndjson_pool_reuses_one_connection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_thread = accepts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            accepts_thread.fetch_add(1, Ordering::Relaxed);
+            let mut writer = match stream.try_clone() {
+                Ok(w) => w,
+                Err(_) => break,
+            };
+            let mut reader = BufReader::new(stream);
+            // serve loop: one reply per request line, like the real agent.
+            while let Ok(n) = reader.read_until(b'\n', &mut Vec::new()) {
+                if n == 0 {
+                    break;
+                }
+                let _ = writer.write_all(b"{\"pong\":true}\n");
+                let _ = writer.flush();
+            }
+        }
+    });
+
+    let (client, sandbox) = connect_fake(&addr, GuestTransport::Ndjson).await;
+    for _ in 0..5 {
+        assert!(sandbox.ping().await.unwrap());
+    }
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        1,
+        "back-to-back pings must ride ONE pooled connection"
+    );
+    let _ = client; // client owns the sandbox lifetime
+}
+
 #[tokio::test]
 async fn facade_ndjson_identical_shapes() {
+    // The real agent's serve loop carries sequential requests on ONE
+    // connection — the facade's warm pool reuses it, so the handler must
+    // loop (a one-shot handler would close the pooled conn after op 1).
     let guest = spawn_guest(|conn| {
-        let Some(action) = conn.recv() else { return };
-        let reply = match action["action"].as_str() {
-            Some("ping") => json!({"pong": true}),
-            Some("exec") => json!({"exit_code": 0, "out": "hi", "timed_out": false}),
-            Some("eval") => json!({"output": [104, 105], "status": 0, "timed_out": false}),
-            Some("ls") => json!({
-                "entries": [
-                    {"name": "a.txt", "is_dir": false, "size": 3},
-                    {"name": "sub", "is_dir": true}
-                ],
-                "truncated": false
-            }),
-            Some("find") => json!({"matches": ["a.txt"], "truncated": false}),
-            Some("grep") => json!({
-                "matches": [{"path": "a.txt", "line": 1, "text": "hi"}],
-                "truncated": false
-            }),
-            Some("read") => json!({"data": [104, 105], "truncated": false, "total_bytes": 2}),
-            Some("write") => json!({"bytes_written": 2}),
-            _ => json!({"error": "unknown action"}),
-        };
-        conn.send(&reply);
+        while let Some(action) = conn.recv() {
+            let reply = match action["action"].as_str() {
+                Some("ping") => json!({"pong": true}),
+                Some("exec") => json!({"exit_code": 0, "out": "hi", "timed_out": false}),
+                Some("eval") => json!({"output": [104, 105], "status": 0, "timed_out": false}),
+                Some("ls") => json!({
+                    "entries": [
+                        {"name": "a.txt", "is_dir": false, "size": 3},
+                        {"name": "sub", "is_dir": true}
+                    ],
+                    "truncated": false
+                }),
+                Some("find") => json!({"matches": ["a.txt"], "truncated": false}),
+                Some("grep") => json!({
+                    "matches": [{"path": "a.txt", "line": 1, "text": "hi"}],
+                    "truncated": false
+                }),
+                Some("read") => json!({"data": [104, 105], "truncated": false, "total_bytes": 2}),
+                Some("write") => json!({"bytes_written": 2}),
+                _ => json!({"error": "unknown action"}),
+            };
+            conn.send(&reply);
+        }
     });
     let (client, sandbox) = connect_fake(&guest, GuestTransport::Ndjson).await;
     assert_eq!(sandbox.transport(), GuestTransport::Ndjson);

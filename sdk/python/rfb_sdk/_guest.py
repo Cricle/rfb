@@ -222,6 +222,17 @@ class _GuestNdjsonClient:
         else:
             sock.close()
 
+    def drop_control(self) -> None:
+        """丢弃所有空闲连接（sandbox 删除/停机）。Sandbox.delete() 对两种
+        transport 的缓存客户端统一调用同名方法——NDJSON 侧缺了这个方法，
+        delete() 会 AttributeError 并跳过控制器删除（沙箱泄漏）。"""
+        while self._pool:
+            sock, _rfile, _ts = self._pool.pop()
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def ping(self) -> dict:
         return self._request({"action": "ping"})[-1]
 

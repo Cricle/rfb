@@ -198,6 +198,7 @@ impl ForkdClient {
         Self::validate_sandbox_id(&x.id)?;
         Self::validate_guest_address(&x.guest_addr)?;
         Ok(ForkdSandbox {
+            guest: sandbox_guest_client(&x, &self.config),
             info: x,
             client: self.clone(),
         })
@@ -314,11 +315,21 @@ impl<'a> CreateSandboxRequest<'a> {
 #[derive(Clone)]
 /// Sandbox managed by forkd.
 pub struct ForkdSandbox {
+    /// Long-lived guest client: the warm NDJSON pool lives behind an Arc, so
+    /// clones share it; building one per `guest()` call emptied the pool on
+    /// every operation.
+    guest: crate::forkd_guest::ForkdGuestClient,
     info: SandboxInfo,
     client: ForkdClient,
 }
 /// Guest client associated with a forkd sandbox.
 pub type ForkdGuest = guest::ForkdGuestClient;
+
+fn sandbox_guest_client(info: &SandboxInfo, config: &ForkdConfig) -> ForkdGuest {
+    let mut g = ForkdGuest::new(info.guest_addr.clone());
+    g.timeout = config.guest_timeout;
+    g
+}
 impl ForkdSandbox {
     /// Return the sandbox identifier.
     pub fn id(&self) -> &str {
@@ -335,9 +346,7 @@ impl ForkdSandbox {
     }
     /// Build a guest client connected to this sandbox's TCP address.
     pub fn guest(&self) -> ForkdGuest {
-        let mut g = ForkdGuest::new(self.info.guest_addr.clone());
-        g.timeout = self.client.config.guest_timeout;
-        g
+        self.guest.clone()
     }
 }
 impl Sandbox for ForkdSandbox {

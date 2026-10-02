@@ -149,7 +149,9 @@ internal sealed class ForkdGuestNdjson
     }
 
     /// <summary>借一条温连接：池中空闲 &lt;1s 的直接复用（零额外 RTT），空闲
-    /// 超龄的直接丢弃重拨（NDJSON 无握手可用作验活，语义同 rust guest.rs）。</summary>
+    /// 超龄的直接丢弃重拨（NDJSON 无握手可用作验活，语义同 rust guest.rs）。
+    /// 新连接先做 agent auth（FORKD_AGENT_TOKEN 非空时首帧必须 auth——
+    /// token 门控的 agent 会拒绝并关掉一切裸业务帧，语义同 java GuestNdjson）。</summary>
     private async Task<(TcpClient, NetworkStream)> BorrowAsync()
     {
         while (_pool.TryDequeue(out var entry))
@@ -164,9 +166,12 @@ internal sealed class ForkdGuestNdjson
         }
 
         var tcp = new TcpClient();
+        NetworkStream stream;
         try
         {
             await ConnectAsync(tcp).ConfigureAwait(false);
+            stream = tcp.GetStream();
+            await AuthenticateAsync(stream).ConfigureAwait(false);
         }
         catch
         {
@@ -174,7 +179,44 @@ internal sealed class ForkdGuestNdjson
             throw;
         }
 
-        return (tcp, tcp.GetStream());
+        return (tcp, stream);
+    }
+
+    /// <summary>agent 连接认证（PROTOCOL.md §2.6）：token 未配置时零写入，
+    /// wire 行为不变；配置后每条新连接的首帧必须是 auth。</summary>
+    private async Task AuthenticateAsync(NetworkStream stream)
+    {
+        var token = Environment.GetEnvironmentVariable("FORKD_AGENT_TOKEN");
+        if (string.IsNullOrEmpty(token))
+        {
+            return;
+        }
+
+        var request = JsonSerializer.Serialize(
+            new Dictionary<string, object?> { ["action"] = "auth", ["token"] = token });
+        await WriteLineAsync(stream, request).ConfigureAwait(false);
+        var reader = new NdjsonLineReader(stream, _timeout);
+        var line = await reader.ReadLineAsync(skipEmpty: true).ConfigureAwait(false)
+            ?? throw new RemoteException("guest closed before response");
+        JsonElement value;
+        try
+        {
+            value = JsonDocument.Parse(line).RootElement.Clone();
+        }
+        catch (JsonException e)
+        {
+            throw new DecodeException($"invalid guest JSON: {e.Message}");
+        }
+        WireJson.CheckRemoteError(value);
+        if (value.ValueKind != JsonValueKind.Object
+            || !value.TryGetProperty("action", out var action)
+            || action.ValueKind != JsonValueKind.String
+            || action.GetString() != "auth"
+            || !value.TryGetProperty("ok", out var ok)
+            || ok.ValueKind != JsonValueKind.True)
+        {
+            throw new RemoteException("guest agent auth failed");
+        }
     }
 
     private void Repay(TcpClient tcp, NetworkStream stream)

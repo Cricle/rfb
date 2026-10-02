@@ -302,12 +302,15 @@ pub struct GuestSandbox {
     http: crate::controller::ForkdClient,
     info: SandboxInfo,
     transport: GuestTransport,
-    timeout: Duration,
     /// Long-lived ZBRT adapter shared by all clones of this facade (holds the
     /// reusable control connection). Constructed eagerly but opens no TCP
     /// connection until the first ZBRT operation.
     #[cfg(feature = "zeroboot")]
     zbrt: zbrt::ZbrtGuest,
+    /// Long-lived NDJSON guest client shared by all clones — holds the warm
+    /// connection pool. A per-call `ForkdGuestClient::new` would empty the
+    /// pool on every operation (the pool is behind an Arc on this struct).
+    ndjson: crate::forkd_guest::ForkdGuestClient,
 }
 
 impl GuestSandbox {
@@ -337,13 +340,15 @@ impl GuestSandbox {
     ) -> Self {
         #[cfg(feature = "zeroboot")]
         let zbrt = zbrt::ZbrtGuest::new(info.guest_addr.clone(), timeout);
+        let ndjson = crate::forkd_guest::ForkdGuestClient::new(info.guest_addr.clone())
+            .with_timeout(timeout);
         Self {
             http,
             info,
             transport,
-            timeout,
             #[cfg(feature = "zeroboot")]
             zbrt,
+            ndjson,
         }
     }
 
@@ -386,10 +391,7 @@ impl GuestSandbox {
 
     fn ops(&self) -> GuestOps {
         match self.transport {
-            GuestTransport::Ndjson => GuestOps::Ndjson(
-                crate::forkd_guest::ForkdGuestClient::new(self.info.guest_addr.clone())
-                    .with_timeout(self.timeout),
-            ),
+            GuestTransport::Ndjson => GuestOps::Ndjson(self.ndjson.clone()),
             #[cfg(feature = "zeroboot")]
             GuestTransport::Zbrt => GuestOps::Zbrt(self.zbrt.clone()),
         }

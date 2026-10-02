@@ -2504,6 +2504,10 @@ async fn restore_and_open(
     // early return skips ensure_parent_snapshot's own hardening, and a
     // permissive mode must fail the restore rather than be tolerated.
     harden_snapshot_permissions(&dir.join("parent"))?;
+    // The cached-snapshot early return also skips boot_and_open's binary
+    // verification: without this check any tampered firecracker binary is
+    // spawned unconditionally on the hot path. Fail closed before the spawn.
+    verify_firecracker(config)?;
     let (firecracker, _kernel, rootfs) = vm_paths(config)?;
     let (work, work_path, work_lock) = create_work_dir()?;
     let mode = RESTORE_MODE.load(Ordering::Relaxed);

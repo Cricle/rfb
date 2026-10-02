@@ -137,6 +137,7 @@ export function frameReader(stream: {
   on(event: 'data', listener: (chunk: Buffer) => void): unknown;
   on(event: 'error', listener: (error: Error) => void): unknown;
   on(event: 'end', listener: () => void): unknown;
+  on(event: 'close', listener: () => void): unknown;
 }): FrameReader {
   let buffer = Buffer.alloc(0);
   const pending: ZbrtFrame[] = [];
@@ -186,6 +187,12 @@ export function frameReader(stream: {
     wake();
   });
   stream.on('end', () => {
+    done = true;
+    wake();
+  });
+  // destroy() 只触发 close 不触发 end：不监听 close，销毁后的 next() 永远
+  // pending（第二次轮询挂死）。
+  stream.on('close', () => {
     done = true;
     wake();
   });

@@ -56,6 +56,11 @@ public final class GuestStream implements AutoCloseable {
         if (event == null) {
             return null;
         }
+        // 合成的 started 是每个 ZBRT turn 的第一个事件（跨语言合同 §2）；
+        // stream == -2 不等于 0，漏掉这个分支会把它映射成假 stderr。
+        if (event.isStarted()) {
+            return StreamEvent.started();
+        }
         if (event.isExit()) {
             return StreamEvent.exit(event.code());
         }

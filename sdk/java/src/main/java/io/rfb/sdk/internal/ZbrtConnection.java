@@ -43,6 +43,17 @@ public final class ZbrtConnection implements AutoCloseable {
     private final InputStream in;
     private final java.io.OutputStream out;
 
+    /** 池借出时刷新读停顿预算（exec 的宽预算不能被上一操作的基础预算
+     * 钉死；反之归还后挂住的读也不该阻塞 75s）。NDJSON 池的
+     * setSoTimeout 是同一模式。 */
+    public void setSocketBudget(java.time.Duration budget) {
+        try {
+            socket.setSoTimeout((int) budget.toMillis());
+        } catch (java.io.IOException e) {
+            throw new TransportError("failed to set socket budget: " + e.getMessage(), e);
+        }
+    }
+
     public ZbrtConnection(InetSocketAddress address, Duration timeout) {
         this.socket = GuestNdjson.connect(address, timeout);
         try {

@@ -383,8 +383,8 @@ impl SharedHostSession {
                 sequence,
             )
             .await?;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
         loop {
             if Instant::now() >= deadline {
                 return Err(VsockClientError::Timeout);
@@ -422,12 +422,16 @@ impl SharedHostSession {
                                     "invalid terminal event payload: {error}"
                                 ))
                             })?;
+                        let chunk = match terminal.data_bytes {
+                            Some(bytes) => bytes,
+                            None => terminal.data.into_bytes(),
+                        };
                         match terminal.stream {
                             crate::session::TerminalStream::Stdout => {
-                                append_capped(&mut stdout, &terminal.data)
+                                append_capped_bytes(&mut stdout, &chunk)
                             }
                             crate::session::TerminalStream::Stderr => {
-                                append_capped(&mut stderr, &terminal.data)
+                                append_capped_bytes(&mut stderr, &chunk)
                             }
                         }
                     }
@@ -442,8 +446,8 @@ impl SharedHostSession {
                         }
                         let mut result: serde_json::Value = serde_json::from_slice(&event.payload)?;
                         if let Some(object) = result.as_object_mut() {
-                            object.insert("stdout".into(), serde_json::Value::String(stdout));
-                            object.insert("stderr".into(), serde_json::Value::String(stderr));
+                            object.insert("stdout".into(), bytes_to_json(&stdout));
+                            object.insert("stderr".into(), bytes_to_json(&stderr));
                         }
                         return Ok(result);
                     }
@@ -593,7 +597,10 @@ impl SharedHostSession {
         content: Vec<u8>,
     ) -> Result<(), VsockClientError> {
         validate_relative_path(path)?;
-        if content.len() > 16 * 1024 * 1024 {
+        // guest 端（workspace_executor/filesystem.rs）按 FILE_RPC_MAX_BYTES
+        // （50 KiB）拒绝写入——宿主侧用同一常量在发送前拒绝，否则任何
+        // (50 KiB, 16 MiB] 的写入都把完整内容送到最远端才吃 100% 失败。
+        if content.len() > FILE_RPC_MAX_BYTES {
             return Err(VsockClientError::InvalidArgument(
                 "file content exceeds size limit".into(),
             ));
@@ -736,21 +743,31 @@ const POISON_MESSAGE: &str = "a previous operation timed out mid-frame; recreate
 /// the host buffer unbounded output for the whole turn deadline; later chunks
 /// are dropped (the turn result stays valid).
 #[cfg(unix)]
-fn append_capped(target: &mut String, data: &str) {
+/// Byte-exact accumulation: TerminalEvent carries binary output in
+/// `data_bytes` (the string form is reserved for valid UTF-8); collapsing it
+/// to "" silently zeroed binary stdout on the RFB1 path.
+fn append_capped_bytes(target: &mut Vec<u8>, data: &[u8]) {
     const CAP: usize = 1024 * 1024;
     if target.len() >= CAP {
         return;
     }
     let remaining = CAP - target.len();
-    if data.len() <= remaining {
-        target.push_str(data);
-        return;
+    let take = data.len().min(remaining);
+    target.extend_from_slice(&data[..take]);
+}
+
+/// Wire convention (UNIFIED_API §4 / forkd_value_bytes): bytes ride a JSON
+/// string when valid UTF-8, else a byte-value array.
+fn bytes_to_json(bytes: &[u8]) -> serde_json::Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => serde_json::Value::String(text.to_owned()),
+        Err(_) => serde_json::Value::Array(
+            bytes
+                .iter()
+                .map(|b| serde_json::Value::Number((*b).into()))
+                .collect(),
+        ),
     }
-    let mut cut = remaining;
-    while cut > 0 && !data.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    target.push_str(&data[..cut]);
 }
 
 #[cfg(unix)]
@@ -943,8 +960,8 @@ impl VsockGuestClient {
                     2,
                 )
                 .await?;
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout: Vec<u8> = Vec::new();
+            let mut stderr: Vec<u8> = Vec::new();
             loop {
                 if Instant::now() >= deadline {
                     return Err(VsockClientError::Timeout);
@@ -982,12 +999,16 @@ impl VsockGuestClient {
                                         "invalid terminal event payload: {error}"
                                     ))
                                 })?;
+                            let chunk = match terminal.data_bytes {
+                                Some(bytes) => bytes,
+                                None => terminal.data.into_bytes(),
+                            };
                             match terminal.stream {
                                 crate::session::TerminalStream::Stdout => {
-                                    append_capped(&mut stdout, &terminal.data)
+                                    append_capped_bytes(&mut stdout, &chunk)
                                 }
                                 crate::session::TerminalStream::Stderr => {
-                                    append_capped(&mut stderr, &terminal.data)
+                                    append_capped_bytes(&mut stderr, &chunk)
                                 }
                             }
                         }
@@ -1003,8 +1024,8 @@ impl VsockGuestClient {
                             let mut result: serde_json::Value =
                                 serde_json::from_slice(&event.payload)?;
                             if let Some(object) = result.as_object_mut() {
-                                object.insert("stdout".into(), serde_json::Value::String(stdout));
-                                object.insert("stderr".into(), serde_json::Value::String(stderr));
+                                object.insert("stdout".into(), bytes_to_json(&stdout));
+                                object.insert("stderr".into(), bytes_to_json(&stderr));
                             }
                             return Ok(result);
                         }
@@ -1155,7 +1176,10 @@ impl VsockGuestClient {
         content: Vec<u8>,
     ) -> Result<(), VsockClientError> {
         validate_relative_path(path)?;
-        if content.len() > 16 * 1024 * 1024 {
+        // guest 端（workspace_executor/filesystem.rs）按 FILE_RPC_MAX_BYTES
+        // （50 KiB）拒绝写入——宿主侧用同一常量在发送前拒绝，否则任何
+        // (50 KiB, 16 MiB] 的写入都把完整内容送到最远端才吃 100% 失败。
+        if content.len() > FILE_RPC_MAX_BYTES {
             return Err(VsockClientError::InvalidArgument(
                 "file content exceeds size limit".into(),
             ));

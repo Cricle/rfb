@@ -553,8 +553,11 @@ internal sealed class ZbrtPool
                 await client.HelloProbeAsync().ConfigureAwait(false);
                 return client;
             }
-            catch (TransportException)
+            catch (RfbException)
             {
+                // Transport 与 Decode 都算验活失败：坏 magic/id 错位的陈旧
+                // 连接必须 Dispose 并继续找，异常冲出去会绕过 Run 的换新
+                // 连接逻辑。
                 client.Dispose();
             }
         }
@@ -573,6 +576,15 @@ internal sealed class ZbrtPool
         else
         {
             client.Dispose();
+        }
+    }
+
+    /// <summary>丢弃所有空闲连接（sandbox 删除/停机）。</summary>
+    internal void Drain()
+    {
+        while (_pool.TryDequeue(out var entry))
+        {
+            entry.Client.Dispose();
         }
     }
 

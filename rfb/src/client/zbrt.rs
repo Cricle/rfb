@@ -73,6 +73,9 @@ pub(super) enum Endpoint {
     Tcp(String),
     /// FC vsock relay UDS, direct: (uds path, guest vsock port).
     Uds(String, u32),
+    /// "uds:<path>@<port>" with an unparseable port: fail the connect with a
+    /// Validation error instead of silently degrading to a nonsense Tcp dial.
+    UdsBadPort,
 }
 
 /// One established guest connection (TCP via a relay, or host-side vsock).
@@ -154,7 +157,9 @@ impl ZbrtGuest {
             match rest.rsplit_once('@') {
                 Some((path, port)) => match port.parse::<u32>() {
                     Ok(port) => Endpoint::Uds(path.to_owned(), port),
-                    Err(_) => Endpoint::Tcp(address),
+                    // "uds:/path@bad" 静默降级成 Tcp 地址只会把错误埋进
+                    // connect —— 校验期就该报出来。
+                    Err(_) => Endpoint::UdsBadPort,
                 },
                 None => Endpoint::Uds(rest.to_owned(), 5000),
             }
@@ -174,6 +179,9 @@ impl ZbrtGuest {
 
     async fn connect(&self) -> Result<GuestConn, RfbError> {
         match &self.endpoint {
+            Endpoint::UdsBadPort => Err(RfbError::Validation(
+                "invalid uds: guest address: port is not a number".to_owned(),
+            )),
             Endpoint::Tcp(addr) => {
                 let stream = tokio::time::timeout(self.timeout, TcpStream::connect(addr))
                     .await
@@ -230,9 +238,13 @@ impl ZbrtGuest {
     async fn write_frame<W: AsyncWrite + Unpin>(
         writer: &mut W,
         frame: &Frame,
+        budget: Duration,
     ) -> Result<(), RfbError> {
-        write_frame_async(writer, frame)
+        // 写侧同样有界（NDJSON 路径每个写都包超时）：一个不再读的 guest
+        // （0 窗口黑洞）会让 16 MiB 的 stdin 写永远 Pending。
+        tokio::time::timeout(budget, write_frame_async(writer, frame))
             .await
+            .map_err(|_| transport_timeout("zbrt write timeout"))?
             .map_err(Self::frame_error)
     }
 
@@ -273,7 +285,7 @@ impl ZbrtGuest {
         let request_id = Self::request_id();
         let hello = crate::protocol::hello_frame(HELLO_CLIENT, request_id)
             .map_err(|_| io_error("failed to encode Hello payload"))?;
-        Self::write_frame(stream, &hello).await?;
+        Self::write_frame(stream, &hello, self.timeout).await?;
         let ack = Self::read_frame(stream, self.timeout).await?;
         Self::check_id(&ack, request_id)?;
         match ack.kind {
@@ -340,7 +352,7 @@ impl ZbrtGuest {
             };
             // Stage 1 — write. Any failure here means the request was never
             // delivered, so a retry is always safe.
-            if let Err(err) = Self::write_frame(&mut stream, &request).await {
+            if let Err(err) = Self::write_frame(&mut stream, &request, self.timeout).await {
                 if attempt == 1 {
                     return Err(err);
                 }
@@ -422,15 +434,30 @@ impl ZbrtGuest {
         // Warm pool: borrow (the re-Hello doubles as a liveness probe — a
         // dead idle connection falls through to a fresh one), run the turn,
         // and return the cleanly-finished connection for reuse.
-        let mut stream = match self.borrow_exec().await {
-            Some(s) => s,
-            None => {
-                let mut s = self.connect().await?;
-                self.handshake(&mut s).await?;
-                s
+        // 写失败 = 请求未送达：control_exchange 同款，换新连接重试一次。
+        let mut stream = None;
+        for attempt in 0..2 {
+            let mut s = match self.borrow_exec().await {
+                Some(s) => s,
+                None => {
+                    let mut s = self.connect().await?;
+                    self.handshake(&mut s).await?;
+                    s
+                }
+            };
+            match Self::write_frame(&mut s, &request, self.timeout).await {
+                Ok(()) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(err) => {
+                    if attempt == 1 {
+                        return Err(err);
+                    }
+                }
             }
-        };
-        Self::write_frame(&mut stream, &request).await?;
+        }
+        let mut stream = stream.expect("write loop guarantees a stream");
         // 长静默 exec：客户端逐帧读预算必须盖住 guest 自己的死线（与 forkd
         // guest.rs exec_in 同款：基础 + 死线 + margin），否则合法的长命令会
         // 先撞客户端读超时——命令还在 guest 里跑，客户端却已报错。
@@ -610,11 +637,14 @@ impl ZbrtGuest {
         };
         let mut stream = guest.connect().await?;
         guest.handshake(&mut stream).await?;
-        Self::write_frame(&mut stream, &request).await?;
+        Self::write_frame(&mut stream, &request, guest.timeout).await?;
         Ok(ZbrtStream {
             stream,
             request_id,
-            timeout: guest.timeout,
+            // 流无 per-turn 死线（timeout_ms:0，guest 不设限）：逐帧读预算
+            // 必须比基础超时宽（NDJSON 流同款 base + margin），否则
+            // tail -f 这类长静默流会被客户端杀死。
+            timeout: guest.timeout + crate::forkd_guest::EXEC_READ_MARGIN,
             started: false,
             terminal: false,
             cancel_sent: false,
@@ -727,7 +757,6 @@ impl ZbrtStream {
         if self.terminal || self.cancel_sent {
             return Ok(());
         }
-        self.cancel_sent = true;
         let payload = Cancel {
             reason: Some("stop".to_owned()),
             target: Some(self.request_id),
@@ -740,7 +769,10 @@ impl ZbrtStream {
             request_id: self.request_id,
             payload,
         };
-        ZbrtGuest::write_frame(&mut self.stream, &frame).await?;
+        // Latch only after the write succeeds (forkd/guest.rs stream 同款):
+        // a failed write must leave stop() retryable, not a permanent no-op.
+        ZbrtGuest::write_frame(&mut self.stream, &frame, self.timeout).await?;
+        self.cancel_sent = true;
         loop {
             let frame = match ZbrtGuest::read_frame(&mut self.stream, self.timeout).await {
                 Ok(frame) => frame,

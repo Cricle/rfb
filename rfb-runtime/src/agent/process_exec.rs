@@ -27,6 +27,10 @@ pub fn command_from(request: &Value) -> io::Result<Command> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "args must not be empty"))?;
     let mut command = Command::new(program);
     command.args(rest);
+    // exec 的子进程默认继承 agent 的全量环境：删掉 agent token，否则子进程
+    // （及守护化的孙进程）能从自身环境读到 token 自行连 8888 认证——会话
+    // 结束后仍持有永久 exec 能力。
+    command.env_remove("FORKD_AGENT_TOKEN");
     let cwd = guest_path(request.get("cwd"), true)?;
     command.current_dir(cwd);
     if let Some(env) = request.get("env") {
@@ -209,7 +213,7 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
             }));
         }
     };
-    Ok(json!({
+    let response = json!({
         "out": bytes_to_wire(&out),
         "err": bytes_to_wire(&err),
         "stdout": bytes_to_wire(&out),
@@ -218,7 +222,52 @@ pub async fn execute(request: &Value) -> io::Result<Value> {
         "error": null,
         "timed_out": false,
         "truncated": truncated
-    }))
+    });
+    Ok(shrink_to_wire_budget(response))
+}
+
+/// 序列化预检：二进制走字节数组形态时每字节最多序列化成 4 个字符
+///（"255,"），别名（out/stdout、err/stderr）再翻倍——128 KiB 的二进制
+/// 捕获可顶破 1 MiB 响应上限，write_json 的整包替换会把 exit_code 一起
+/// 丢掉（客户端看到 fatal error 而非结果）。逐级收缩输出字段（数组减半、
+/// 字符串按码点边界减半）并置 truncated，保住终端形状。
+fn shrink_to_wire_budget(mut response: Value) -> Value {
+    const BUDGET: usize = 1024 * 1024 - 256;
+    for _ in 0..24 {
+        let len = serde_json::to_vec(&response)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if len <= BUDGET {
+            return response;
+        }
+        let mut changed = false;
+        if let Some(object) = response.as_object_mut() {
+            for key in ["out", "stdout", "err", "stderr"] {
+                match object.get_mut(key) {
+                    Some(Value::Array(items)) => {
+                        items.truncate(items.len() / 2);
+                        changed = true;
+                    }
+                    Some(Value::String(text)) => {
+                        let mut cut = text.len() / 2;
+                        while cut > 0 && !text.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        text.truncate(cut);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                object.insert("truncated".into(), Value::Bool(true));
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    response
 }
 
 /// Kill the whole process group of a spawned child (used for timeouts). The

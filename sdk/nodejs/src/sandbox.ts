@@ -920,7 +920,14 @@ class ZbrtGuestStream implements GuestStream {
   }
 
   async nextEvent(): Promise<StreamEvent | null> {
-    const event = await this.#session.nextEvent();
+    let event;
+    try {
+      event = await this.#session.nextEvent();
+    } catch (error) {
+      // Error/Decode/Transport = 终态：连接一并释放，错误原样上抛。
+      this.#conn.close();
+      throw error;
+    }
     if (event === null) {
       // Session over: release the transport socket instead of leaking it
       // until GC/process exit.

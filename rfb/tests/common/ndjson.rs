@@ -91,24 +91,69 @@ pub mod mock_once {
         )
     }
 
-    /// Serve `responses.len()` sequential connections on one listener; the
-    /// k-th connection gets `responses[k]`. Returns the address and a task
-    /// handle resolving to the parsed request lines in order, so tests can
-    /// assert the wire shape after the fact.
+    /// Serve the `responses` request-indexed on one listener: the real
+    /// agent's serve loop carries SEQUENTIAL requests on one connection and
+    /// the SDK warm pool reuses it, so the k-th REQUEST gets `responses[k]`;
+    /// a fresh accept happens only when the client re-dials. Returns the
+    /// address and a task handle resolving to the parsed request lines in
+    /// order, so tests can assert the wire shape after the fact.
     pub async fn mock_ndjson_lines(
         responses: Vec<String>,
     ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock ndjson");
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for response in responses {
-                let (stream, _) = listener.accept().await.expect("accept mock ndjson");
-                requests.push(serve_one(stream, &response).await);
+            // 响应按"请求序号"出队（共享队列）。每条连接一个 task：
+            // 温池把背靠背操作合到一条连接，而 stream/exclusive 会话另拨
+            // 新连接——串行 accept 会卡死在上一条连接的读上。
+            let total = responses.len();
+            let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            while requests.lock().await.len() < total {
+                // select：请求已全部服务完就不再等下一个 accept——池把
+                // 操作合到已有连接上时，悬着的 accept 永远等不到新 dial。
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.expect("accept mock ndjson");
+                        let queue = queue.clone();
+                        let requests = requests.clone();
+                        tokio::spawn(async move {
+                            let (read, mut write) = stream.into_split();
+                            let mut reader = BufReader::new(read);
+                            loop {
+                                // 先读请求、再取响应：先取响应会把空闲池化
+                                // 连接"绑"走一个回答（请求永远不来），真正
+                                // 带着请求来的新连接反而拿不到响应。
+                                let mut line = String::new();
+                                match reader.read_line(&mut line).await {
+                                    Ok(0) | Err(_) => break, // client closed / re-dial
+                                    Ok(_) => {}
+                                }
+                                let response = match queue.lock().await.pop_front() {
+                                    Some(response) => response,
+                                    None => break, // exhausted: close like a real turn end
+                                };
+                                requests
+                                    .lock()
+                                    .await
+                                    .push(serde_json::from_str(line.trim()).unwrap());
+                                write.write_all(response.as_bytes()).await.unwrap();
+                                write.flush().await.unwrap();
+                            }
+                        });
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => continue,
+                }
             }
-            requests
+            // 到达顺序 = 请求顺序（单沙箱顺序测试里跨连接不会交错）。
+            let out = requests.lock().await.clone();
+            out
         });
         (addr, handle)
     }

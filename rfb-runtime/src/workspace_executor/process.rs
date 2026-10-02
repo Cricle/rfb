@@ -53,12 +53,15 @@ impl WorkspaceGuestExecutor {
             if let Some(text) = stdout.as_str() {
                 forward_chunk(&self.event_sink, 0, text.as_bytes());
             } else if let Some(items) = stdout.as_array() {
-                // builtin 的二进制输出（字节数组形态）——逐字节前转。
-                let bytes: Vec<u8> = items
+                // builtin 的二进制输出（字节数组形态）——逐字节前转；
+                // 全有或全无：混入越界值时静默丢字节会悄悄毁数据。
+                let bytes: Option<Vec<u8>> = items
                     .iter()
-                    .filter_map(|v| v.as_u64().and_then(|v| u8::try_from(v).ok()))
+                    .map(|v| v.as_u64().and_then(|v| u8::try_from(v).ok()))
                     .collect();
-                forward_chunk(&self.event_sink, 0, &bytes);
+                if let Some(bytes) = bytes {
+                    forward_chunk(&self.event_sink, 0, &bytes);
+                }
             }
             let exit_code = result.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
             return Ok(json!({

@@ -422,6 +422,10 @@ public sealed class Sandbox : IAsyncDisposable
         {
             _ndjson.Value.DrainPool();
         }
+        else
+        {
+            _zbrt.Value.Drain();
+        }
         await _client.DeleteSandbox(Id).ConfigureAwait(false);
     }
 
