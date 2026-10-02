@@ -153,17 +153,19 @@ describe('ZbrtConnection (fake frame server)', () => {
     conn.close();
   });
 
-  it('a read stall past the client timeout is a TransportError', { timeout: 10_000 }, async () => {
+  it('a read stall past the exec read budget is a TransportError', { timeout: 15_000 }, async () => {
     await startServer(async (socket) => {
       await acceptHello(socket, []);
-      // Hold the turn open with no reply: the idle gap must fail the session
-      // as Transport (PROTOCOL.md §3.4), never hang it.
+      // Hold the turn open with no reply. During a turn the guest is
+      // legitimately silent until its own deadline, so the session fails at
+      // base + guest deadline + EXEC_READ_MARGIN (rust/java/python contract)
+      // — bounded, never a hang (PROTOCOL.md §3.4).
     });
 
     const conn = new ZbrtConnection('127.0.0.1', port, 250);
     await conn.ready();
     await assert.rejects(
-      () => conn.execute(['echo'], '/workspace', Buffer.alloc(0), 5000),
+      () => conn.execute(['echo'], '/workspace', Buffer.alloc(0), 100),
       (error: Error) => error.constructor.name === 'TransportError',
     );
     conn.close();
