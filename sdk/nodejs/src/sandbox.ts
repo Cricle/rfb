@@ -200,6 +200,13 @@ export class Sandbox {
     this.snapshotTag = String(info.snapshot_tag ?? '');
     this.guestAddr = String(info.guest_addr ?? '');
     this.transport = transport;
+    if (transport !== TRANSPORT_ZBRT && String(info.guest_addr ?? '').startsWith('uds:')) {
+      // uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP（TAP 网段），
+      // 留到请求期才失败会把错误埋在深处。
+      throw new ValidationError(
+        'uds: guest addresses require the zbrt transport',
+      );
+    }
     this.#client = client;
     this.#guestTimeoutMs = guestTimeoutMs;
   }

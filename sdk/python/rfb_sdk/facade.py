@@ -236,6 +236,11 @@ class Sandbox:
     def _guest(self):
         timeout_s = self._client.timeout_s
         if self._guest_client_cache is None:
+            if self._transport != "zbrt" and self.guest_addr.startswith("uds:"):
+                # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP，
+                # 留到请求期才失败会把错误埋在深处。
+                raise ValidationError(
+                    "uds: guest addresses require the zbrt transport")
             self._guest_client_cache = (
                 _ZbrtGuestClient(self.guest_addr, timeout_s)
                 if self._transport == "zbrt"
