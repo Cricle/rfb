@@ -443,6 +443,11 @@ must_replace(facade, '''def _zbrt_exec_result(t: tuple) -> ExecResult:
 
 ''', "")
 must_replace(facade, '''        if self._guest_client_cache is None:
+            if self._transport != "zbrt" and self.guest_addr.startswith("uds:"):
+                # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP，
+                # 留到请求期才失败会把错误埋在深处。
+                raise ValidationError(
+                    "uds: guest addresses require the zbrt transport")
             self._guest_client_cache = (
                 _ZbrtGuestClient(self.guest_addr, timeout_s)
                 if self._transport == "zbrt"
@@ -617,6 +622,14 @@ must_replace(f"{N}/src/sandbox.ts", '''  /** exec 温连接池：已 Hello 的�
 ''', "")
 must_replace(f"{N}/src/sandbox.ts",
              "    for (const { conn } of this.#zbrtExecPool.splice(0)) conn.close();\n", "")
+must_replace(f"{N}/src/sandbox.ts", '''    if (transport !== TRANSPORT_ZBRT && String(info.guest_addr ?? '').startsWith('uds:')) {
+      // uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP（TAP 网段），
+      // 留到请求期才失败会把错误埋在深处。
+      throw new ValidationError(
+        'uds: guest addresses require the zbrt transport',
+      );
+    }
+''', "")
 drop_brace_block(f"{N}/src/sandbox.ts", "export const TRANSPORT_ZBRT")
 drop_brace_block(f"{N}/src/sandbox.ts", "function zbrtTimeoutMs")
 drop_brace_block(f"{N}/src/sandbox.ts", "this.transport === TRANSPORT_ZBRT", expect_min=6)
