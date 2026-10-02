@@ -11,7 +11,7 @@
 
   <groupId>example</groupId>
   <artifactId>rfb-java-quickstart</artifactId>
-  <version>0.0.3</version>
+  <version>0.0.4</version>
   <packaging>jar</packaging>
 
   <properties>
@@ -23,7 +23,7 @@
     <dependency>
       <groupId>io.github.cricle</groupId>
       <artifactId>rfb-sdk</artifactId>
-      <version>0.0.3</version>
+      <version>0.0.4</version>
     </dependency>
   </dependencies>
 

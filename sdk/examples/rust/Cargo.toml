@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 # The lib target is named `rfb` (see rfb/Cargo.toml [lib] name); the package
 # alias `rfb` lets us `use rfb::...` in code.
-rfb = { package = "rfb-sdk", version = "0.0.3", features = ["forkd", "zeroboot"] }
+rfb = { package = "rfb-sdk", version = "0.0.4", features = ["forkd", "zeroboot"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [workspace]

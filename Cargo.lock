@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "rfb-ben"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "clap",
  "rfb-sdk",
@@ -2473,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "rfb-rig"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "futures",
  "rfb-sdk",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "rfb-runtime"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "rfb-sdk"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "clap",

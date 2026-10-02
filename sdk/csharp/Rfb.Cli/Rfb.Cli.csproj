@@ -11,7 +11,7 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PackageId>Rfb.Cli</PackageId>
-    <Version>0.0.3</Version>
+    <Version>0.0.4</Version>
     <Authors>Cricle</Authors>
     <Description>RFB CLI (rfb-cli) native binary for linux-x64. Binary-only package.</Description>
     <PackageProjectUrl>https://github.com/Cricle/rfb</PackageProjectUrl>
