@@ -1,6 +1,6 @@
-//! The vsock listener server: one shared runtime for every connection so
-//! sessions survive disconnects and a Cancel from connection B can stop a turn
-//! started on connection A.
+//! The vsock listener server: each connection owns its runtime (converged with
+//! the ZeroBoot guest), so turns from different connections execute in
+//! parallel and a wedged connection can never brick the runtime.
 
 use crate::resources::RuntimeLimits;
 use std::io;
@@ -26,7 +26,7 @@ pub mod dispatcher {
     #[cfg(target_os = "linux")]
     use super::*;
 
-    /// Serve one already-accepted RFB1 guest connection with the shared
+    /// Serve one already-accepted RFB1 guest connection with the caller's
     /// [`RuntimeService`]. This is the testable seam used by vsock listeners
     /// and fake transports; no second protocol or guest implementation exists.
     #[cfg(target_os = "linux")]
@@ -68,11 +68,12 @@ pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
     let listener =
         crate::vsock::bind_guest(crate::config::RuntimeConfig::from_environment().vsock_port)?;
     let codec = FrameCodec::from_limits(&limits);
-    // One runtime shared by every connection so sessions survive disconnects
-    // and a Cancel from connection B can stop a turn started on connection A.
-    let shared = Arc::new(Mutex::new(RuntimeService::from_environment_with_limits(
-        limits,
-    )));
+    // Per-connection runtime, converged with the ZeroBoot guest: each
+    // connection owns its RuntimeService + workspace executor, so turns from
+    // different connections execute in parallel and one wedged connection
+    // cannot brick the runtime for later connections. The workspace size
+    // cache stays shared per-root (see `workspace_executor::shared_size_cache`),
+    // so `max_workspace_bytes` remains a workspace-wide bound across executors.
     // A transient accept error must not terminate the pid-1 guest service:
     // there is no supervisor to restart it, so one bad accept would leave the
     // VM permanently unreachable. Retry with a short backoff instead, and only
@@ -101,11 +102,14 @@ pub async fn run(limits: RuntimeLimits) -> io::Result<()> {
                 continue;
             }
         };
-        let shared = shared.clone();
+        let limits = limits.clone();
         let codec = codec.clone();
         tokio::spawn(async move {
+            let service = Arc::new(Mutex::new(RuntimeService::from_environment_with_limits(
+                limits,
+            )));
             let (reader, writer) = tokio::io::split(stream);
-            let _ = dispatcher::serve(reader, writer, codec, shared).await;
+            let _ = dispatcher::serve(reader, writer, codec, service).await;
         });
     }
 }

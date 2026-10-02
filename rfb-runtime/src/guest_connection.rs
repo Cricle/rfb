@@ -2,7 +2,7 @@
 //! worker thread, and stream responses back while keeping Cancel/Shutdown
 //! servable from other connections.
 
-use crate::codec::{read_frame, write_frame, Frame, FrameCodec, MessageType};
+use crate::codec::{read_frame, write_frame, FrameCodec, MessageType};
 use crate::runtime_service::{GuestEvent, GuestExecutor, RuntimeService};
 use crate::session::{ControlMessage, RuntimeMessage};
 use std::io;
@@ -45,31 +45,18 @@ where
     // this connection lives — the join result is the online panic detector.
     let mut worker_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Frame reading lives in a dedicated task: read_frame is not
-    // cancellation-safe, so the select! below must never drop it mid-frame —
-    // a dropped read loses partially buffered bytes and desyncs the stream
-    // for the rest of the connection. Receiving from the channel IS
-    // cancellation-safe.
+    // Frame reading lives in a dedicated task (see `spawn_frame_reader` for
+    // why: frame reads are not cancellation-safe, so the select! below must
+    // never drop one mid-frame).
     let codec = Arc::new(codec);
-    let (frame_tx, mut frame_rx) =
-        tokio::sync::mpsc::channel::<io::Result<(Frame, ControlMessage)>>(8);
-    let read_codec = Arc::clone(&codec);
-    tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(reader_stream);
-        loop {
-            match read_frame::<_, ControlMessage>(&mut reader, &read_codec).await {
-                Ok(value) => {
-                    if frame_tx.send(Ok(value)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = frame_tx.send(Err(error)).await;
-                    break;
-                }
+    let mut frame_rx =
+        crate::connection_util::spawn_frame_reader(tokio::io::BufReader::new(reader_stream), {
+            let codec = Arc::clone(&codec);
+            move |reader| {
+                let codec = Arc::clone(&codec);
+                Box::pin(async move { read_frame::<_, ControlMessage>(reader, &codec).await })
             }
-        }
-    });
+        });
 
     // Every loop exit is a `break` carrying the I/O outcome — never a bare
     // `return`. An early return would drop `result_rx` while a turn is still

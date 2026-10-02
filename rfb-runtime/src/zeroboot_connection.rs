@@ -136,27 +136,11 @@ where
     let mut terminated_order: std::collections::VecDeque<[u8; 16]> =
         std::collections::VecDeque::new();
 
-    // Frame reading lives in a dedicated task: `read_frame_async` is not
-    // cancellation-safe (header and payload are separate reads), so the
-    // select! below must never drop it mid-frame — a dropped read loses
-    // partially consumed bytes and desyncs the stream for the rest of the
-    // connection. Receiving from the channel IS cancellation-safe.
-    let (frame_tx, mut frame_rx) = mpsc::channel::<io::Result<Frame>>(8);
-    tokio::spawn(async move {
-        let mut reader = reader;
-        loop {
-            match read_frame_async(&mut reader).await {
-                Ok(frame) => {
-                    if frame_tx.send(Ok(frame)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = frame_tx.send(Err(error)).await;
-                    break;
-                }
-            }
-        }
+    // Frame reading lives in a dedicated task (see `spawn_frame_reader` for
+    // why: frame reads are not cancellation-safe, so the select! below must
+    // never drop one mid-frame).
+    let mut frame_rx = crate::connection_util::spawn_frame_reader(reader, |reader| {
+        Box::pin(read_frame_async(reader))
     });
 
     let io_result = loop {

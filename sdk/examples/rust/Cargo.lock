@@ -879,6 +879,8 @@ dependencies = [
 [[package]]
 name = "rfb-runtime"
 version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "226d4c6dbf89997f9adede9b86cd4e58b48bcea0ae4eddbd1e711ec7cb5f0482"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -893,6 +895,8 @@ dependencies = [
 [[package]]
 name = "rfb-sdk"
 version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c149991877795a17b201b21248de8786009a46a2bc0f451f37bc8e7853a5035"
 dependencies = [
  "anyhow",
  "libc",

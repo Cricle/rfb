@@ -25,6 +25,10 @@ pub mod builtin;
 pub mod codec;
 /// Runtime configuration (ports, paths, timeouts — all overridable).
 pub mod config;
+/// Connection-serving plumbing shared by the framed guest transports
+/// (RFB1, ZeroBoot): the frame-read task discipline.
+#[cfg(any(feature = "guest", feature = "zeroboot"))]
+pub(crate) mod connection_util;
 #[cfg(feature = "guest")]
 pub(crate) mod environment_loader;
 /// Minimal fake runtime for tests.
@@ -51,10 +55,12 @@ pub mod guest_entrypoint;
 /// Guest-facing operation DTOs.
 #[cfg(feature = "guest")]
 pub mod guest_protocol;
-/// RFB1 guest vsock listener: one shared runtime for every connection so
-/// sessions survive disconnects and a Cancel from connection B can stop a turn
-/// started on connection A. [`guest_vsock::dispatcher`] is the testable serve
-/// seam (vsock listeners and fake transports hand it stream halves).
+/// RFB1 guest vsock listener. Each connection owns its
+/// [`crate::runtime_service::RuntimeService`] (converged with the ZeroBoot
+/// guest): turns from different connections execute in parallel, and a wedged
+/// connection can never brick the runtime for later connections.
+/// [`guest_vsock::dispatcher`] is the testable serve seam (vsock listeners and
+/// fake transports hand it stream halves and their service of choice).
 #[cfg(feature = "guest")]
 pub mod guest_vsock;
 /// Host-side Firecracker `/vsock` UDS relay and RFB1 client.

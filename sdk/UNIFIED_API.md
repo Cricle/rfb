@@ -75,6 +75,22 @@ VMM 的机制。uds:/ 与 TCP 中继是仅有的两条宿主路径。）
 **池深 = 16（连接数扩展曲线实测）**：8 连接 16k ops/s → 16 连接
 26k（+65%，= 裸帧地板 27269 的 96%）→ 32 平台（25.7k）→ 64 过度订阅
 回落（8k）；16 = 拐点。并发度由调用方驱动（每线程借一条连接）。
+**ZBRT/vsock 的天花板（实测闭环）**：scale 基准（每迭代 ping+ls 两个
+RPC）32 并发 8.4k ops/s = **RPC 吞吐 ≈16.9k/s，已等于裸探针测到的 FC
+vsock 设备天花板（14929）**——软件栈已 wire-bound，零代码余量。builtin
+exec（echo）单连接 p50 ≈ ping（五 SDK 实测 1.0-1.3ms：内建命令在 guest
+serve 内联直出，spawn_blocking 往返已消除）。与 NDJSON（26k，TAP 内核
+数据面）的剩余差距是**设备层**差距：Firecracker 的 vsock 是用户态设备
+仿真，包处理在 VMM 内串行化（并发下 RTT 线性劣化 0.63→2.2ms）；TAP 由
+内核转发，VMM 零参与。这不是代码可修的——vsock 路径的选择依据是
+无 TAP 网卡（零网络配置）而非吞吐。
+**guest 运行时模型（三传输已收敛）**：NDJSON agent、ZBRT、RFB1 vsock
+三种 guest serve 全部是**每连接独立 RuntimeService + workspace executor**
+——turn 跨连接并行，单连接卡死不殃及后续连接；workspace 大小缓存按
+workspace 根共享（进程级注册表），`max_workspace_bytes` 仍是全工作区
+约束。ZBRT 连接上内建命令内联直出（panic 有 catch_unwind 边界，fail
+-closed），真实进程 spawn 仍走阻塞工作线程（有序通道 + join 探测兜底
+panic）；RFB1/ZBRT 共享同一帧读取任务纪律（`connection_util`）。
 **UDS 直拨（性能路径）**：`guest_addr = "uds:<path>[@<guest_port>]"` 直拨
 Firecracker 的 vsock relay UDS——无 TCP/中继跳，rtt 减半（0.6→0.32ms），
 8 并发 fs ≈ 6.4k ops/srust 实测 6388 ops/s（idle 阈值优化后 11479 ops/s）；

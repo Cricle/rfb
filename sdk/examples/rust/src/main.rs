@@ -51,6 +51,21 @@ async fn main() -> Result<(), RfbError> {
     result
 }
 
+/// Placeholder values for the fields a direct attach does not carry.
+fn erased() -> SandboxInfo {
+    SandboxInfo {
+        id: String::new(),
+        snapshot_tag: String::new(),
+        netns: None,
+        created_at_unix: None,
+        guest_addr: String::new(),
+        memory_limit_mib: None,
+        pid: None,
+        has_branched: false,
+        branch_count: 0,
+    }
+}
+
 /// The SAME five calls on either backend.
 async fn flow(sandbox: &GuestSandbox) -> Result<(), RfbError> {
     println!("ping: {}", sandbox.ping().await?);
@@ -73,19 +88,4 @@ async fn flow(sandbox: &GuestSandbox) -> Result<(), RfbError> {
         .collect();
     println!("ls: {names:?}");
     Ok(())
-}
-
-/// Placeholder values for the fields a direct attach does not carry.
-fn erased() -> SandboxInfo {
-    SandboxInfo {
-        id: String::new(),
-        snapshot_tag: String::new(),
-        netns: None,
-        created_at_unix: None,
-        guest_addr: String::new(),
-        memory_limit_mib: None,
-        pid: None,
-        has_branched: false,
-        branch_count: 0,
-    }
 }
