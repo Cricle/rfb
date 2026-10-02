@@ -669,6 +669,11 @@ pub fn build_rootfs(
         // `nproc` is that same multi-call binary under another name, so link
         // it instead of paying another copy: capacity runs use it to report
         // the CPU count the guest actually brought up.
+        // vsockdial 与 nproc 一样走硬链接（零额外镜像字节——guest 镜像的
+        // 余量只够整份拷贝四个 applet，第五份会撑爆 ext2）。
+        let vsockdial = "/bin/vsockdial";
+        clear_inode(&image_path, vsockdial);
+        run_debugfs(&image_path, &format!("ln /bin/netprobe {vsockdial}"), false)?;
         let nproc = "/bin/nproc";
         clear_inode(&image_path, nproc);
         run_debugfs(&image_path, &format!("ln /bin/echo {nproc}"), false)?;

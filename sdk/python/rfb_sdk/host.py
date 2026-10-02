@@ -356,6 +356,63 @@ class TcpVsockRelay:
 # ---------------------------------------------------------------------------
 
 
+def _pump_to_tcp(conn: "socket.socket", target: str, stop_event) -> None:
+    """桥一条 guest→host 的 vsock 连接到宿主 TCP 目标：vsock 侧字节 →
+    TCP 发送、TCP 回包 → vsock 侧。任一侧 EOF/错误即双向收尾。"""
+    try:
+        host, _, port = target.rpartition(":")
+        upstream = socket.create_connection(
+            (host or "127.0.0.1", int(port)), timeout=5)
+    except OSError as e:
+        try:
+            conn.sendall(f"host target unreachable: {e}\n".encode())
+        except OSError:
+            pass
+        conn.close()
+        return
+    upstream.settimeout(None)
+    conn.settimeout(None)
+    stop = stop_event.is_set
+
+    def tcp_to_vsock() -> None:
+        try:
+            while not stop():
+                data = upstream.recv(65536)
+                if not data:
+                    break
+                conn.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    pump = threading.Thread(target=tcp_to_vsock, daemon=True)
+    pump.start()
+    try:
+        while not stop():
+            data = conn.recv(65536)
+            if not data:
+                break
+            upstream.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            upstream.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            upstream.close()
+        except OSError:
+            pass
+        pump.join(timeout=5)
+        conn.close()
+
+
+
 class ZerobootHost:
     """One Firecracker VM bridged onto TCP for direct ZBRT clients.
 
@@ -388,6 +445,8 @@ class ZerobootHost:
         self.mem_size_mib = mem_size_mib
         self._process = None
         self._relay = None
+        # guest→host 方向的暴露表：guest_port → stop 回调（expose()）
+        self._exposures = {}
 
     def alive(self) -> bool:
         try:
@@ -467,6 +526,68 @@ class ZerobootHost:
             self._process.wait()
             self._process = None
         self._kill_stale()
+
+    # -- guest -> host（vsock 反向方向） --------------------------------
+
+    def expose(self, guest_port: int, target: str) -> None:
+        """把宿主的一个 TCP 服务暴露给 guest：guest 里连 vsock
+        (CID 2, `guest_port`)——`/bin/vsockdial <guest_port>` 或任何
+        AF_VSOCK 客户端——即到达 `target`（如 "127.0.0.1:5432"）。
+
+        Firecracker 对 guest→host 方向是**裸字节流**（转发到
+        `<uds>_<guest_port>` 的 AF_UNIX 监听，无 CONNECT 前导——那是
+        host→guest 方向的协议）。逐端口显式暴露：no-egress 合同不被破坏
+        （guest 只能到达运营者点名转发的东西，且仅限宿主本机）。幂等：
+        同端口重复 expose 先收旧的再起新的；`down()`/`unexpose()` 收掉。
+        """
+        if not self.alive():
+            raise RfbError("backend is not up: expose() needs a live VM")
+        uds_path = os.path.join(self.run_dir, "vm", "vsock.sock")
+        reverse_path = f"{uds_path}_{guest_port}"
+        if guest_port in self._exposures:
+            self._exposures.pop(guest_port)()
+        try:
+            os.unlink(reverse_path)
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(reverse_path)
+        server.listen(16)
+        stop_event = threading.Event()
+
+        def acceptor() -> None:
+            server.settimeout(0.5)
+            while not stop_event.is_set():
+                try:
+                    conn, _ = server.accept()
+                except (socket.timeout, TimeoutError):
+                    continue
+                except OSError:
+                    break
+                threading.Thread(
+                    target=_pump_to_tcp,
+                    args=(conn, target, stop_event),
+                    daemon=True,
+                ).start()
+            server.close()
+
+        thread = threading.Thread(target=acceptor, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            stop_event.set()
+            try:
+                os.unlink(reverse_path)
+            except OSError:
+                pass
+
+        self._exposures[guest_port] = stop
+
+    def unexpose(self, guest_port: int) -> None:
+        """撤销一个 expose（停止接受新连接；已建立的连接自然排空）。"""
+        stop = self._exposures.pop(guest_port, None)
+        if stop:
+            stop()
 
 
 # ---------------------------------------------------------------------------
