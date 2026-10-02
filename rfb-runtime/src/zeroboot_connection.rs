@@ -113,7 +113,7 @@ pub async fn serve<R, W>(
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send,
 {
     let mut writer = writer;
     // ZBRT handshake is enforced, never auto-negotiated: the peer must send a
@@ -291,6 +291,8 @@ where
                             &mut worker_active,
                             &mut active_id,
                             &mut requests,
+                            &mut terminated_order,
+                            &mut writer,
                         )
                         .await
                         {
@@ -437,7 +439,8 @@ fn handle_hello(request_id: [u8; 16], payload: &[u8]) -> Option<Frame> {
     })
 }
 
-async fn handle_execute(
+#[allow(clippy::too_many_arguments)] // 与 stream.rs 的六参数聚合同理由：拆聚合结构会让每个调用点的借用图更乱
+async fn handle_execute<W: AsyncWrite + Unpin>(
     service: &Arc<Mutex<RuntimeService>>,
     request_id: [u8; 16],
     payload: &[u8],
@@ -445,6 +448,8 @@ async fn handle_execute(
     worker_active: &mut bool,
     active_id: &mut Option<[u8; 16]>,
     requests: &mut HashMap<[u8; 16], RequestEntry>,
+    terminated_order: &mut std::collections::VecDeque<[u8; 16]>,
+    writer: &mut W,
 ) -> io::Result<(Option<Frame>, Option<tokio::task::JoinHandle<()>>)> {
     let exec = match Execute::decode(payload) {
         Ok(exec) => exec,
@@ -481,6 +486,108 @@ async fn handle_execute(
             }
         }
     };
+    requests.insert(
+        request_id,
+        RequestEntry {
+            request_id: request_id_str.clone(),
+            terminated: false,
+        },
+    );
+    // **builtin 快路径**：in-process 的内建命令（echo/ls/true/…）在
+    // start_turn 里同步完成（亚 100μs CPU）——塞进 spawn_blocking = 每
+    // turn 多付一次阻塞线程池的入池/唤醒往返（本平台 ~0.3-0.5ms，UDS
+    // 并发扩展的实测差距与之一致）。inline：事件经本地收集器直出
+    // forward_event（**绝不走 worker 通道**——serve 此刻阻塞在本调用里，
+    // 通道的 blocking_send 会自己堵自己）；读完在独立 task 里继续缓冲，
+    // serve 只被内建命令的微秒级 CPU 短暂占用。真实进程 spawn 仍走
+    // spawn_blocking（可能阻塞数秒）。
+    if crate::builtin::builtin(
+        &serde_json::from_str::<serde_json::Value>(&turn.prompt).unwrap_or(serde_json::Value::Null),
+    )
+    .is_some()
+    {
+        let collected: Arc<std::sync::Mutex<Vec<_>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let sink = collected.clone();
+            executor.attach_event_sink(Some(Arc::new(move |event| {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(event);
+            })));
+        }
+        // **panic 边界必须保留**：executor 的实现可能 panic（测试注入的
+        // PanickingExecutor 就是）——inline 的 panic 若炸穿 serve 循环 =
+        // 整条连接死 + executor 滞留（worker 路径靠 join 探测防这个）。
+        // catch_unwind 同步捕获 → 走同款 fail-closed（abandon + Error
+        // 帧），且比 join 探测**更快**（无 5s 窗口）。
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.start_turn(&turn)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                let responses = {
+                    let mut runtime = service.lock().await;
+                    runtime.abandon_active_turn()
+                };
+                if let Some(frame) = terminal_frame(request_id, &responses) {
+                    write_frame_async(writer, &frame).await?;
+                }
+                if let Some(entry) = requests.get_mut(&request_id) {
+                    entry.terminated = true;
+                    terminated_order.push_back(request_id);
+                    while terminated_order.len() > TERMINATED_RETENTION {
+                        if let Some(oldest) = terminated_order.pop_front() {
+                            requests.remove(&oldest);
+                        }
+                    }
+                }
+                return Ok((None, None));
+            }
+        };
+        // 先 collect 再循环：lock 的 guard 不得跨 await（MutexGuard 非
+        // Send，会传染整个 serve future）。
+        let collected_events: Vec<_> = collected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect();
+        for event in collected_events {
+            if let Err(error) = forward_event(writer, request_id, &event).await {
+                // inline 的写失败 = 连接级故障：executor 还没归还，先
+                // 归还再上抛（否则工作区执行器永久滞留）。
+                {
+                    let mut runtime = service.lock().await;
+                    runtime.complete_turn(
+                        turn.session_id.clone(),
+                        turn.request_id.clone(),
+                        Err("connection failed mid-turn".into()),
+                        executor,
+                    );
+                }
+                return Err(error);
+            }
+        }
+        let responses = {
+            let mut runtime = service.lock().await;
+            runtime.complete_turn(
+                turn.session_id.clone(),
+                request_id_str.clone(),
+                result,
+                executor,
+            )
+        };
+        if let Some(frame) = terminal_frame(request_id, &responses) {
+            write_frame_async(writer, &frame).await?;
+        }
+        if let Some(entry) = requests.get_mut(&request_id) {
+            entry.terminated = true;
+            terminated_order.push_back(request_id);
+            while terminated_order.len() > TERMINATED_RETENTION {
+                if let Some(oldest) = terminated_order.pop_front() {
+                    requests.remove(&oldest);
+                }
+            }
+        }
+        return Ok((None, None));
+    }
     // Attach a live output sink that queues into the same ordered worker
     // channel as the terminal result, so Output frames always precede the
     // single terminal frame for this request.
@@ -516,10 +623,10 @@ async fn handle_execute(
             terminated: false,
         },
     );
-    let tx = worker_tx.clone();
     // Keep the handle in the serve loop: it is the panic detector for this
     // worker (a panic never delivers a Terminal, so the channel alone cannot
     // clear `worker_active`).
+    let tx = worker_tx.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let result = executor.start_turn(&turn);
         if tx
