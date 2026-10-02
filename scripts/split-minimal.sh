@@ -443,11 +443,6 @@ must_replace(facade, '''def _zbrt_exec_result(t: tuple) -> ExecResult:
 
 ''', "")
 must_replace(facade, '''        if self._guest_client_cache is None:
-            if self._transport != "zbrt" and self.guest_addr.startswith("uds:"):
-                # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP，
-                # 留到请求期才失败会把错误埋在深处。
-                raise ValidationError(
-                    "uds: guest addresses require the zbrt transport")
             self._guest_client_cache = (
                 _ZbrtGuestClient(self.guest_addr, timeout_s)
                 if self._transport == "zbrt"
@@ -500,6 +495,11 @@ t = t.replace('"""Open an interactive stream (transport per the handle; ZBRT has
 p.write_text(t, encoding="utf-8", newline="")
 must_replace(facade, '"stdin is only supported over the ZBRT transport"',
              '"stdin is not supported over the ndjson transport"')
+must_replace(facade, '''        # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP（TAP 网
+        # 段）——构造期拒绝（node 同款），留到请求期才失败会把错误埋在深处。
+        if transport != "zbrt" and info.guest_addr.startswith("uds:"):
+            raise ValidationError("uds: guest addresses require the zbrt transport")
+''', "")
 assert "zbrt" not in Path(facade).read_text(encoding="utf-8").lower(), "facade.py zbrt leftover"
 
 init_py = f"{S}/rfb_sdk/__init__.py"
