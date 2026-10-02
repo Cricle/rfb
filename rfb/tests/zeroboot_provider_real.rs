@@ -160,12 +160,13 @@ fn filesystem_roundtrip_and_escape_rejection() {
 
         // the mode rides the JSON Fs op and is now APPLIED (chmod
         // semantics; it used to be rejected over ZBRT while NDJSON silently
-        // dropped it — write(mode=) never took effect anywhere).
+        // dropped it — write(mode=) never took effect anywhere). APPEND:
+        // the file's payload is grepped for below.
         sandbox
             .write(WriteRequest {
                 path: "/workspace/e2e-probe.txt".into(),
                 data: b"x".to_vec(),
-                append: false,
+                append: true,
                 mode: Some(0o644),
             })
             .await
