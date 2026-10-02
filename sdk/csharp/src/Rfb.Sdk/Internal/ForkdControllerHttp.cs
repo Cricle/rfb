@@ -18,6 +18,10 @@ internal readonly record struct RawResponse(int Status, string Body)
 /// </summary>
 internal sealed class ForkdControllerHttp : IDisposable
 {
+    /// <summary>create 的独立预算：快照恢复（restore+resume）可超客户端
+    /// 默认——超时会孤儿一个已落地的沙箱。</summary>
+    internal static readonly TimeSpan CreateBudget = TimeSpan.FromSeconds(60);
+
     public const string DefaultBaseUrl = "http://127.0.0.1:8889";
 
     private readonly HttpClient _http;
@@ -65,7 +69,8 @@ internal sealed class ForkdControllerHttp : IDisposable
     }
 
     public async Task<JsonElement> CreateSandboxesAsync(object body) =>
-        await SendForJsonAsync(HttpMethod.Post, "/v1/sandboxes", body).ConfigureAwait(false);
+        await SendForJsonAsync(HttpMethod.Post, "/v1/sandboxes", body,
+            CreateBudget).ConfigureAwait(false);
 
     public async Task<JsonElement> ListSandboxesAsync() =>
         await SendForJsonAsync(HttpMethod.Get, "/v1/sandboxes", null).ConfigureAwait(false);
@@ -91,13 +96,13 @@ internal sealed class ForkdControllerHttp : IDisposable
 
     private static string Escape(string segment) => Uri.EscapeDataString(segment);
 
-    private async Task<JsonElement> SendForJsonAsync(HttpMethod method, string path, object? body)
+    private async Task<JsonElement> SendForJsonAsync(HttpMethod method, string path, object? body, TimeSpan? budget = null)
     {
-        var raw = await RawAsync(method, path, body).ConfigureAwait(false);
+        var raw = await RawAsync(method, path, body, budget).ConfigureAwait(false);
         return (await ParseAsync(raw)).RootElement.Clone();
     }
 
-    private async Task<RawResponse> RawAsync(HttpMethod method, string path, object? body = null)
+    private async Task<RawResponse> RawAsync(HttpMethod method, string path, object? body = null, TimeSpan? budget = null)
     {
         using var request = new HttpRequestMessage(method, _baseUrl + path);
         if (_token is not null)
@@ -113,7 +118,17 @@ internal sealed class ForkdControllerHttp : IDisposable
         HttpResponseMessage response;
         try
         {
-            response = await _http.SendAsync(request).ConfigureAwait(false);
+            if (budget is null)
+            {
+                response = await _http.SendAsync(request).ConfigureAwait(false);
+            }
+            else
+            {
+                // create 的独立预算：快照恢复可超客户端默认（超时 = 孤儿一个
+                // 已落地的沙箱）。
+                using var cts = new CancellationTokenSource(budget.Value);
+                response = await _http.SendAsync(request, cts.Token).ConfigureAwait(false);
+            }
         }
         catch (TaskCanceledException)
         {

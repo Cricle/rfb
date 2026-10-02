@@ -101,6 +101,10 @@ public sealed class Sandbox : IAsyncDisposable
     /// <exception cref="DecodeException">The response could not be decoded.</exception>
     public async Task<ExecResult> Exec(IReadOnlyList<string> args, string cwd = "/workspace", double timeoutS = 60.0, byte[]? stdin = null)
     {
+        if (args is null)
+        {
+            throw new ValidationException("argv is required");
+        }
         if (args.Count == 0)
         {
             throw new ValidationException("argv is empty");

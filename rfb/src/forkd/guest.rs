@@ -555,8 +555,17 @@ async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(
         if n == 0 {
             return Ok(None);
         }
-        if buf.len() > MAX_LINE_BYTES || !buf.ends_with(b"\n") {
+        if buf.ends_with(b"\n") {
+            if buf.len() > MAX_LINE_BYTES {
+                return Err(ForkdGuestError::TooLarge);
+            }
+        } else if buf.len() > MAX_LINE_BYTES {
+            // 读取在 take 上限截断且未见换行 = 行超限（截断形态）。
             return Err(ForkdGuestError::TooLarge);
+        } else {
+            // 限内的无换行 EOF = 对端写半行后关闭——不是行超限（排障时会
+            // 误导成"响应过大"），是 Remote 类的对端中断。
+            return Err(ForkdGuestError::Remote("guest closed mid-line".into()));
         }
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
             buf.pop();

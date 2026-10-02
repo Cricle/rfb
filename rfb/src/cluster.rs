@@ -355,7 +355,10 @@ fn classify_create_error(error: &ForkdClientError) -> CreateFault {
         // the same request elsewhere risks a second create.
         ForkdClientError::Remote(_) => CreateFault::Rejected,
         ForkdClientError::Http { status, .. } if status.is_client_error() => CreateFault::Rejected,
-        ForkdClientError::Http { .. } => CreateFault::NodeFault { reconcile: false },
+        // 5xx 落在 create 之后是完全可能的（沙箱已建、响应失败）——与
+        // transport/timeout 同类，标记可 reconcile（reconcile 自身"宁漏勿
+        // 删"，不会误删未落地者）。
+        ForkdClientError::Http { .. } => CreateFault::NodeFault { reconcile: true },
     }
 }
 

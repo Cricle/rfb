@@ -105,7 +105,10 @@ public final class ControllerHttp {
                 .put("prewarm", prewarm)
                 .put("live_fork", liveFork)
                 .put("hugepages", hugepages);
-        HttpResult resp = send("POST", "/v1/sandboxes", Json.write(body), "application/json");
+        // create 的独立预算：快照恢复可超基础 10s（超时 = 孤儿一个已落地
+        // 的沙箱）。
+        HttpResult resp = send("POST", "/v1/sandboxes", Json.write(body),
+                "application/json", 60_000);
         SandboxInfo[] arr = Json.convert(expectOk(resp), SandboxInfo[].class);
         return new ArrayList<>(Arrays.asList(arr));
     }
@@ -153,13 +156,19 @@ public final class ControllerHttp {
      * timeouts are not connection-staleness and are surfaced as-is.
      */
     private HttpResult send(String method, String pathAndQuery, byte[] body, String contentType) {
+        return send(method, pathAndQuery, body, contentType, 0);
+    }
+
+    /** budgetMsMs > 0 = 本调用的独立预算（create 的快照恢复）；0 = 客户端默认。 */
+    private HttpResult send(String method, String pathAndQuery, byte[] body, String contentType,
+                            long budgetMs) {
         boolean idempotent = IDEMPOTENT_METHODS.contains(method);
         IOException lastFailure = null;
         int attempts = idempotent ? 2 : 1;
         for (int attempt = 0; attempt < attempts; attempt++) {
             HttpURLConnection conn = null;
             try {
-                conn = open(method, pathAndQuery, body, contentType);
+                conn = open(method, pathAndQuery, body, contentType, budgetMs);
                 int status = conn.getResponseCode();
                 try (InputStream stream =
                         status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
@@ -181,11 +190,13 @@ public final class ControllerHttp {
     }
 
     /** Open and write one request; the connection stays pooled on success. */
-    private HttpURLConnection open(String method, String pathAndQuery, byte[] body, String contentType)
+    private HttpURLConnection open(String method, String pathAndQuery, byte[] body, String contentType,
+                                   long budgetMs)
             throws IOException {
         URL url = new URL(baseUrl + pathAndQuery);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        int timeoutMs = (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
+        int timeoutMs = (int) Math.min(Integer.MAX_VALUE,
+                budgetMs > 0 ? budgetMs : timeout.toMillis());
         conn.setConnectTimeout(timeoutMs);
         conn.setReadTimeout(timeoutMs);
         conn.setRequestMethod(method);

@@ -524,8 +524,12 @@ class _ZbrtGuestClient:
                 sock.connect(a)
                 # FC 的 vsock relay UDS 不是透明字节流：先 CONNECT 前导。
                 sock.sendall(f"CONNECT {b}\n".encode())
+                # 前导行上限（host.py 同款 256B）：失控/恶意 relay 不能把
+                # 内存逐字节撑爆。
                 line = b""
                 while not line.endswith(b"\n"):
+                    if len(line) > 256:
+                        raise TransportError("vsock relay preamble too long")
                     byte = sock.recv(1)
                     if not byte:
                         raise TransportError(

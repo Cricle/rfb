@@ -92,7 +92,15 @@ impl RfbClient {
         let token = std::env::var("FORKD_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        Self::new(url, token, default_guest_timeout())
+        // 控制器预算与 guest 预算分离：create 的快照恢复实测可超 10s——
+        // 超时会孤儿一个已落地的沙箱（provider 路径的同款结论，60s）。
+        // guest 操作仍用 10s 默认（错误尽早浮出）。
+        const CONTROLLER_BUDGET: Duration = Duration::from_secs(60);
+        let http = crate::controller::ForkdClient::new(url, token, CONTROLLER_BUDGET)?;
+        Ok(Self {
+            http,
+            timeout: default_guest_timeout(),
+        })
     }
 
     /// `GET /v1/snapshots`.

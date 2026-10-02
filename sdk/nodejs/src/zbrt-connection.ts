@@ -249,6 +249,13 @@ export class ZbrtConnection {
           let buf = '';
           const ondata = (d: Buffer): void => {
             buf += d.toString('utf8');
+            // 前导行上限（host.py 同款 256B）：失控/恶意 relay 不能把内存
+            // 逐字节撑爆。
+            if (buf.length > 256) {
+              socket.removeListener('data', ondata);
+              reject(new TransportError('vsock relay preamble too long'));
+              return;
+            }
             const nl = buf.indexOf('\n');
             if (nl >= 0) {
               socket.removeListener('data', ondata);

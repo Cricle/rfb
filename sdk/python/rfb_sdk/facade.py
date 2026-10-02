@@ -208,6 +208,10 @@ class Sandbox:
         self.info = info
         self._client = client
         self._transport = transport
+        # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP（TAP 网
+        # 段）——构造期拒绝（node 同款），留到请求期才失败会把错误埋在深处。
+        if transport != "zbrt" and info.guest_addr.startswith("uds:"):
+            raise ValidationError("uds: guest addresses require the zbrt transport")
         # 每操作重连是毫秒级握手税的主因：health/fs 复用一条控制连接
         # （缓存 guest 客户端；exec/stream 仍每 turn 新连接）。
         self._guest_client_cache = None
@@ -236,11 +240,6 @@ class Sandbox:
     def _guest(self):
         timeout_s = self._client.timeout_s
         if self._guest_client_cache is None:
-            if self._transport != "zbrt" and self.guest_addr.startswith("uds:"):
-                # uds: 是 FC vsock relay 的 ZBRT 直拨形态；NDJSON 只走 TCP，
-                # 留到请求期才失败会把错误埋在深处。
-                raise ValidationError(
-                    "uds: guest addresses require the zbrt transport")
             self._guest_client_cache = (
                 _ZbrtGuestClient(self.guest_addr, timeout_s)
                 if self._transport == "zbrt"

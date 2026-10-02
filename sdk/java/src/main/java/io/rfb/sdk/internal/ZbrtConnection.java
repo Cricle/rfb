@@ -383,10 +383,6 @@ public final class ZbrtConnection implements AutoCloseable {
 
     // ---- plumbing --------------------------------------------------------
 
-    private void sendCancel(String reason, byte[] target16) {
-        cancelRoundTrip(reason, target16);
-    }
-
     /**
      * Send Cancel and wait for the CancelAck. The guest may emit straggler
      * Output/Exit frames for the cancelled turn before the ack; they are

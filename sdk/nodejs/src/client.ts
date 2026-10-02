@@ -8,6 +8,10 @@ import * as validation from './validation.js';
 import { Sandbox, TRANSPORT_NDJSON, TRANSPORT_ZBRT } from './sandbox.js';
 import type { SandboxInfo } from './sandbox.js';
 
+/** create 的独立预算：快照恢复（restore+resume）可超基础 10s——超时会
+ * 孤儿一个已落地的沙箱。 */
+const CREATE_BUDGET_MS = 60_000;
+
 const DEFAULT_URL = 'http://127.0.0.1:8889';
 const DEFAULT_TIMEOUT_S = 10.0;
 const DEFAULT_WAIT_TIMEOUT_S = 60;
@@ -105,12 +109,12 @@ export class RfbClient {
     this.timeoutS = timeoutS;
   }
 
-  async #send(method: string, pathAndQuery: string, body?: unknown): Promise<HttpResponse> {
+  async #send(method: string, pathAndQuery: string, body?: unknown, budgetMs?: number): Promise<HttpResponse> {
     // PROTOCOL.md §1.2: a keep-alive connection may be closed by the peer;
     // retry once for idempotent methods (GET/DELETE/PUT).
     for (let attempt = 0; attempt < 2; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutS * 1000);
+      const timer = setTimeout(() => controller.abort(), budgetMs ?? this.timeoutS * 1000);
       try {
         const response = await fetch(this.baseUrl + pathAndQuery, {
           method,
@@ -273,6 +277,8 @@ export class RfbClient {
     } = options;
     validation.snapshotTag(tag);
     validation.transport(transport);
+    // create 的快照恢复实测可超基础 10s（provider 同款结论：超时 = 孤儿
+    // 一个已落地的沙箱）——create 用独立的 60s 预算。
     const result = await this.#send('POST', '/v1/sandboxes', {
       snapshot_tag: tag,
       n,
@@ -281,7 +287,7 @@ export class RfbClient {
       prewarm,
       live_fork: liveFork,
       hugepages,
-    });
+    }, CREATE_BUDGET_MS);
     const infos = this.#parseJson<SandboxInfo[]>(this.#expectOk(result));
     return infos.map((info) => new Sandbox(info, this, transport, this.timeoutS * 1000));
   }

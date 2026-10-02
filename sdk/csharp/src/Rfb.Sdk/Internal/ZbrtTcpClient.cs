@@ -724,12 +724,17 @@ internal sealed class ZbrtStreamSession : IDisposable
                 case ZbrtKind.Error:
                     {
                         var (_, message) = ZbrtFrameCodec.DecodeError(frame.Payload);
+                        _terminal = true;
                         throw new RemoteException(message);
                     }
                 case ZbrtKind.CancelAck:
                     continue;
                 default:
-                    continue;
+                    // 未知帧 = 流已失步：静默顺延会把 desync 无限放大
+                    //（java 同款抛 DecodeError）。
+                    _terminal = true;
+                    throw new DecodeException(
+                        $"unexpected frame kind {frame.Kind} while streaming");
             }
         }
     }

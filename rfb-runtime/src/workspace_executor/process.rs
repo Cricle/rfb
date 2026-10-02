@@ -17,6 +17,10 @@ use std::time::Duration;
 /// loop still wakes promptly on partial output.
 const READ_CHUNK: usize = 32 * 1024;
 
+/// 收尾窗：直接子进程已退出但管道仍被守护化孙进程持有时的 drain 上限
+///（agent/stream.rs 的 DRAIN_CAP 同款）。
+const DRAIN_CAP: Duration = Duration::from_secs(5);
+
 impl WorkspaceGuestExecutor {
     pub(super) fn exec(&self, value: &Value, cancel: &AtomicBool) -> Result<Value, String> {
         let args = value
@@ -227,12 +231,27 @@ impl WorkspaceGuestExecutor {
             // straddling a READ_CHUNK boundary must not be split into U+FFFD.
             let mut decoders = [Utf8ChunkDecoder::new(), Utf8ChunkDecoder::new()];
             let mut buf = vec![0u8; READ_CHUNK];
+            // 守护化的孙进程继承 stdout/stderr 后，直接子进程已退出但管道
+            // 仍开：给一个有界的收尾窗（超时杀组，管道毫秒级关闭），按真实
+            // 退出码出结果——旧行为会吃满整个 deadline 并把输出与退出码全
+            // 部丢成 "command timed out"。
+            let mut drain_deadline: Option<std::time::Instant> = None;
             while !(done[0] && done[1]) {
                 if cancel.load(Ordering::SeqCst) {
                     return Err("request cancelled".into());
                 }
-                if std::time::Instant::now() >= deadline {
+                let effective = drain_deadline.unwrap_or(deadline);
+                if std::time::Instant::now() >= effective {
+                    if drain_deadline.is_some() {
+                        kill_group(guard.pid);
+                        // 杀组后管道随即 EOF；再给一小段有界窗口排空。
+                        drain_deadline = Some(std::time::Instant::now() + Duration::from_secs(1));
+                        continue;
+                    }
                     return Err("command timed out".into());
+                }
+                if drain_deadline.is_none() && matches!(guard.child.try_wait(), Ok(Some(_))) {
+                    drain_deadline = Some(std::time::Instant::now() + DRAIN_CAP);
                 }
                 let mut poll_fds: [libc::pollfd; 2] = [
                     libc::pollfd {

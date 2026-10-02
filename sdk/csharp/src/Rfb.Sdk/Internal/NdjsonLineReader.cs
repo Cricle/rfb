@@ -27,7 +27,6 @@ internal sealed class NdjsonLineReader
 
     /// <summary>池化复用：每次借出按本操作的实际预算刷新（exec 的宽预算
     /// 不能被首次构造时的基础超时钉死）。</summary>
-    internal void Reset(TimeSpan timeout) => _timeout = timeout;
 
     /// <summary>
     /// Read one \n-terminated line (chunk-scanned, not byte-by-byte). Trailing

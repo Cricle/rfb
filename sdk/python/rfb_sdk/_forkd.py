@@ -14,6 +14,9 @@ from .validation import validate_sandbox_id
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8889"
 DEFAULT_TIMEOUT_S = 10.0
+# create 的快照恢复（restore + resume）实测可超 10s——provider 侧同款结论
+# （forkd/provider.rs: 10s 在 create 上超时会孤儿一个已落地的沙箱）。
+CREATE_TIMEOUT_S = 60.0
 
 
 def _error_message(data: bytes) -> str:
@@ -69,10 +72,16 @@ class _ForkdController:
         with self._lock:
             return self._request_locked(method, path, body)
 
-    def _request_locked(self, method: str, path: str, body=None) -> tuple:
+    def _request_locked(self, method: str, path: str, body=None,
+                        budget_s: float = None) -> tuple:
         conn = self._conn
-        reused = conn is not None
-        if conn is None:
+        reused = conn is not None and budget_s is None
+        if budget_s is not None:
+            # 独立预算（create）：临时连接，不复用也不缓存——快照恢复的
+            # 预算不能被池化连接上的基础超时钉死。
+            conn = self._conn_cls(self._host, self._port, timeout=budget_s)
+            self._conn = None
+        elif conn is None:
             conn = self._connect()
             self._conn = conn
         headers = {"Accept": "application/json"}
@@ -91,6 +100,8 @@ class _ForkdController:
         except (OSError, http.client.HTTPException) as e:
             self._conn = None
             conn.close()
+            if budget_s is not None:
+                raise TransportError(f"forkd request failed: {e}") from e
             if reused and method in ("GET", "HEAD", "DELETE"):
                 # Stale pooled socket (closed by the peer while idle): retry
                 # once on a fresh connection, then fail. Non-idempotent
@@ -103,7 +114,7 @@ class _ForkdController:
                 return self._request_locked(method, path, body)
             raise TransportError(f"forkd request failed: {e}") from e
 
-    def _json_request(self, method: str, path: str, body=None):
+    def _json_request(self, method: str, path: str, body=None, budget_s=None):
         status, data = self._request(method, path, body)
         if not 200 <= status < 300:
             raise HttpStatusError(status, _error_message(data))
@@ -132,7 +143,8 @@ class _ForkdController:
 
     def create_sandboxes(self, request: dict) -> list:
         body = json.dumps(request, separators=(",", ":"))
-        value = self._json_request("POST", "/v1/sandboxes", body=body)
+        value = self._json_request("POST", "/v1/sandboxes", body=body,
+                                   budget_s=CREATE_TIMEOUT_S)
         if not isinstance(value, list):
             raise DecodeError("sandbox list must be a JSON array")
         return value

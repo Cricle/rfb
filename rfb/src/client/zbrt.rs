@@ -537,7 +537,11 @@ impl ZbrtGuest {
             if std::time::Instant::now().duration_since(last_used) < Duration::from_secs(1) {
                 return Some(stream);
             }
-            if self.handshake(&mut stream).await.is_ok() {
+            // 验活握手用短预算：N 条"黑洞型"陈旧连接（不回不关）曾会在
+            // 借出路径上串行阻塞 N × 完整超时。2s 足够覆盖一个 RTT 的
+            // Hello/HelloAck，黑洞连接被快速跳过。
+            let probe = tokio::time::timeout(Duration::from_secs(2), self.handshake(&mut stream));
+            if matches!(probe.await, Ok(Ok(()))) {
                 return Some(stream);
             }
         }
