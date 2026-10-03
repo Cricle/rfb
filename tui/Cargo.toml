@@ -1,0 +1,23 @@
+[package]
+name = "rfb-tui"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Terminal agent over the RFB sandbox (ratatui + adk-rust)"
+
+[workspace]
+# 独立于 rfb 工作区（TUI 依赖树不进 CI 门禁）。
+
+[dependencies]
+rfb-sdk = { path = "../rfb", features = ["forkd", "zeroboot"] }
+rfb-adk = { path = "../rfb-adk" }
+adk-rust = { version = "2.2.0", default-features = false, features = ["minimal", "openai", "tools"] }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+serde_json = "1"
+futures = "0.3"
+
+[profile.release]
+strip = true

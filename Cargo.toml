@@ -1,11 +1,14 @@
 [workspace]
 members = ["rfb", "rfb-adk", "rfb-runtime", "ben"]
+# tui/ 是独立 crate（TUI 依赖树不进 CI 门禁）。
+exclude = ["tui"]
 resolver = "2"
 
 [workspace.package]
 version = "0.0.4"
 edition = "2021"
-rust-version = "1.93"
+# 1.95：adk-rust 2.2（rfb-adk）要求 edition 2024。
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 # Replace before publishing this workspace.
 repository = "https://github.com/Cricle/rfb"
