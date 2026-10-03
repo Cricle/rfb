@@ -21,3 +21,9 @@ tokio = { version = "1", default-features = false, features = ["time"] }
 [dev-dependencies]
 futures = "0.3"
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# eval-real 测试（tests/agent_eval.rs，真机三重门）需要 zeroboot provider；
+# 仅测试图启用，库构建保持 core。
+rfb = { workspace = true, features = ["zeroboot"] }
+
+[features]
+eval-real = []
