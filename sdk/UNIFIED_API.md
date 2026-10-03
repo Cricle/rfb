@@ -256,10 +256,14 @@ Python SDK 额外携带**宿主侧编排**（`rfb_sdk/host.py`，纯标准库）
   支持 `;`/换行、`&&`/`||`、管道、重定向（`>`/`>>`/`<`/`2>&1` 等）、引号、
   `$?`、内建 `exit/echo/cd/pwd/true/false/:`；**不支持**变量展开（除 `$?`）、
   循环、命令替换、glob，且 **只接受 `sh -c SCRIPT`**（`sh SCRIPT` 与交互
-  模式报 "interactive shell is not supported"）。agent 工具调用必须用 -c
-  形式。镜像内的 applet 就这些：`sh/bash/sleep/echo/true/false/netprobe/
-  vsockdial/nproc`——没有 rm/cat/ls/tail/wc（ls/cat 走 FS RPC），脚本里
-  `rm` 要换成 `: > file` 截断、读文件走 read RPC。
+  模式报 "interactive shell is not supported"）。agent 工具调用可用 -c
+  形式或脚本文件（**sh FILE 与 shebang 脚本均支持**——复杂任务电池 X1
+  的教训：此前 shebang 脚本在 guest 里永远跑不起来，kernel shebang 机制
+  调 `/bin/sh <文件>` 而 sh 只认 -c；已支持文件模式）。镜像内的 applet：
+  `sh/bash/sleep/echo/true/false/netprobe/vsockdial/nproc`——没有
+  rm/cat/ls/tail/wc（ls/cat 走 FS RPC），脚本里 `rm` 要换成 `: > file`
+  截断、读文件走 read RPC。覆写文件**保留原权限**（write_atomic 原子
+  替换曾把 chmod +x 的脚本在下次编辑后打回 0644——已修复）。
 
 - **ZBRT 的 exec deadline 命中**：NDJSON 返回 `ExecResult(timed_out=True,
   exit_code=-1)`；ZBRT 走 guest `Error` 帧（"command timed out"）→ 五 SDK

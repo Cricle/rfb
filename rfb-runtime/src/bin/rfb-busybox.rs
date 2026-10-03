@@ -42,6 +42,19 @@ mod imp {
                     let script = args.get(1).cloned().unwrap_or_default();
                     std::process::exit(run_script(&script));
                 }
+                // `sh FILE [args...]`：脚本文件模式。kernel 的 shebang 机制
+                // 正是调 `/bin/sh <脚本>`——agent 工作流写出的脚本必须能
+                // 这么跑，缺了它 shebang 脚本在这个 guest 里永远无法执行。
+                if let Some(file) = args.first() {
+                    match std::fs::read_to_string(file) {
+                        Ok(script) => std::process::exit(run_script(&script)),
+                        Err(error) => {
+                            eprintln!("sh: {file}: {error}");
+                            // POSIX：找不到/打不开 = 127（命令不存在语义）。
+                            std::process::exit(127);
+                        }
+                    }
+                }
                 eprintln!("busybox: interactive shell is not supported; use sh -c SCRIPT");
                 std::process::exit(2);
             }
@@ -608,7 +621,7 @@ mod imp {
         let program_path =
             resolve_program(program).ok_or_else(|| format!("{program}: not found"))?;
         let (stdin, stdout, stderr) = build_stdio(command, stdin_chan, stdout_chan)?;
-        ProcCommand::new(program_path)
+        ProcCommand::new(&program_path)
             .args(&command.words[1..])
             .stdin(stdin)
             .stdout(stdout)

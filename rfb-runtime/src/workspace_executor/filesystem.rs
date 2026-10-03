@@ -163,9 +163,18 @@ fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
     tmp_name.push(format!(".{}.{}.tmp", nanos, std::process::id()));
     let mut tmp = path.to_path_buf();
     tmp.set_file_name(tmp_name);
+    // 原子替换会换掉目录项——原文件的权限随旧 inode 一起消失（一个被
+    // chmod +x 过的脚本在下次编辑后就不再是可执行的）。覆写已存在文件
+    // 时把它的 mode 复制到临时文件上，rename 后语义不变。
+    let preserve_mode = fs::metadata(path).ok().map(|meta| meta.permissions());
     let result = fs::File::create(&tmp)
         .and_then(|mut file| file.write_all(content))
-        .and_then(|_| fs::rename(&tmp, path));
+        .and_then(|_| {
+            if let Some(mode) = &preserve_mode {
+                fs::set_permissions(&tmp, mode.clone())?;
+            }
+            fs::rename(&tmp, path)
+        });
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }

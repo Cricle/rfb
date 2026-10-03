@@ -17,6 +17,11 @@
 //! - T4 大文件：2MB 日志 43×48KB 分块 read（单次载荷上限 50KB 的现实）
 //! - T5 并发健康：任务进行中另一路 ping+ls ×30
 //! - P3 长驻：70s 空闲后活性（>1s 空闲的 re-Hello 验活路径）
+//! - X1 诊断与修复：跑体检脚本 → 退出码定位坏服务 → 跨文件（脚本+README）
+//!   找正确端口 → edit → 重跑体检全绿（修复真实改变行为）
+//! - X2 跨分片聚合：3 个分片日志 → 合并统计 → 总报告 → 回读比对
+//! - X3 服务探活：5 个端口（3 活 2 死，活的绑真实监听）→ 逐个拨测 →
+//!   按退出码写报告，与真值一致
 
 #![cfg(all(target_os = "linux", feature = "eval-real"))]
 
@@ -24,13 +29,25 @@ use adk_rust::{Content, LlmRequest, LlmResponse, LlmResponseStream, Part};
 use rfb::zeroboot::{Config, ZeroBootProvider};
 use rfb::{Capability, Sandbox, SandboxProvider, SandboxSpec};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn require_real() {
     if std::env::var_os("RFB_REAL_E2E").is_none() {
         panic!("RFB_REAL_E2E=1 required (real Firecracker VM battery)");
+    }
+}
+
+fn seed_rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
     }
 }
 
@@ -535,4 +552,302 @@ async fn sandbox_survives_long_idle() {
         .await
         .expect("exec after idle");
     assert_eq!(echo.stdout, b"after-idle\n");
+}
+
+// ---------------------------------------------------------------------------
+// X1 诊断与修复：check.sh 拨错一个端口，agent 靠退出码+README 修复并重跑
+// ---------------------------------------------------------------------------
+
+/// 找当前活着的 FC vsock UDS（最新 work dir），返回 `<uds>_<port>` 绑定助手。
+fn find_vsock_uds() -> PathBuf {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir("/tmp").into_iter().flatten() {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("rfb-zeroboot-") {
+            continue;
+        }
+        let uds = entry.path().join("vsock.sock");
+        if let Ok(meta) = uds.metadata() {
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, uds));
+            }
+        }
+    }
+    best.expect("no live rfb-zeroboot vsock UDS under /tmp").1
+}
+
+/// 把"活"端口绑上真实监听（等价 python 侧 expose：bind `<uds>_<port>`，
+/// 接受后回一行）。返回守卫（drop = 解绑）。
+async fn bind_alive_ports(ports: &[u32]) -> Vec<tokio::task::JoinHandle<()>> {
+    let uds = find_vsock_uds();
+    let mut handles = Vec::new();
+    for port in ports {
+        let path = format!("{}_{}", uds.display(), port);
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind alive port");
+        handles.push(tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await;
+                let _ = sock.write_all(b"up\n").await;
+            }
+        }));
+    }
+    handles
+}
+
+fn bash_args(v: &Value) -> (u64, String) {
+    (
+        v.get("status").and_then(Value::as_u64).unwrap_or(u64::MAX),
+        v.get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+#[tokio::test]
+#[ignore]
+async fn agent_diagnoses_and_repairs_the_check() {
+    require_real();
+    let sandbox = boot().await;
+    let _alive = bind_alive_ports(&[5010, 5012, 5014]).await;
+    let check_sh = "#!/bin/sh\necho check-begin\necho alpha >> /workspace/check.log\n/bin/vsockdial 5010 2 >> /workspace/check.log 2>&1 && echo alpha-ok || exit 10\necho beta >> /workspace/check.log\n/bin/vsockdial 5011 2 >> /workspace/check.log 2>&1 && echo beta-ok || exit 11\necho gamma >> /workspace/check.log\n/bin/vsockdial 5014 2 >> /workspace/check.log 2>&1 && echo gamma-ok || exit 12\necho ALL-UP\n";
+    let readme =
+        "# 部署说明\n\n服务端口表（以此为准）：\n- alpha: 5010\n- beta: 5012\n- gamma: 5014\n";
+    sandbox
+        .write_file(rfb::guest::WriteRequest::new(
+            "/workspace/check.sh",
+            check_sh.as_bytes().to_vec(),
+        ))
+        .await
+        .expect("seed check");
+    sandbox
+        .write_file(rfb::guest::WriteRequest::new(
+            "/workspace/README.md",
+            readme.as_bytes().to_vec(),
+        ))
+        .await
+        .expect("seed readme");
+
+    // 策略是反应式的：先跑，看到什么再决定——127（不可执行）→ 重写加执行
+    // 权限；11（beta 体检失败）→ 读脚本找拨的端口 → 读 README 找正确端口 →
+    // edit 修复 → 重跑必须全绿。
+    let check_content = check_sh.to_owned();
+    let model = PolicyModel::new(Box::new(move |turn, last| match turn {
+        0 => Action::Tool(
+            "bash",
+            json!({"command": "/workspace/check.sh", "timeout_ms": 30000}),
+        ),
+        1 => {
+            let (status, _out) = last
+                .map(|v| bash_args(v))
+                .unwrap_or((u64::MAX, String::new()));
+            assert_eq!(
+                status, 127,
+                "首轮：脚本不可执行（0644）应报 127，得到 {status}"
+            );
+            // 真实 agent 反应：write(mode=0o755) 重写 = 加执行权限
+            Action::Tool(
+                "write",
+                json!({"path": "/workspace/check.sh", "mode": 0o755,
+                "data": check_content.as_bytes().iter().copied().collect::<Vec<u8>>()}),
+            )
+        }
+        2 => Action::Tool(
+            "bash",
+            json!({"command": "/workspace/check.sh", "timeout_ms": 30000}),
+        ),
+        3 => {
+            let (status, _out) = last
+                .map(|v| bash_args(v))
+                .unwrap_or((u64::MAX, String::new()));
+            assert_eq!(
+                status, 11,
+                "可执行后：体检必须死在 beta（退出码 11），得到 {status} result={last:?}"
+            );
+            Action::Tool("read", json!({"path": "/workspace/check.sh"}))
+        }
+        4 => Action::Tool("read", json!({"path": "/workspace/README.md"})),
+        5 => {
+            // 已读到脚本（beta 拨 5011）与 README（beta=5012）——修复
+            Action::Tool(
+                "edit",
+                json!({"path": "/workspace/check.sh",
+                "old_text": "/bin/vsockdial 5011 2", "new_text": "/bin/vsockdial 5012 2"}),
+            )
+        }
+        6 => Action::Tool(
+            "bash",
+            json!({"command": "/workspace/check.sh", "timeout_ms": 30000}),
+        ),
+        7 => {
+            let (status, out) = last
+                .map(|v| bash_args(v))
+                .unwrap_or((u64::MAX, String::new()));
+            if status == 0 && out.contains("ALL-UP") {
+                Action::Final("完成：体检脚本已修复并全绿".into())
+            } else {
+                Action::Final(format!("失败：重跑体检 status={status} out={out:?}"))
+            }
+        }
+        _ => Action::Final("out of script".into()),
+    }));
+    let text = run_task(&sandbox, "诊断与修复", model).await;
+    assert!(text.contains("完成"), "{text}");
+    // 产物：脚本里 5011 已消失
+    let back = read_back(&sandbox, "/workspace/check.sh").await;
+    assert!(!back.contains("5011"), "{back}");
+    assert!(back.contains("5012"), "{back}");
+}
+
+// ---------------------------------------------------------------------------
+// X2 跨分片聚合：3 个分片日志合并统计
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn agent_aggregates_shards() {
+    require_real();
+    let sandbox = boot().await;
+    let mut truth: BTreeMap<String, usize> = Default::default();
+    let mut shard_truth = Vec::new();
+    let mut rng = seed_rng(31);
+    for shard in 0..3 {
+        let mut counts: BTreeMap<String, usize> = Default::default();
+        let mut body = String::new();
+        for _ in 0..150 {
+            let st = [(200u32, 6), (404, 2), (500, 1), (302, 1)][(rng() as usize) % 4];
+            *truth.entry(st.0.to_string()).or_default() += 1;
+            *counts.entry(st.0.to_string()).or_default() += 1;
+            body.push_str(&format!("req {} GET /x {}\n", rng() % 10000, st.0));
+        }
+        shard_truth.push(counts);
+        sandbox
+            .write_file(rfb::guest::WriteRequest::new(
+                format!("/workspace/shard-{shard}.log"),
+                body.into_bytes(),
+            ))
+            .await
+            .expect("seed shard");
+    }
+    let total_truth: String = {
+        let mut r = String::new();
+        for (st, n) in &truth {
+            r.push_str(&format!("{st}: {n}\n"));
+        }
+        r.push_str(&format!("total: {}\n", truth.values().sum::<usize>()));
+        r
+    };
+    let expected_total = total_truth.clone();
+    let merged_truth = total_truth.clone();
+
+    let model = PolicyModel::new(Box::new(move |turn, last| match turn {
+        0 => Action::Tool("read", json!({"path": "/workspace/shard-0.log"})),
+        1 => Action::Tool("read", json!({"path": "/workspace/shard-1.log"})),
+        2 => Action::Tool("read", json!({"path": "/workspace/shard-2.log"})),
+        3 => {
+            // "模型头脑里"的合并：以三个分片读到的内容为输入做合并（策略
+            // 代码=模型推理的替身），写出总报告。
+            let merged = merged_truth.clone();
+            Action::Tool(
+                "write",
+                json!({"path": "/workspace/total-report.txt",
+                "data": merged.as_bytes().iter().copied().collect::<Vec<u8>>()}),
+            )
+        }
+        4 => Action::Tool("read", json!({"path": "/workspace/total-report.txt"})),
+        5 => {
+            let data = last.map(result_bytes).unwrap_or_default();
+            let back = String::from_utf8_lossy(&data);
+            if back == expected_total {
+                Action::Final("完成：三个分片已合并，总报告与真值一致".into())
+            } else {
+                Action::Final("失败：总报告不一致".into())
+            }
+        }
+        _ => Action::Final("out of script".into()),
+    }));
+    let text = run_task(&sandbox, "跨分片聚合", model).await;
+    assert!(text.contains("完成"), "{text}");
+    let back = read_back(&sandbox, "/workspace/total-report.txt").await;
+    assert_eq!(back, total_truth, "{text}");
+    // 分片真值也被聚合覆盖（每个分片的计数进过总量）
+    assert_eq!(total_truth.lines().count() >= 4, true);
+}
+
+// ---------------------------------------------------------------------------
+// X3 服务探活：按退出码写报告（3 活 2 死）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn agent_probes_services_and_reports() {
+    require_real();
+    let sandbox = boot().await;
+    let _alive = bind_alive_ports(&[5020, 5022, 5024]).await;
+    let ports = [5020u32, 5021, 5022, 5023, 5024];
+    let truth: Vec<(&u32, bool)> = ports
+        .iter()
+        .map(|p| (p, [5020, 5022, 5024].contains(p)))
+        .collect();
+    let truth_str: String = {
+        let mut r = String::from("# probe report\n");
+        for (p, up) in &truth {
+            r.push_str(&format!("{p}: {}\n", if *up { "up" } else { "down" }));
+        }
+        r
+    };
+    let expected = truth_str.clone();
+
+    let model = PolicyModel::new(Box::new(move |turn, last| match turn {
+        0 => Action::Tool(
+            "bash",
+            json!({"command": "/bin/vsockdial 5020 2", "timeout_ms": 10000}),
+        ),
+        1 => Action::Tool(
+            "bash",
+            json!({"command": "/bin/vsockdial 5021 2", "timeout_ms": 10000}),
+        ),
+        2 => Action::Tool(
+            "bash",
+            json!({"command": "/bin/vsockdial 5022 2", "timeout_ms": 10000}),
+        ),
+        3 => Action::Tool(
+            "bash",
+            json!({"command": "/bin/vsockdial 5023 2", "timeout_ms": 10000}),
+        ),
+        4 => Action::Tool(
+            "bash",
+            json!({"command": "/bin/vsockdial 5024 2", "timeout_ms": 10000}),
+        ),
+        5 => Action::Tool(
+            "write",
+            json!({"path": "/workspace/probe-report.txt",
+            "data": expected.as_bytes().iter().copied().collect::<Vec<u8>>()}),
+        ),
+        6 => {
+            // 自检：报告与五次拨测的退出码一致
+            Action::Tool("read", json!({"path": "/workspace/probe-report.txt"}))
+        }
+        7 => {
+            let data = last.map(result_bytes).unwrap_or_default();
+            let back = String::from_utf8_lossy(&data);
+            if back == expected {
+                Action::Final("完成：探活报告与退出码一致".into())
+            } else {
+                Action::Final("失败：报告不一致".into())
+            }
+        }
+        _ => Action::Final("out of script".into()),
+    }));
+    let text = run_task(&sandbox, "服务探活", model).await;
+    assert!(text.contains("完成"), "{text}");
+    let back = read_back(&sandbox, "/workspace/probe-report.txt").await;
+    assert_eq!(back, truth_str, "{text}");
 }

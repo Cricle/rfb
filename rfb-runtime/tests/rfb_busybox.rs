@@ -4,6 +4,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command as ProcCommand;
 
@@ -264,4 +265,41 @@ fn pipeline_stage_spawn_failure_reaps_started_stages() {
         leaked.is_empty(),
         "pipeline spawn failure must kill and reap started stages; leaked: {leaked:?}"
     );
+}
+
+#[test]
+fn sh_file_mode_runs_a_script_file() {
+    // `sh FILE`：kernel 的 shebang 机制调 `/bin/sh <脚本>`——没有这个模式
+    // guest 里的 shebang 脚本永远无法执行。
+    let script = temp_path("sh-file-mode.sh");
+    std::fs::write(&script, "echo from-file\necho second\n").expect("write");
+    let out = run_applet("sh", &[script.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from-file\nsecond\n");
+}
+
+#[test]
+fn shebang_script_executes_via_the_kernel() {
+    // 直接 exec（kernel shebang → /bin/sh <文件>）：与 guest 里 bash 工具
+    // 执行 /workspace/*.sh 的路径完全一致。
+    let script = temp_path("shebang.sh");
+    std::fs::write(&script, "#!/bin/sh\necho shebang-ok\n").expect("write");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = ProcCommand::new(&script).output().expect("exec script");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "shebang-ok\n");
+}
+
+#[test]
+fn sh_missing_file_reports_127() {
+    let out = run_applet("sh", &["/nonexistent/script.sh"]);
+    assert_eq!(out.status.code(), Some(127));
 }
