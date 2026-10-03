@@ -6,15 +6,20 @@
 //! 可见。`stop` 退役 VM 并注销工具。宿主进程在默认状态下零 VM、零成本。
 //!
 //! 设计要点：
-//! - 一个会话至多一个沙箱（重复 start 返回现有句柄的描述——幂等）；
+//! - 一个会话至多一个沙箱：start 在启动互斥锁内完成 check+boot+注册，
+//!   并发 start 不会双启动（第二个等到锁后走 reuse 幂等返回）；
 //! - start 失败（坏路径/无 KVM）= 错误数据回给模型，循环不中断；
-//! - 沙箱工具每次 boot 后重新构建（它们捕获沙箱句柄）。
+//! - 沙箱工具每次 boot 后重新构建（它们捕获沙箱句柄）；stop 后这些工具
+//!   即刻注销——但在**同轮内**已被模型拿到的分发表快照仍持有旧句柄，
+//!   旧沙箱要等该轮结束才真正 drop（延迟一个轮内窗口，文档化语义）。
 
 use crate::loop_agent::Toolset;
 use rfb::zeroboot::{Config, ZeroBootProvider};
 use rfb::{Capability, Sandbox, SandboxProvider, SandboxSpec};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,23 +38,19 @@ pub struct SandboxSetup {
     pub boot_timeout: Duration,
 }
 
-impl SandboxSetup {
-    /// 从仓库默认布局取路径（resx/ 与 examples 资产，相对 cwd）。
-    pub fn from_repo_defaults() -> Self {
-        Self {
-            kernel: PathBuf::from("resx/kernel/vmlinux-arcbox-0.0.24"),
-            rootfs: PathBuf::from("resx/rootfs/zeroboot-zbrt.ext4"),
-            firecracker: PathBuf::from("sdk/examples/python/assets/firecracker"),
-            guest_port: 5000,
-            boot_timeout: Duration::from_secs(30),
-        }
-    }
-}
+/// 沙箱引导工厂：返回活的沙箱或失败原因（失败作为错误数据回给模型）。
+pub type SandboxBoot = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<Arc<dyn Sandbox>, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
-/// 会话的沙箱状态：`None` = 没有沙箱（默认）。
+/// 会话的沙箱状态：`None` = 没有沙箱（默认）。`boot_lock` 串行化
+/// check+boot+注册的临界区——两个并发 start 只会引导一个 VM。
 #[derive(Default)]
 pub struct SandboxState {
     sandbox: Mutex<Option<Arc<dyn Sandbox>>>,
+    boot_lock: tokio::sync::Mutex<()>,
 }
 
 impl SandboxState {
@@ -65,11 +66,53 @@ impl SandboxState {
     }
 }
 
+fn default_boot(setup: &SandboxSetup) -> SandboxBoot {
+    let setup = setup.clone();
+    Arc::new(move || {
+        let provider = ZeroBootProvider::new(Config {
+            kernel: Some(setup.kernel.clone()),
+            rootfs: Some(setup.rootfs.clone()),
+            firecracker: Some(setup.firecracker.clone()),
+            guest_port: setup.guest_port,
+            timeout: setup.boot_timeout,
+        });
+        Box::pin(async move {
+            let boxed = provider
+                .create(SandboxSpec {
+                    capabilities: vec![
+                        Capability::Execute,
+                        Capability::Health,
+                        Capability::ReadFile,
+                        Capability::WriteFile,
+                    ],
+                    ..SandboxSpec::default()
+                })
+                .await
+                .map_err(|e| format!("sandbox boot failed: {e}"))?;
+            let sandbox: Arc<dyn Sandbox> = boxed.into();
+            if !sandbox.ping().await.map(|h| h.healthy).unwrap_or(false) {
+                return Err("sandbox booted but the guest did not answer ping".into());
+            }
+            Ok(sandbox)
+        })
+    })
+}
+
 /// 把「按需沙箱」的两个元工具装进工具集。调用后：模型只看到
 /// `sandbox_start`/`sandbox_stop`；start 成功后七个沙箱工具即时可见。
 pub fn install_session_tools(setup: SandboxSetup, toolset: &Toolset, state: Arc<SandboxState>) {
+    install_session_tools_with_boot(default_boot(&setup), toolset, state);
+}
+
+/// 同 [`install_session_tools`]，但引导工厂由调用方注入（测试用假工厂；
+/// 生产用 [`SandboxSetup`] 走 ZeroBootProvider）。
+pub fn install_session_tools_with_boot(
+    boot: SandboxBoot,
+    toolset: &Toolset,
+    state: Arc<SandboxState>,
+) {
     toolset.register(Arc::new(SandboxStartTool {
-        setup,
+        boot,
         toolset: toolset.clone(),
         state: state.clone(),
     }));
@@ -80,7 +123,7 @@ pub fn install_session_tools(setup: SandboxSetup, toolset: &Toolset, state: Arc<
 }
 
 struct SandboxStartTool {
-    setup: SandboxSetup,
+    boot: SandboxBoot,
     toolset: Toolset,
     state: Arc<SandboxState>,
 }
@@ -110,44 +153,20 @@ impl adk_rust::Tool for SandboxStartTool {
         _ctx: Arc<dyn adk_rust::ToolContext>,
         _args: Value,
     ) -> adk_rust::Result<Value> {
+        // 启动互斥：check（reuse）与 boot+注册在同一个临界区里，并发
+        // start 不会双引导 VM，也不会出现「沙箱在而工具未注册」的中间态。
+        let _guard = self.state.boot_lock.lock().await;
         if self.state.current().is_some() {
             return Ok(json!({"ok": true, "reused": true, "tools": SANDBOX_TOOL_NAMES}));
         }
-        let provider = ZeroBootProvider::new(Config {
-            kernel: Some(self.setup.kernel.clone()),
-            rootfs: Some(self.setup.rootfs.clone()),
-            firecracker: Some(self.setup.firecracker.clone()),
-            guest_port: self.setup.guest_port,
-            timeout: self.setup.boot_timeout,
-        });
-        let boxed = provider
-            .create(SandboxSpec {
-                capabilities: vec![
-                    Capability::Execute,
-                    Capability::Health,
-                    Capability::ReadFile,
-                    Capability::WriteFile,
-                ],
-                ..SandboxSpec::default()
-            })
-            .await
-            .map_err(|e| {
-                adk_rust::AdkError::new(
-                    adk_rust::ErrorComponent::Tool,
-                    adk_rust::ErrorCategory::Unavailable,
-                    "rfb.session.boot_failed",
-                    format!("sandbox boot failed: {e}"),
-                )
-            })?;
-        let sandbox: Arc<dyn Sandbox> = boxed.into();
-        if !sandbox.ping().await.map(|h| h.healthy).unwrap_or(false) {
-            return Err(adk_rust::AdkError::new(
+        let sandbox = (self.boot)().await.map_err(|message| {
+            adk_rust::AdkError::new(
                 adk_rust::ErrorComponent::Tool,
                 adk_rust::ErrorCategory::Unavailable,
-                "rfb.session.boot_unhealthy",
-                "sandbox booted but the guest did not answer ping",
-            ));
-        }
+                "rfb.session.boot_failed",
+                message,
+            )
+        })?;
         // 解锁七个沙箱工具（每次 boot 后重建——它们捕获沙箱句柄）。
         for tool in crate::sandbox_tools(sandbox.clone()).tools() {
             self.toolset.register(tool);
@@ -163,7 +182,8 @@ impl adk_rust::Tool for SandboxStopTool {
         SANDBOX_STOP_NAME
     }
     fn description(&self) -> &str {
-        "退役当前沙箱（kill + reap，无孤儿进程）并注销其工具。没有沙箱时幂等成功。"
+        "退役当前沙箱（kill + reap，无孤儿进程）并注销其工具。没有沙箱时幂等成功。\
+         注意：本轮已被模型看到的工具分发表仍持有旧句柄，旧 VM 在本轮结束后才真正退出。"
     }
     fn parameters_schema(&self) -> Option<Value> {
         Some(json!({"type":"object","additionalProperties":false}))
@@ -195,11 +215,144 @@ pub const SANDBOX_TOOL_NAMES: [&str; 7] = crate::adapter::TOOL_NAMES;
 mod tests {
     use super::*;
 
-    /// 未 start 时状态为空；start 幂等（无 VM 的纯状态机路径不走这里——
-    /// 引导路径需要真机，见 tests/agent_eval.rs）。
-    #[test]
-    fn default_session_has_no_sandbox() {
+    fn memory_sandbox() -> Arc<dyn Sandbox> {
+        use rfb::{BackendKind, BoxFuture, ExecResult, ExecSpec, SandboxError, TransportKind};
+        #[derive(Default)]
+        struct Mem;
+        impl Sandbox for Mem {
+            fn backend(&self) -> BackendKind {
+                BackendKind::InMemory
+            }
+            fn transport(&self) -> TransportKind {
+                TransportKind::InProcess
+            }
+            fn capabilities(&self) -> &[Capability] {
+                static CAPS: [Capability; 7] = [
+                    Capability::ReadFile,
+                    Capability::WriteFile,
+                    Capability::Execute,
+                    Capability::Grep,
+                    Capability::Find,
+                    Capability::Ls,
+                    Capability::Health,
+                ];
+                &CAPS
+            }
+            fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
+                Box::pin(async { Err(SandboxError::NotReady) })
+            }
+        }
+        Arc::new(Mem)
+    }
+
+    fn boot_ok(counter: Arc<std::sync::atomic::AtomicUsize>) -> SandboxBoot {
+        Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sandbox = memory_sandbox();
+            Box::pin(async move { Ok(sandbox) })
+        })
+    }
+
+    fn boot_failing() -> SandboxBoot {
+        Arc::new(|| Box::pin(async { Err("no kvm".into()) }))
+    }
+
+    #[tokio::test]
+    async fn default_session_has_no_sandbox() {
         let state = SandboxState::new();
         assert!(state.current().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_unlocks_tools_and_stop_removes_them() {
+        let toolset = Toolset::new();
+        let state = SandboxState::new();
+        install_session_tools_with_boot(boot_ok(Arc::default()), &toolset, state.clone());
+        assert_eq!(toolset.names(), vec![SANDBOX_START_NAME, SANDBOX_STOP_NAME]);
+
+        let start = toolset
+            .snapshot()
+            .into_iter()
+            .find(|t| t.name() == SANDBOX_START_NAME)
+            .unwrap();
+        let ctx: Arc<dyn adk_rust::ToolContext> = Arc::new(crate::NoOpToolContext);
+        let out = start.execute(ctx.clone(), json!({})).await.unwrap();
+        assert_eq!(out["reused"], json!(false));
+        assert!(state.current().is_some());
+        let names = toolset.names();
+        for name in SANDBOX_TOOL_NAMES {
+            assert!(names.contains(&name.to_owned()), "{name} must be unlocked");
+        }
+
+        // 幂等 start
+        let out = start.execute(ctx.clone(), json!({})).await.unwrap();
+        assert_eq!(out["reused"], json!(true));
+
+        // stop 注销 + 状态清空
+        let stop = toolset
+            .snapshot()
+            .into_iter()
+            .find(|t| t.name() == SANDBOX_STOP_NAME)
+            .unwrap();
+        let out = stop.execute(ctx.clone(), json!({})).await.unwrap();
+        assert_eq!(out["stopped"], json!(true));
+        assert!(state.current().is_none());
+        for name in SANDBOX_TOOL_NAMES {
+            assert!(!toolset.names().contains(&name.to_owned()));
+        }
+        // 幂等 stop
+        let out = stop.execute(ctx, json!({})).await.unwrap();
+        assert_eq!(out["stopped"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_boot_exactly_one_vm() {
+        let toolset = Toolset::new();
+        let state = SandboxState::new();
+        let boots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        install_session_tools_with_boot(boot_ok(boots.clone()), &toolset, state.clone());
+        let start = toolset
+            .snapshot()
+            .into_iter()
+            .find(|t| t.name() == SANDBOX_START_NAME)
+            .unwrap();
+        let ctx: Arc<dyn adk_rust::ToolContext> = Arc::new(crate::NoOpToolContext);
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let start = start.clone();
+            let ctx = ctx.clone();
+            handles.push(tokio::spawn(
+                async move { start.execute(ctx, json!({})).await },
+            ));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            boots.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "并发 start 只能引导一个 VM"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_failure_is_error_data_and_tools_stay_hidden() {
+        let toolset = Toolset::new();
+        let state = SandboxState::new();
+        install_session_tools_with_boot(boot_failing(), &toolset, state.clone());
+        let start = toolset
+            .snapshot()
+            .into_iter()
+            .find(|t| t.name() == SANDBOX_START_NAME)
+            .unwrap();
+        let ctx: Arc<dyn adk_rust::ToolContext> = Arc::new(crate::NoOpToolContext);
+        let error = start.execute(ctx, json!({})).await.unwrap_err();
+        assert!(error.message.contains("no kvm"));
+        assert!(state.current().is_none());
+        assert_eq!(
+            toolset.names(),
+            vec![SANDBOX_START_NAME, SANDBOX_STOP_NAME],
+            "失败后沙箱工具不得出现"
+        );
     }
 }

@@ -124,9 +124,10 @@ impl WorkspaceGuestExecutor {
             file.write_all(&request.content)
                 .map_err(|e| e.to_string())?;
         } else {
-            // Temp file + rename so a crash mid-write leaves the previous
+            // Temp file + rename so a PROCESS crash mid-write leaves the previous
             // content intact instead of a truncated file (same directory =
-            // one filesystem).
+            // one filesystem; no fsync — a POWER loss may lose both the tmp
+            // file and the rename, which is beyond this contract).
             write_atomic(&path, &request.content).map_err(|e| e.to_string())?;
         }
         // The size cache is shared per workspace root and this guard is held

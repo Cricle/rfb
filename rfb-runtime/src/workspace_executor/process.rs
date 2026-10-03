@@ -23,6 +23,17 @@ const DRAIN_CAP: Duration = Duration::from_secs(5);
 
 impl WorkspaceGuestExecutor {
     pub(super) fn exec(&self, value: &Value, cancel: &AtomicBool) -> Result<Value, String> {
+        // 子进程退出（成功 reap 或错误路径收尸）后，它对工作区的改动就定格
+        // 了——必须再 invalidate 一次：spawn 前的 invalidate 不能覆盖「执行
+        // 期间子进程删/截断文件 → 并发 write 的重走拿到 mid-exec 偏小值并
+        // 存入缓存」的交错，那个 undercount 否则会一直活到下一次 exec，
+        // 期间 max_workspace_bytes 可被持续突破。
+        let result = self.exec_inner(value, cancel);
+        self.invalidate_workspace_size();
+        result
+    }
+
+    fn exec_inner(&self, value: &Value, cancel: &AtomicBool) -> Result<Value, String> {
         let args = value
             .get("args")
             .and_then(Value::as_array)

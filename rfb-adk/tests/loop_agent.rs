@@ -335,3 +335,116 @@ async fn unknown_tool_and_tool_errors_flow_back_as_data() {
         assert!(function_response.response.get("error").is_some());
     }
 }
+
+/// 一个会自我了断的工具：执行时置 abort 标志并返回成功——用它验证
+/// abort 在**同一轮的两个工具之间**生效（第一个工具跑完即停）。
+struct AborterTool {
+    abort: rfb_adk::AbortFlag,
+    executions: Arc<AtomicUsize>,
+}
+
+#[adk_rust::async_trait]
+impl adk_rust::Tool for AborterTool {
+    fn name(&self) -> &str {
+        "aborter"
+    }
+    fn description(&self) -> &str {
+        "sets the abort flag"
+    }
+    async fn execute(
+        &self,
+        _ctx: Arc<dyn adk_rust::ToolContext>,
+        _args: Value,
+    ) -> adk_rust::Result<Value> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        self.abort.abort();
+        Ok(json!({"ok": true}))
+    }
+}
+
+#[derive(Default)]
+struct CountingSandbox {
+    reads: Arc<AtomicUsize>,
+}
+impl Sandbox for CountingSandbox {
+    fn backend(&self) -> BackendKind {
+        BackendKind::InMemory
+    }
+    fn transport(&self) -> TransportKind {
+        TransportKind::InProcess
+    }
+    fn capabilities(&self) -> &[Capability] {
+        static CAPS: [Capability; 1] = [Capability::ReadFile];
+        &CAPS
+    }
+    fn exec<'a>(&'a self, _: ExecSpec) -> BoxFuture<'a, Result<ExecResult, SandboxError>> {
+        Box::pin(async { Err(SandboxError::NotReady) })
+    }
+    fn read<'a>(
+        &'a self,
+        _: rfb::guest::ReadRequest,
+    ) -> BoxFuture<'a, Result<rfb::guest::ReadResult, SandboxError>> {
+        let reads = self.reads.clone();
+        Box::pin(async move {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Ok(rfb::guest::ReadResult {
+                data: vec![],
+                truncated: false,
+                total_bytes: Some(0),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn abort_stops_between_tool_calls_within_one_round() {
+    let sandbox = Arc::new(CountingSandbox::default());
+    let abort = rfb_adk::AbortFlag::new();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let aborter: Arc<dyn adk_rust::Tool> = Arc::new(AborterTool {
+        abort: abort.clone(),
+        executions: executions.clone(),
+    });
+    let set = rfb_adk::Toolset::new();
+    set.register(aborter);
+    for tool in rfb_adk::sandbox_tools(sandbox.clone()).tools() {
+        set.register(tool);
+    }
+    // 同一轮两个调用：aborter 先跑（置标志），read 必须不再执行
+    let model = FakeModel::new(vec![Content {
+        role: "model".into(),
+        parts: vec![
+            Part::FunctionCall {
+                name: "aborter".into(),
+                args: json!({}),
+                id: Some("c1".into()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "read".into(),
+                args: json!({"path": "x"}),
+                id: Some("c2".into()),
+                thought_signature: None,
+            },
+        ],
+    }]);
+    let mut messages = vec![Content::new("user").with_text("go")];
+    let outcome = agent_loop(
+        model,
+        &set,
+        &mut messages,
+        rfb_adk::LoopOptions {
+            abort: Some(abort),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, rfb_adk::LoopOutcome::Aborted);
+    assert_eq!(executions.load(Ordering::SeqCst), 1, "aborter 跑了一次");
+    assert_eq!(
+        sandbox.reads.load(Ordering::SeqCst),
+        0,
+        "同轮后继工具不得执行"
+    );
+}

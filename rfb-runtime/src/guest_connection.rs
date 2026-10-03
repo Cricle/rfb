@@ -82,10 +82,9 @@ where
                             break Err(error);
                         }
                     }
-                    // The worker dropped its sender without delivering: the
-                    // result can never arrive — reclaim the in-flight turn
-                    // bookkeeping so the runtime keeps answering instead of
-                    // reporting a phantom active turn forever.
+                    // 不可达分支（serve 自持 result_tx 直到函数结束，主循环
+                    // 里 recv 不会返回 None）；保留只为穷尽性，语义上按
+                    // 「结果永远不会来」兜底收回。
                     None => {
                         worker_active = false;
                         worker_handle = None;
@@ -288,8 +287,18 @@ where
                         let mut runtime = shared.lock().await;
                         runtime.abandon_active_turn();
                     }
-                    if let Some(delivery) = wait_delivery(&mut result_rx).await {
-                        deliver(shared, delivery).await;
+                    // 第二段等待同样有界：worker 真正 wedged 时（历史教训：
+                    // kill 后既不 deliver 也不 panic），不能永久泄漏一个
+                    // task + channel。上限 = 合法 turn 的最大 deadline
+                    // （1800s）加排空余量。
+                    match tokio::time::timeout(
+                        DETACHED_TURN_WAIT + std::time::Duration::from_secs(60),
+                        wait_delivery(&mut result_rx),
+                    )
+                    .await
+                    {
+                        Ok(Some(delivery)) => deliver(shared, delivery).await,
+                        _ => {}
                     }
                 }
             }

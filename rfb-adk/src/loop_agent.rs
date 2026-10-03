@@ -116,12 +116,13 @@ pub enum LoopOutcome {
     Aborted,
 }
 
-/// 内置空工具上下文（rfb 工具不读 ctx；第三方工具拿到的是诚实声明过的
-/// stub——所有查询返回空）。
-struct NoCtx;
+/// 内置空工具上下文（公开：测试与嵌入方需要直接调 `Tool::execute` 时用
+/// 它；rfb 工具不读 ctx，第三方工具拿到的是诚实声明过的 stub——所有查询
+/// 返回空）。
+pub struct NoOpToolContext;
 
 #[adk_rust::async_trait]
-impl adk_rust::ReadonlyContext for NoCtx {
+impl adk_rust::ReadonlyContext for NoOpToolContext {
     fn invocation_id(&self) -> &str {
         "agent-loop"
     }
@@ -146,14 +147,14 @@ impl adk_rust::ReadonlyContext for NoCtx {
     }
 }
 
-impl adk_rust::CallbackContext for NoCtx {
+impl adk_rust::CallbackContext for NoOpToolContext {
     fn artifacts(&self) -> Option<Arc<dyn adk_rust::Artifacts>> {
         None
     }
 }
 
 #[adk_rust::async_trait]
-impl adk_rust::ToolContext for NoCtx {
+impl adk_rust::ToolContext for NoOpToolContext {
     fn function_call_id(&self) -> &str {
         ""
     }
@@ -222,7 +223,7 @@ pub async fn agent_loop(
 ) -> adk_rust::Result<LoopOutcome> {
     let ctx: Arc<dyn adk_rust::ToolContext> = match &opts.ctx {
         Some(ctx) => ctx.clone(),
-        None => Arc::new(NoCtx),
+        None => Arc::new(NoOpToolContext),
     };
 
     for round in 0..opts.max_rounds {
@@ -260,26 +261,52 @@ pub async fn agent_loop(
         let stream = model.generate_content(request, false).await?;
         use adk_rust::futures::StreamExt;
         let mut pinned = std::pin::pin!(stream);
-        let mut response: Option<adk_rust::LlmResponse> = None;
+        // 聚合整个流：partial chunk 是契约的一部分（增量文本/分批工具调用），
+        // 覆盖式只留末项会把多 chunk 实现的前序内容静默丢掉。文本与工具调用
+        // 按序累积成一个 content；usage/error 以最后一个携带者为准。
+        let mut merged_parts: Vec<Part> = Vec::new();
+        let mut usage: Option<adk_rust::UsageMetadata> = None;
+        let mut error_message: Option<String> = None;
+        let mut saw_any = false;
         while let Some(item) = pinned.next().await {
-            response = Some(item?);
+            let item = item?;
+            saw_any = true;
+            if let Some(message) = &item.error_message {
+                error_message = Some(message.clone());
+            }
+            if item.usage_metadata.is_some() {
+                usage = item.usage_metadata;
+            }
+            if let Some(content) = item.content {
+                merged_parts.extend(content.parts);
+            }
         }
-        let Some(response) = response else {
+        if !saw_any {
             return Err(adk_rust::AdkError::new(
                 adk_rust::ErrorComponent::Model,
                 adk_rust::ErrorCategory::Internal,
                 "rfb.loop.empty_response",
                 "model returned an empty response stream",
             ));
-        };
-        if let Some(message) = &response.error_message {
+        }
+        if let Some(message) = error_message {
             return Err(adk_rust::AdkError::new(
                 adk_rust::ErrorComponent::Model,
                 adk_rust::ErrorCategory::Unavailable,
                 "rfb.loop.model_error",
-                message.clone(),
+                message,
             ));
         }
+        let response = adk_rust::LlmResponse {
+            content: Some(Content {
+                role: "model".into(),
+                parts: merged_parts,
+            }),
+            usage_metadata: usage,
+            turn_complete: true,
+            finish_reason: Some(adk_rust::FinishReason::Stop),
+            ..Default::default()
+        };
 
         let content = response.content.unwrap_or_else(|| Content::new("model"));
         let mut text = String::new();
@@ -305,6 +332,11 @@ pub async fn agent_loop(
         }
 
         for (id, name, args) in calls {
+            // 中止在每个工具执行之间生效：一轮 N 个慢工具时，abort 不等
+            // 整轮跑完（已回填的结果留在历史里，是合法前缀）。
+            if opts.abort.as_ref().is_some_and(AbortFlag::is_aborted) {
+                return Ok(LoopOutcome::Aborted);
+            }
             emit(
                 &opts,
                 LoopEvent::ToolCall {

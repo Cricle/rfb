@@ -183,6 +183,7 @@ where
                             }
                         }
                     }
+                    // 不可达（serve 自持 worker_tx 克隆直到函数结束）；穷尽性保留。
                     None => break Ok(()),
                 }
             }
@@ -600,13 +601,8 @@ async fn handle_execute<W: AsyncWrite + Unpin>(
             // (a stderr line per dropped chunk would itself feed the firehose).
         }
     })));
-    requests.insert(
-        request_id,
-        RequestEntry {
-            request_id: request_id_str.clone(),
-            terminated: false,
-        },
-    );
+    // （条目已在 spawn_turn 成功后插入过——这里的二次 insert 是历史遗留，
+    // 删除以免误导。）
     // Keep the handle in the serve loop: it is the panic detector for this
     // worker (a panic never delivers a Terminal, so the channel alone cannot
     // clear `worker_active`).

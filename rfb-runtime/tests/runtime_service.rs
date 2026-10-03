@@ -1356,6 +1356,44 @@ fn workspace_executor_write_honors_append_and_fails_closed_on_mode() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// 覆写（write_atomic 原子替换）必须保留已存在文件的权限：一个被
+/// chmod 过（write mode=）的脚本在下次不带 mode 的覆写后必须仍是可
+/// 执行的——X1 复杂任务实测：覆写把 0755 打回 0644，脚本随后无法执行。
+#[test]
+fn overwrite_preserves_existing_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace();
+    let executor = WorkspaceGuestExecutor::new(&root, RuntimeLimits::default()).unwrap();
+    let mut service = RuntimeService::with_executor_impl(RuntimeLimits::default(), executor);
+    service.handle(ControlMessage::Hello {
+        protocol_version: 1,
+    });
+    let write = |service: &mut RuntimeService, request_id: &str, args: serde_json::Value| {
+        service.handle(ControlMessage::StartTurn(SessionRequest {
+            session_id: "s".into(),
+            request_id: request_id.into(),
+            prompt: serde_json::json!({"op": "write", "args": args}).to_string(),
+        }))
+    };
+    write(
+        &mut service,
+        "w1",
+        serde_json::json!({"path": "run.sh", "data": b"echo hi".to_vec(), "mode": 0o755}),
+    );
+    // 不带 mode 的覆写：权限必须保留
+    write(
+        &mut service,
+        "w2",
+        serde_json::json!({"path": "run.sh", "data": b"echo bye".to_vec()}),
+    );
+    let mode = fs::metadata(root.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "覆写必须保留已存在文件的权限");
+    let _ = fs::remove_dir_all(root);
+}
+
 /// P1-1: the typed control-message write path gains `append` with the same
 /// semantics (truncate-write remains the `append: false` default).
 #[test]

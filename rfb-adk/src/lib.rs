@@ -17,7 +17,8 @@ pub use adapter::*;
 /// Toolset`]、转向、中止、输出截断。
 pub mod loop_agent;
 pub use loop_agent::{
-    agent_loop, AbortFlag, LoopEvent, LoopOptions, LoopOutcome, SteeringInbox, Toolset,
+    agent_loop, AbortFlag, LoopEvent, LoopOptions, LoopOutcome, NoOpToolContext, SteeringInbox,
+    Toolset,
 };
 
 /// 按需沙箱会话：默认零沙箱，agent 调 `sandbox_start` 才引导并解锁工具。
