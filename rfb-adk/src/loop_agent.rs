@@ -73,7 +73,10 @@ pub enum LoopEvent<'a> {
     ToolResult { name: &'a str, ok: bool },
 }
 
-pub struct LoopOptions<'a> {
+/// 事件回调类型（同步、快速——TUI 里只 push 日志）。
+pub type EventHandler = Arc<dyn Fn(LoopEvent<'_>) + Send + Sync>;
+
+pub struct LoopOptions {
     /// 最大轮数（一轮 = 一次模型调用 + 其工具执行）。
     pub max_rounds: usize,
     /// 单条工具结果进入历史的字符上限；超出截断（超大输出会永久占据
@@ -85,11 +88,11 @@ pub struct LoopOptions<'a> {
     pub inbox: Option<SteeringInbox>,
     /// 中止标志。
     pub abort: Option<AbortFlag>,
-    /// 事件回调（同步、快速——TUI 里只 push 日志）。
-    pub on_event: Option<&'a dyn Fn(LoopEvent<'_>)>,
+    /// 事件回调。
+    pub on_event: Option<EventHandler>,
 }
 
-impl Default for LoopOptions<'_> {
+impl Default for LoopOptions {
     fn default() -> Self {
         Self {
             max_rounds: 40,
@@ -195,7 +198,7 @@ impl Toolset {
     }
 }
 
-fn emit(opts: &LoopOptions<'_>, event: LoopEvent<'_>) {
+fn emit(opts: &LoopOptions, event: LoopEvent<'_>) {
     if let Some(on_event) = &opts.on_event {
         on_event(event);
     }
@@ -215,7 +218,7 @@ pub async fn agent_loop(
     model: Arc<dyn adk_rust::Llm>,
     tools: &Toolset,
     messages: &mut Vec<Content>,
-    opts: LoopOptions<'_>,
+    opts: LoopOptions,
 ) -> adk_rust::Result<LoopOutcome> {
     let ctx: Arc<dyn adk_rust::ToolContext> = match &opts.ctx {
         Some(ctx) => ctx.clone(),
