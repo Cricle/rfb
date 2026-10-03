@@ -17,7 +17,7 @@ RFB（Runtime/Resource/Filesystem Boundary）是面向沙箱的 Rust workspace�
 ```toml
 [dependencies]
 rfb-sdk = "0.0.1"
-rfb-rig = "0.0.1"
+rfb-adk = "0.0.1"
 # 只有需要 guest/Firecracker 运行时才需要：
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
@@ -63,10 +63,10 @@ crates.io 包只包含 Rust 源码与 crate 资源，不包含 Firecracker、Lin
 | crate | 职责 |
 |---|---|
 | `rfb-sdk` | 最小沙箱 API、能力/文件系统/guest 协议抽象；可选 forkd、ZBRT 与 `rfb-cli` 集成。|
-| `rfb-rig` | 将 RFB 沙箱能力适配为 Rig 0.42 工具；不拥有 Agent loop。|
+| `rfb-adk` | 将 RFB 沙箱能力适配为 ADK（adk-rust）agent 工具，并提供开箱 agent 组装；模型归应用所有。|
 | `rfb-runtime` | RFB1 guest/runtime、workspace executor、vsock、Firecracker 控制器和运行时测试；也提供构建/验收所需库代码。|
 
-依赖方向为 `rfb-rig`/`rfb-runtime` → `rfb-sdk`；`rfb-sdk` 不依赖 Rig。应用负责 Agent、提示词、模型、HTTP/SSE、凭据和会话存储。
+依赖方向为 `rfb-adk`/`rfb-runtime` → `rfb-sdk`；`rfb-sdk` 不依赖 adk-rust。应用负责 Agent、提示词、模型、HTTP/SSE、凭据和会话存储。
 
 ## 多语言 SDK
 
@@ -117,7 +117,7 @@ rfb-cli doctor --json   # 宿主能力报告
 
 - **CI**——所有 PR 与非 main 分支推送：Rust 门禁（fmt、clippy、测试、文档，全部 `--all-features`，含边界检查）+ 干净 Debian 12 容器里的 SDK 全量构建与测试（Python / C# / Java / Node.js）。
 - **真机 E2E**——push 到 `main`：在 KVM runner 上启动真实 Firecracker/forkd 栈，从 forkd-agent rootfs 创建快照，跑全部 `#[ignore]` 门控的真机测试。
-- **Release**——推送 `v主.次.补丁` tag：按 `rfb-runtime` → `rfb-sdk` → `rfb-rig` 顺序发布到 crates.io，`rfb-sdk` 发布到 PyPI、`io.github.cricle:rfb-sdk` 发布到 Maven Central（GPG 签名）、`Rfb.Sdk` 发布到 NuGet、`rfb-sdk`（TypeScript）与 `rfb-cli`（仅二进制）发布到 npm，并把 `rfb-cli` 二进制与 SHA256SUMS 附件挂到 GitHub Release。发布幂等：重跑时已发布的产物自动跳过。
+- **Release**——推送 `v主.次.补丁` tag：按 `rfb-runtime` → `rfb-sdk` → `rfb-adk` 顺序发布到 crates.io，`rfb-sdk` 发布到 PyPI、`io.github.cricle:rfb-sdk` 发布到 Maven Central（GPG 签名）、`Rfb.Sdk` 发布到 NuGet、`rfb-sdk`（TypeScript）与 `rfb-cli`（仅二进制）发布到 npm，并把 `rfb-cli` 二进制与 SHA256SUMS 附件挂到 GitHub Release。发布幂等：重跑时已发布的产物自动跳过。
 
 ## 发布与 CI
 

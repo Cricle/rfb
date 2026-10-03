@@ -1,0 +1,23 @@
+[package]
+name = "rfb-adk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADK agent integration for RFB sandbox testing"
+keywords = ["sandbox", "adk", "agent", "llm", "tools"]
+categories = ["development-tools::testing", "api-bindings"]
+
+[dependencies]
+rfb = { workspace = true }
+adk-rust = { version = "2.2.0", default-features = false, features = ["minimal", "openai", "tools"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# adk 的模型调用超时（NonStreamingModel）直接用 tokio 的定时器。
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }

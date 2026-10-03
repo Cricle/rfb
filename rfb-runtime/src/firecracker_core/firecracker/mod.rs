@@ -280,6 +280,18 @@ pub struct FirecrackerVm {
     /// Host-side vsock relay UDS this VM was booted with, when any.
     vsock_uds_path: Option<String>,
     vsock_identity: Option<EndpointIdentity>,
+    /// PDEATHSIG holder 线程的释放信号（保持最后一位：Drop 顺序 = 声明顺序，
+    /// 先 kill 子进程、再放 holder 退出）。PDEATHSIG 绑定 fork 它的那个
+    /// **线程**（Linux 语义是父线程而非父进程）：线程一退出，存活的 FC 就
+    /// 被 SIGKILL。tokio 阻塞池线程空闲 keep-alive（默认 10s）后即被回收
+    /// ——**不是**"运行时关停才回收"（真机演练实测：从阻塞池线程 fork 的
+    /// FC 恰在 boot 后 ~10s 整被 SIGKILL，所有 guest 连接集体死亡且 FC 无
+    /// 退出日志，长驻 agent 场景必踩）。因此 fork 一律发生在 [`Self::
+    /// spawn_api`] 的专职 holder 线程上：spawn 后停驻，直到本 VM teardown
+    /// （本字段 drop → 通道断开 → recv 返回）才退出；那时子进程已死，
+    /// PDEATHSIG 无害。构造中途失败时 spawn_api 局部 `release_tx` 先 drop，
+    /// holder 同样被唤醒退出，不泄漏线程。
+    holder: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 impl FirecrackerVm {
@@ -453,8 +465,8 @@ impl FirecrackerVm {
             remove_stale_socket(Path::new(&vsock.uds_path));
         }
 
-        let process = Self::spawn_api(firecracker_bin_path, work_dir, socket_path)?;
-        let mut vm = Self::attach_api_child(socket_path, process)?;
+        let (process, holder) = Self::spawn_api(firecracker_bin_path, work_dir, socket_path)?;
+        let mut vm = Self::attach_api_child(socket_path, process, holder)?;
         vm.snapshot_dir = snapshot_dir.map(str::to_owned);
 
         // Configure machine
@@ -509,10 +521,17 @@ impl FirecrackerVm {
         Ok(vm)
     }
 
-    /// Spawn a Firecracker process and wait until its API socket accepts a
-    /// connection. Returns the raw child on success; a dropped [`ChildGuard`]
-    /// on any failure path tears the process down.
-    fn spawn_api(firecracker_bin_path: &str, work_dir: &str, socket_path: &str) -> Result<Child> {
+    /// Spawn a Firecracker process on a dedicated PDEATHSIG holder thread and
+    /// wait until its API socket accepts a connection. Returns the child plus
+    /// the holder's release signal — the holder parks until released, so the
+    /// thread outlives the VM (a PDEATHSIG parent thread that exits early
+    /// kills a healthy VM; see the `holder` field docs). A dropped
+    /// [`ChildGuard`] on any failure path tears the process down.
+    fn spawn_api(
+        firecracker_bin_path: &str,
+        work_dir: &str,
+        socket_path: &str,
+    ) -> Result<(Child, std::sync::mpsc::SyncSender<()>)> {
         eprintln!("Starting Firecracker...");
         let log_path = format!("{work_dir}/firecracker.log");
         // Both stdio hooks append to the same file: Firecracker logs to stdout
@@ -530,21 +549,61 @@ impl FirecrackerVm {
         };
         let log = open_log()?;
         let log_out = open_log()?;
-        let mut command = Command::new(firecracker_bin_path);
-        command
-            .args(["--api-sock", socket_path])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_out))
-            .stderr(Stdio::from(log));
-        // The VM must not outlive this process: without PDEATHSIG a SIGKILLed
-        // host leaves an orphan Firecracker holding the snapshot dir and its
-        // 100s of MiB of guest memory. The single shared helper concentrates
-        // the unsafe; every Firecracker spawn goes through it.
-        attach_pdeathsig(&mut command)?;
-        let process = command
-            .spawn()
-            .map_err(|e| FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}")))?;
-        let mut process_guard = ChildGuard::new(process);
+        let socket_path_for_cmd = socket_path.to_owned();
+        let firecracker_bin_path = firecracker_bin_path.to_owned();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        std::thread::Builder::new()
+            .name("rfb-fc-pdeathsig-holder".into())
+            .spawn(move || {
+                let mut command = Command::new(firecracker_bin_path);
+                command
+                    .args(["--api-sock", &socket_path_for_cmd])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(log_out))
+                    .stderr(Stdio::from(log));
+                // The VM must not outlive this process: without PDEATHSIG a
+                // SIGKILLed host leaves an orphan Firecracker holding the
+                // snapshot dir and its 100s of MiB of guest memory. The single
+                // shared helper concentrates the unsafe; every Firecracker
+                // spawn goes through it.
+                let spawned = attach_pdeathsig(&mut command)
+                    .map_err(FirecrackerError::from)
+                    .and_then(|()| {
+                        command.spawn().map_err(|e| {
+                            FirecrackerError::Protocol(format!("Failed to start Firecracker: {e}"))
+                        })
+                    });
+                let child = match spawned {
+                    Ok(child) => child,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(child)).is_err() {
+                    // Caller gone before taking ownership: this thread is the
+                    // child's PDEATHSIG parent, so exiting here kills it —
+                    // the child cannot orphan.
+                    return;
+                }
+                // Park until the VM is torn down. Exiting earlier fires
+                // PDEATHSIG on a healthy VM.
+                let _ = release_rx.recv();
+            })
+            .map_err(|e| {
+                FirecrackerError::Protocol(format!("spawn PDEATHSIG holder thread: {e}"))
+            })?;
+
+        let child = match ready_rx.recv() {
+            Ok(Ok(child)) => child,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(FirecrackerError::Protocol(
+                    "Firecracker holder thread died before handing over the child".into(),
+                ))
+            }
+        };
 
         // Wait until the API socket accepts a connection, not merely until its
         // filesystem entry appears. A dead child fails in milliseconds (the
@@ -557,6 +616,7 @@ impl FirecrackerVm {
         // API), so the async branch is deliberately absent. This function is
         // synchronous spawn glue — blocking the caller for the socket deadline
         // is its documented behavior.
+        let mut process_guard = ChildGuard::new(child);
         let start = Instant::now();
         loop {
             let connected = UnixStream::connect(socket_path).is_ok();
@@ -570,12 +630,16 @@ impl FirecrackerVm {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        process_guard.take()
+        Ok((process_guard.take()?, release_tx))
     }
 
     /// Wrap a freshly spawned (and connect-ready) Firecracker child into a VM
     /// handle by taking the socket's endpoint identity.
-    fn attach_api_child(socket_path: &str, process: Child) -> Result<Self> {
+    fn attach_api_child(
+        socket_path: &str,
+        process: Child,
+        holder: std::sync::mpsc::SyncSender<()>,
+    ) -> Result<Self> {
         let socket_identity = endpoint_identity(Path::new(socket_path)).ok_or_else(|| {
             FirecrackerError::Protocol("Firecracker API socket is not a Unix socket".into())
         })?;
@@ -586,6 +650,7 @@ impl FirecrackerVm {
             snapshot_dir: None,
             vsock_uds_path: None,
             vsock_identity: None,
+            holder: Some(holder),
         })
     }
 
@@ -896,8 +961,8 @@ impl FirecrackerVm {
         mem_file_path: &str,
     ) -> Result<Self> {
         let socket_path = format!("{work_dir}/firecracker.sock");
-        let process = Self::spawn_api(firecracker_path, work_dir, &socket_path)?;
-        let vm = Self::attach_api_child(&socket_path, process)?;
+        let (process, holder) = Self::spawn_api(firecracker_path, work_dir, &socket_path)?;
+        let vm = Self::attach_api_child(&socket_path, process, holder)?;
         let vsock_path = format!("{work_dir}/vsock.sock");
         // Boot-specific resources (boot-source) are baked into the snapshot
         // and must NOT be configured before a load. The machine shape must
@@ -951,8 +1016,8 @@ impl FirecrackerVm {
         // the name.
         let _ = std::fs::remove_file(&baked);
         let socket_path = format!("{work_dir}/firecracker.sock");
-        let process = Self::spawn_api(firecracker_path, work_dir, &socket_path)?;
-        let mut vm = Self::attach_api_child(&socket_path, process)?;
+        let (process, holder) = Self::spawn_api(firecracker_path, work_dir, &socket_path)?;
+        let mut vm = Self::attach_api_child(&socket_path, process, holder)?;
         vm.api_put(
             "/snapshot/load",
             &snapshot_load_body(vmstate_path, mem_file_path),
@@ -1029,5 +1094,8 @@ impl Drop for FirecrackerVm {
                 remove_owned_socket(Path::new(path), identity);
             }
         }
+        // 最后释放 PDEATHSIG holder：通道断开 → holder 线程退出。此刻子
+        // 进程已 kill+reap，线程退出不再触发任何东西。
+        drop(self.holder.take());
     }
 }

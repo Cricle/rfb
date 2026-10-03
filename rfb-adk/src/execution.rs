@@ -5,7 +5,7 @@
 //! [`rfb::Sandbox`], or fails closed when no backend policy is selected.
 //!
 //! ```
-//! use rfb_rig::{ExecutionError, ExecutionTarget, GuestExecution};
+//! use rfb_adk::{ExecutionError, ExecutionTarget, GuestExecution};
 //!
 //! // A target with no backing policy is always fail-closed.
 //! let target = ExecutionTarget::unsupported("not provisioned");
@@ -189,26 +189,23 @@ impl GuestExecution for ExecutionTarget {
         Box::pin(async move {
             match self {
                 Self::Guest { sandbox, .. } => {
-                    let bridge = crate::RigPortableTools::from_sandbox(sandbox.clone());
+                    let bridge = crate::SandboxTools::from_sandbox(sandbox.clone());
                     Ok(bridge
                         .invoke(
                             match tool {
-                                "read" => crate::RigCapability::Read,
-                                "write" => crate::RigCapability::Write,
-                                "grep" => crate::RigCapability::Grep,
-                                "find" => crate::RigCapability::Find,
-                                "ls" => crate::RigCapability::Ls,
-                                "eval" => crate::RigCapability::Eval,
-                                "bash" | "execute" => crate::RigCapability::Bash,
+                                "read" => crate::AdkCapability::Read,
+                                "write" => crate::AdkCapability::Write,
+                                "grep" => crate::AdkCapability::Grep,
+                                "find" => crate::AdkCapability::Find,
+                                "ls" => crate::AdkCapability::Ls,
+                                "eval" => crate::AdkCapability::Eval,
+                                "bash" | "execute" => crate::AdkCapability::Bash,
                                 x => return Err(ExecutionError::Unsupported(x.into())),
                             },
                             args,
                         )
                         .await
-                        .map_err(|e| ExecutionError::Guest(e.to_string()))?
-                        .as_json()
-                        .cloned()
-                        .unwrap_or(Value::Null))
+                        .map_err(|e| ExecutionError::Guest(e.to_string()))?)
                 }
                 Self::Unsupported { reason } => Err(ExecutionError::Unsupported(reason.clone())),
             }

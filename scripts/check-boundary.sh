@@ -16,17 +16,17 @@ if [[ -n "$violations" ]]; then
   exit 1
 fi
 
-for manifest in "$ROOT_DIR"/Cargo.toml "$ROOT_DIR"/rfb/Cargo.toml "$ROOT_DIR"/rfb-runtime/Cargo.toml "$ROOT_DIR"/rfb-rig/Cargo.toml; do
+for manifest in "$ROOT_DIR"/Cargo.toml "$ROOT_DIR"/rfb/Cargo.toml "$ROOT_DIR"/rfb-runtime/Cargo.toml "$ROOT_DIR"/rfb-adk/Cargo.toml; do
   test -f "$manifest" || { printf 'missing manifest: %s\n' "$manifest" >&2; exit 1; }
 done
 
 # ---------------------------------------------------------------------------
 # 依赖方向断言（防依赖倒置）：
-#   - crate `rfb-sdk` 的依赖集合不得包含 `rfb-rig` / `rfb-ben`；
-#   - crate `rfb-runtime` 的依赖集合不得包含 `rfb-sdk` / `rfb-rig`；
-#   - crate `rfb-rig` 必须依赖 `rfb-sdk`。
+#   - crate `rfb-sdk` 的依赖集合不得包含 `rfb-adk` / `rfb-ben`；
+#   - crate `rfb-runtime` 的依赖集合不得包含 `rfb-sdk` / `rfb-adk`；
+#   - crate `rfb-adk` 必须依赖 `rfb-sdk`。
 # 用 `cargo metadata --no-deps` 解析而不是 grep Cargo.toml：metadata 能看穿
-# `rfb = { package = "rfb-sdk", ... }` 这类重命名（rfb-rig / ben 都这样写），
+# `rfb = { package = "rfb-sdk", ... }` 这类重命名（rfb-adk / ben 都这样写），
 # 按真实包名断言更稳。工具缺失时的降级策略分两档：本机开发环境优雅降级为
 # 警告（不让本机工具缺失挡住边界扫描）；CI（CI=true）必须硬失败——CI 容器
 # 里静默跳过等于断言永远不跑（rust:1-bookworm 容器曾因无 python3 而把本
@@ -70,17 +70,17 @@ for p in meta["packages"]:
         deps[p["name"]].add(d["name"])
 
 bad = []
-# rfb-sdk 是纯契约/门面层：不得反向依赖集成层（rfb-rig）与基准层（rfb-ben）。
-for banned in ("rfb-rig", "rfb-ben"):
+# rfb-sdk 是纯契约/门面层：不得反向依赖集成层（rfb-adk）与基准层（rfb-ben）。
+for banned in ("rfb-adk", "rfb-ben"):
     if banned in deps.get("rfb-sdk", ()):
         bad.append("rfb-sdk -> " + banned + " (forbidden: sdk must not depend on rig/ben)")
 # rfb-runtime 是最底层运行时：不得依赖 SDK 或任何集成层。
-for banned in ("rfb-sdk", "rfb-rig"):
+for banned in ("rfb-sdk", "rfb-adk"):
     if banned in deps.get("rfb-runtime", ()):
         bad.append("rfb-runtime -> " + banned + " (forbidden: runtime must not depend on sdk/rig)")
-# rfb-rig 是 SDK 之上的集成层：必须显式依赖 rfb-sdk。
-if "rfb-sdk" not in deps.get("rfb-rig", ()):
-    bad.append("rfb-rig missing dependency rfb-sdk (rig must depend on sdk)")
+# rfb-adk 是 SDK 之上的集成层：必须显式依赖 rfb-sdk。
+if "rfb-sdk" not in deps.get("rfb-adk", ()):
+    bad.append("rfb-adk missing dependency rfb-sdk (rig must depend on sdk)")
 
 for b in bad:
     print("RFB dependency direction violation: " + b, file=sys.stderr)

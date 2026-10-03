@@ -1,7 +1,7 @@
 # RFB 发布流水线：tag v*.*.* 触发，四条独立渠道并行发布。
 #
 # 渠道与凭据（secrets 名以仓库配置为准）：
-# - crates.io:  rfb-runtime → rfb-sdk → rfb-rig（主 crate 发布名 rfb-sdk——
+# - crates.io:  rfb-runtime → rfb-sdk → rfb-adk（主 crate 发布名 rfb-sdk——
 #   crates.io 裸名 `rfb` 被无关项目占用，lib 名仍是 rfb；scripts/release.sh
 #   按依赖链发布并等待索引传播）。凭据 CRATES_KEY ->
 #   CARGO_REGISTRIES_CRATES_IO_TOKEN。
@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   crates:
-    name: Publish rfb-runtime / rfb-sdk / rfb-rig to crates.io
+    name: Publish rfb-runtime / rfb-sdk / rfb-adk to crates.io
     runs-on: ubuntu-latest
     # 与 ci.yml 的 rust job 同款：官方 rust 镜像（省每次 run 的工具链安装）
     # + bash 默认 shell（容器 sh=dash 不认 pipefail）+ rust-cache。
@@ -108,7 +108,7 @@ jobs:
           printf '%s\n' "$gate_log"
           # 三个已发布 crate 的版本没有清单文件可表达，仍从 cargo metadata
           # 读取比对（workspace 内真实包名）。
-          crate_versions=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print("\n".join("%s %s" % (p["name"], p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"] in ("rfb-runtime", "rfb-sdk", "rfb-rig")))')
+          crate_versions=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print("\n".join("%s %s" % (p["name"], p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"] in ("rfb-runtime", "rfb-sdk", "rfb-adk")))')
           bad=0
           while IFS=' ' read -r crate_name crate_ver; do
             [ -n "$crate_name" ] || continue

@@ -7,7 +7,7 @@ use rfb::{
     guest, BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, Sandbox, SandboxError,
     TransportKind,
 };
-use rfb_rig::{ExecutionError, ExecutionTarget, GuestExecution};
+use rfb_adk::{ExecutionError, ExecutionTarget, GuestExecution};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;

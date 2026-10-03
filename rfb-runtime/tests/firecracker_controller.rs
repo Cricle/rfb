@@ -122,6 +122,8 @@ mod firecracker_impl {
                 snapshot_dir: None,
                 vsock_uds_path: None,
                 vsock_identity: None,
+                // 非 PDEATHSIG fork 的测试替身：无 holder，直接 None。
+                holder: None,
             }
         }
 

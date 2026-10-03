@@ -1,11 +1,11 @@
-//! The capability surface advertised by the Rig adapter.
+//! The capability surface advertised by the ADK adapter.
 
 use rfb::{Capability, Sandbox};
 
-/// A known capability exposed as a Rig tool. `core()` maps it to the RFB core
+/// A known capability exposed as an ADK tool. `core()` maps it to the RFB core
 /// capability that gates registration; `Edit` is a compound of read+write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RigCapability {
+pub enum AdkCapability {
     /// Stable `bash` tool, backed by the core execute capability.
     Bash,
     /// Stable structured text replacement, backed by core read/write.
@@ -32,7 +32,7 @@ pub enum RigCapability {
     Cancel,
 }
 
-impl RigCapability {
+impl AdkCapability {
     pub(super) fn core(self) -> Option<Capability> {
         match self {
             Self::Bash => Some(Capability::Execute),

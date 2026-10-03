@@ -1,6 +1,10 @@
-//! Rig adapters for RFB.
+//! ADK (adk-rust) agent integration for RFB.
+//!
+//! Exposes an RFB sandbox as ADK function tools and assembles a ready-to-run
+//! [`adk_rust::agent::LlmAgent`] over them; the application owns the model
+//! credentials, prompts, and session lifecycle.
 
-/// Adapters that expose an RFB sandbox as Rig tools.
+/// Adapters that expose an RFB sandbox as ADK tools and agents.
 pub mod adapter;
 pub use adapter::*;
 
@@ -14,7 +18,7 @@ pub use execution::{ExecutionError, ExecutionTarget, GuestExecution};
 /// decisions intentionally remain outside this crate.
 ///
 /// ```
-/// # use rfb_rig::{ExecutionTarget, GuestExecution};
+/// # use rfb_adk::{ExecutionTarget, GuestExecution};
 /// # let target = ExecutionTarget::unsupported("not provisioned");
 /// assert!(target.capabilities().is_empty());
 /// ```

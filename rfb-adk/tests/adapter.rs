@@ -1,23 +1,76 @@
-//! Public-API integration tests for the `rfb-rig` adapter.
+//! Public-API integration tests for the `rfb-adk` adapter.
 //!
-//! These tests exercise [`rfb_rig`] strictly through its public surface and
+//! These tests exercise [`rfb_adk`] strictly through its public surface and
 //! [`rfb::Sandbox`], so they also serve as a compile-time check that the
 //! adapter is usable from another crate without access to its internals.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use adk_rust::AdkError;
 use futures::executor::block_on;
 use rfb::guest as guest_dtos;
 use rfb::{
     BackendKind, BoxFuture, Capability, ExecResult, ExecSpec, Sandbox, SandboxError, TransportKind,
 };
-use rfb_rig::{
-    execute_schema, portable_dynamic_tools, rig_tools, sandbox_execute_tool, RigCapability,
-    RigPortableTools, SandboxExecuteAdapter, SANDBOX_EXECUTE_NAME, TOOL_NAMES,
+use rfb_adk::{
+    execute_schema, sandbox_execute_tool, sandbox_tools, AdkCapability, SandboxExecuteTool,
+    SandboxTools, SANDBOX_EXECUTE_NAME, TOOL_NAMES,
 };
-use rig_core::tool::{ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
+
+/// Minimal no-op ADK tool context for direct tool dispatch in tests.
+struct NullCtx;
+
+#[adk_rust::async_trait]
+impl adk_rust::ReadonlyContext for NullCtx {
+    fn invocation_id(&self) -> &str {
+        "test"
+    }
+    fn agent_name(&self) -> &str {
+        "test"
+    }
+    fn user_id(&self) -> &str {
+        "test"
+    }
+    fn app_name(&self) -> &str {
+        "test"
+    }
+    fn session_id(&self) -> &str {
+        "test"
+    }
+    fn branch(&self) -> &str {
+        ""
+    }
+    fn user_content(&self) -> &adk_rust::Content {
+        static CONTENT: std::sync::OnceLock<adk_rust::Content> = std::sync::OnceLock::new();
+        CONTENT.get_or_init(|| adk_rust::Content::new("user").with_text("test"))
+    }
+}
+
+impl adk_rust::CallbackContext for NullCtx {
+    fn artifacts(&self) -> Option<Arc<dyn adk_rust::Artifacts>> {
+        None
+    }
+}
+
+#[adk_rust::async_trait]
+impl adk_rust::ToolContext for NullCtx {
+    fn function_call_id(&self) -> &str {
+        "test"
+    }
+    fn actions(&self) -> adk_rust::EventActions {
+        adk_rust::EventActions::default()
+    }
+    fn set_actions(&self, _actions: adk_rust::EventActions) {}
+    async fn search_memory(&self, _query: &str) -> adk_rust::Result<Vec<adk_rust::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+fn ctx() -> Arc<dyn adk_rust::ToolContext> {
+    Arc::new(NullCtx)
+}
 
 /// A public in-process fake [`Sandbox`] that records the specs it receives and
 /// returns a scripted result.
@@ -115,11 +168,8 @@ impl Sandbox for ScriptedSandbox {
     }
 }
 
-fn run(
-    adapter: &SandboxExecuteAdapter,
-    arguments: Value,
-) -> Result<ToolOutput, ToolExecutionError> {
-    block_on(adapter.execute(arguments))
+fn run(tool: &SandboxExecuteTool, arguments: Value) -> Result<Value, AdkError> {
+    block_on(adk_rust::Tool::execute(tool, ctx(), arguments))
 }
 
 #[test]
@@ -155,10 +205,14 @@ fn schema_is_strict_and_exposes_the_documented_fields() {
 
 #[test]
 fn tool_surface_exposes_the_stable_name_and_schema() {
-    let tool = sandbox_execute_tool(Arc::new(FakeSandbox::new()));
-    assert_eq!(tool.name(), SANDBOX_EXECUTE_NAME);
-    assert_eq!(tool.definition().name, SANDBOX_EXECUTE_NAME);
-    assert_eq!(tool.definition().parameters["additionalProperties"], false);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(FakeSandbox::new()));
+    assert_eq!(adk_rust::Tool::name(&tool), SANDBOX_EXECUTE_NAME);
+    assert_eq!(
+        adk_rust::Tool::parameters_schema(&tool).unwrap()["additionalProperties"],
+        false
+    );
+    let shared = sandbox_execute_tool(Arc::new(FakeSandbox::new()));
+    assert_eq!(adk_rust::Tool::name(shared.as_ref()), SANDBOX_EXECUTE_NAME);
 }
 
 #[test]
@@ -168,16 +222,15 @@ fn stable_surface_registers_only_advertised_capabilities() {
         ["read", "write", "edit", "bash", "grep", "find", "ls"]
     );
     let sandbox = Arc::new(AllGuestSandbox);
-    let tools = portable_dynamic_tools(sandbox);
-    let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+    let tools = sandbox_tools(sandbox);
+    let names: Vec<_> = tools.tools().iter().map(|t| t.name().to_owned()).collect();
     assert_eq!(names, TOOL_NAMES);
 
-    let execute_only = Arc::new(FakeSandbox::new());
-    assert!(rig_tools(execute_only)
+    let execute_only_tools = sandbox_tools(Arc::new(FakeSandbox::new()));
+    assert!(execute_only_tools
         .tools()
         .iter()
         .any(|tool| tool.name() == "bash"));
-    let execute_only_tools = rig_tools(Arc::new(FakeSandbox::new()));
     assert!(!execute_only_tools
         .tools()
         .iter()
@@ -216,10 +269,10 @@ impl Sandbox for AllGuestSandbox {
 #[test]
 fn cwd_is_accepted_as_an_opaque_guest_path_and_forwarded_uninterpreted() {
     let sandbox = FakeSandbox::new();
-    let adapter = SandboxExecuteAdapter::new(sandbox.clone());
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox.clone()));
 
     let result = run(
-        &adapter,
+        &tool,
         json!({"command": "pwd", "cwd": "/guest/work dir/src"}),
     );
     assert!(result.is_ok(), "valid guest paths must reach the sandbox");
@@ -238,11 +291,10 @@ fn invalid_cwd_is_rejected_before_reaching_the_sandbox() {
         "",
     ] {
         let sandbox = FakeSandbox::new();
-        let adapter = SandboxExecuteAdapter::new(sandbox.clone());
-        let error = run(&adapter, json!({"command": "pwd", "cwd": cwd}))
+        let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox.clone()));
+        let error = run(&tool, json!({"command": "pwd", "cwd": cwd}))
             .expect_err("invalid cwd must be rejected");
-        assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-        assert_eq!(error.code(), None);
+        assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
         assert!(
             sandbox.exec_specs().is_empty(),
             "sandbox was never called for {cwd:?}"
@@ -258,15 +310,14 @@ fn structured_output_matches_the_documented_contract() {
         stderr: vec![0xff, 0xfe],
         timed_out: false,
     }));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let out = run(
-        &adapter,
+    let payload = run(
+        &tool,
         json!({"command": "echo", "args": ["héllo"], "stdin": [104, 105, 0]}),
     )
     .unwrap();
 
-    let payload = out.as_json().expect("output is JSON");
     assert_eq!(payload["status"], json!(7));
     // Bytes are surfaced lossily as text so models can consume them; the
     // original bytes remain intact in the core result.
@@ -279,10 +330,10 @@ fn structured_output_matches_the_documented_contract() {
 #[test]
 fn exec_spec_is_forwarded_with_args_stdin_and_timeout() {
     let sandbox = FakeSandbox::new();
-    let adapter = SandboxExecuteAdapter::new(sandbox.clone());
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox.clone()));
 
     run(
-        &adapter,
+        &tool,
         json!({
             "command": "ls",
             "args": ["-la", "src"],
@@ -304,7 +355,7 @@ fn exec_spec_is_forwarded_with_args_stdin_and_timeout() {
 #[test]
 fn unknown_fields_and_missing_command_are_rejected() {
     let sandbox = FakeSandbox::new();
-    let adapter = SandboxExecuteAdapter::new(sandbox.clone());
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox.clone()));
 
     for arguments in [
         json!({"command": "x", "extra": 1}),
@@ -312,8 +363,8 @@ fn unknown_fields_and_missing_command_are_rejected() {
         json!({}),
         json!({"args": ["naked"]}),
     ] {
-        let error = run(&adapter, arguments).expect_err("must be rejected");
-        assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
+        let error = run(&tool, arguments).expect_err("must be rejected");
+        assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
         assert!(sandbox.exec_specs().is_empty(), "sandbox was never called");
     }
 }
@@ -321,19 +372,19 @@ fn unknown_fields_and_missing_command_are_rejected() {
 #[test]
 fn overlong_stdin_bytes_and_zero_timeout_are_rejected() {
     let sandbox = FakeSandbox::new();
-    let adapter = SandboxExecuteAdapter::new(sandbox.clone());
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox.clone()));
 
     assert_eq!(
-        run(&adapter, json!({"command": "x", "stdin": [0, 256]}))
+        run(&tool, json!({"command": "x", "stdin": [0, 256]}))
             .unwrap_err()
-            .kind(),
-        ToolErrorKind::InvalidArgs
+            .category,
+        adk_rust::ErrorCategory::InvalidInput
     );
     assert_eq!(
-        run(&adapter, json!({"command": "x", "timeout_ms": 0}))
+        run(&tool, json!({"command": "x", "timeout_ms": 0}))
             .unwrap_err()
-            .kind(),
-        ToolErrorKind::InvalidArgs
+            .category,
+        adk_rust::ErrorCategory::InvalidInput
     );
     assert!(sandbox.exec_specs().is_empty());
 }
@@ -346,76 +397,80 @@ fn timeout_is_classified_and_redacted() {
         stderr: "partial".as_bytes().to_vec(),
         timed_out: true,
     }));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let error = run(&adapter, json!({"command": "slow"})).unwrap_err();
+    let error = run(&tool, json!({"command": "slow"})).unwrap_err();
 
-    assert_eq!(error.kind(), ToolErrorKind::Timeout);
-    assert_eq!(error.code(), Some("execution_timeout"));
-    assert_eq!(error.retryable(), Some(true));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Timeout);
+    assert_eq!(error.code, "rfb.tool.execution_timeout");
+    assert!(error.retry.should_retry);
     // The model sees only stable feedback, never partial stdout/stderr.
-    assert_eq!(error.model_feedback(), Some("tool execution timed out"));
-    assert!(!error.model_output().render().contains("partial"));
+    assert!(!error.message.contains("partial"));
+    assert!(!render_adk(&error).contains("partial"));
 }
 
 #[test]
 fn transport_diagnostics_are_redacted_from_model_visible_output() {
     let secret = "tcp://sandbox.internal/session/secret-token";
     let sandbox = ScriptedSandbox::new(Err(SandboxError::Transport(secret.to_string())));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let error = run(&adapter, json!({"command": "x"})).unwrap_err();
+    let error = run(&tool, json!({"command": "x"})).unwrap_err();
 
-    assert_eq!(error.kind(), ToolErrorKind::Network);
-    assert_eq!(error.code(), Some("transport"));
-    assert_eq!(
-        error.model_feedback(),
-        Some("the tool could not reach its upstream service")
-    );
-    // The operator-facing message still carries the diagnostics for logs...
-    assert!(error.message().contains(secret));
-    // ...but they never reach the model presentation.
-    assert!(!error.model_output().render().contains("secret-token"));
-    assert!(!error.model_output().render().contains("sandbox.internal"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unavailable);
+    assert_eq!(error.code, "rfb.tool.transport");
+    // The model-visible message is generic; the diagnostics ride in the
+    // operator-facing metadata for logs.
+    assert!(!error.message.contains(secret));
+    let diagnostics = error
+        .details
+        .metadata
+        .get("diagnostics")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(diagnostics.contains(secret), "diagnostics: {diagnostics}");
 }
 
 #[test]
 fn execution_diagnostics_are_redacted_from_model_visible_output() {
     let secret = "payload of restricted data";
     let sandbox = ScriptedSandbox::new(Err(SandboxError::Execution(secret.to_string())));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let error = run(&adapter, json!({"command": "x"})).unwrap_err();
+    let error = run(&tool, json!({"command": "x"})).unwrap_err();
 
-    assert_eq!(error.kind(), ToolErrorKind::Other);
-    assert_eq!(error.code(), Some("execution"));
-    assert!(error.message().contains(secret));
-    assert_eq!(error.model_feedback(), Some("the tool failed"));
-    assert!(!error.model_output().render().contains(secret));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Internal);
+    assert_eq!(error.code, "rfb.tool.execution");
+    assert!(!error.message.contains(secret));
+    let diagnostics = error
+        .details
+        .metadata
+        .get("diagnostics")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(diagnostics.contains(secret), "diagnostics: {diagnostics}");
 }
 
 #[test]
-fn unsupported_capability_is_permission_denied() {
+fn unsupported_capability_is_unsupported() {
     let sandbox = ScriptedSandbox::new(Err(SandboxError::UnsupportedCapability(Capability::Eval)));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let error = run(&adapter, json!({"command": "x"})).unwrap_err();
+    let error = run(&tool, json!({"command": "x"})).unwrap_err();
 
-    assert_eq!(error.kind(), ToolErrorKind::PermissionDenied);
-    assert_eq!(error.code(), Some("unsupported_capability"));
-    assert_eq!(error.model_feedback(), Some("the tool denied the request"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unsupported);
+    assert_eq!(error.code, "rfb.tool.unsupported_capability");
 }
 
 #[test]
 fn not_ready_is_classified_and_safe() {
     let sandbox = ScriptedSandbox::new(Err(SandboxError::NotReady));
-    let adapter = SandboxExecuteAdapter::new(sandbox);
+    let tool = SandboxExecuteTool::from_arc(Arc::new(sandbox));
 
-    let error = run(&adapter, json!({"command": "x"})).unwrap_err();
+    let error = run(&tool, json!({"command": "x"})).unwrap_err();
 
-    assert_eq!(error.kind(), ToolErrorKind::Other);
-    assert_eq!(error.code(), Some("not_ready"));
-    assert_eq!(error.model_feedback(), Some("the tool failed"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unavailable);
+    assert_eq!(error.code, "rfb.tool.not_ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -745,23 +800,27 @@ impl Sandbox for StreamingSandbox {
 
 fn invoke_tool(
     sandbox: &Arc<dyn Sandbox>,
-    capability: RigCapability,
+    capability: AdkCapability,
     args: Value,
-) -> Result<ToolOutput, ToolExecutionError> {
-    let tools = RigPortableTools::from_sandbox(sandbox.clone());
+) -> Result<Value, AdkError> {
+    let tools = SandboxTools::from_sandbox(sandbox.clone());
     block_on(tools.invoke(capability, args))
 }
 
-/// Invoke the stream tool. `RigPortableTools::from_sandbox` only registers the
+/// Invoke the stream tool. `SandboxTools::from_sandbox` only registers the
 /// default seven-tool surface, so the surface must explicitly declare the
 /// `Stream` capability (which the sandbox stub advertises in `capabilities()`)
 /// for the stream tool to be reachable at all.
-fn invoke_stream_tool(
-    sandbox: &Arc<dyn Sandbox>,
-    args: Value,
-) -> Result<ToolOutput, ToolExecutionError> {
-    let tools = RigPortableTools::new(sandbox.clone(), [RigCapability::Stream]);
-    block_on(tools.invoke(RigCapability::Stream, args))
+fn invoke_stream_tool(sandbox: &Arc<dyn Sandbox>, args: Value) -> Result<Value, AdkError> {
+    let tools = SandboxTools::new(sandbox.clone(), [AdkCapability::Stream]);
+    block_on(tools.invoke(AdkCapability::Stream, args))
+}
+
+/// What the ADK runner hands back to the model for a failed tool call: the
+/// error's message (the metadata channel is operator-facing, never model
+/// input). The redaction tests assert the secrets stay out of this.
+fn render_adk(error: &AdkError) -> String {
+    error.message.clone()
 }
 
 #[test]
@@ -769,23 +828,23 @@ fn structured_read_write_tools_round_trip() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(StructuredSandbox::default());
     let written = invoke_tool(
         &sandbox,
-        RigCapability::Write,
+        AdkCapability::Write,
         json!({"path": "notes.txt", "data": [104, 105, 0]}),
     )
     .unwrap();
-    assert_eq!(written.as_json().unwrap()["bytes_written"], json!(3));
+    assert_eq!(written["bytes_written"], json!(3));
 
-    let read = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "notes.txt"})).unwrap();
-    assert_eq!(read.as_json().unwrap()["data"], json!([104, 105, 0]));
-    assert_eq!(read.as_json().unwrap()["total_bytes"], json!(3));
+    let read = invoke_tool(&sandbox, AdkCapability::Read, json!({"path": "notes.txt"})).unwrap();
+    assert_eq!(read["data"], json!([104, 105, 0]));
+    assert_eq!(read["total_bytes"], json!(3));
 }
 
 #[test]
 fn structured_tools_register_only_advertised_capabilities() {
     let read_only: Arc<dyn Sandbox> = Arc::new(ReadOnlySandbox);
-    let tools = RigPortableTools::from_sandbox(read_only.clone());
+    let tools = SandboxTools::from_sandbox(read_only.clone());
     let registered = tools.tools();
-    let names: Vec<&str> = registered.iter().map(|tool| tool.name()).collect();
+    let names: Vec<&str> = registered.iter().map(|t| t.name()).collect();
     assert!(names.contains(&"read"));
     assert!(
         !names.contains(&"write"),
@@ -819,13 +878,13 @@ fn edit_tool_single_and_replace_all_semantics() {
         Arc::new(StructuredSandbox::with_file("a.txt", b"one two three"));
     invoke_tool(
         &sandbox,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "a.txt", "old_text": "one", "new_text": "1"}),
     )
     .unwrap();
-    let read = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "a.txt"})).unwrap();
+    let read = invoke_tool(&sandbox, AdkCapability::Read, json!({"path": "a.txt"})).unwrap();
     assert_eq!(
-        read.as_json().unwrap()["data"],
+        read["data"],
         json!([49, 32, 116, 119, 111, 32, 116, 104, 114, 101, 101])
     );
 
@@ -833,25 +892,22 @@ fn edit_tool_single_and_replace_all_semantics() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(StructuredSandbox::with_file("b.txt", b"one two one"));
     let error = invoke_tool(
         &sandbox,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "b.txt", "old_text": "one", "new_text": "1"}),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-    assert!(error.message().contains("exactly once"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
+    assert!(error.message.contains("exactly once"));
 
     // replace_all applies to every occurrence.
     invoke_tool(
         &sandbox,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "b.txt", "old_text": "one", "new_text": "1", "replace_all": true}),
     )
     .unwrap();
-    let read = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "b.txt"})).unwrap();
-    assert_eq!(
-        read.as_json().unwrap()["data"],
-        json!([49, 32, 116, 119, 111, 32, 49])
-    );
+    let read = invoke_tool(&sandbox, AdkCapability::Read, json!({"path": "b.txt"})).unwrap();
+    assert_eq!(read["data"], json!([49, 32, 116, 119, 111, 32, 49]));
 }
 
 #[test]
@@ -859,68 +915,68 @@ fn edit_tool_reports_missing_text_and_non_utf8_content() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(StructuredSandbox::with_file("a.txt", b"hello world"));
     let error = invoke_tool(
         &sandbox,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "a.txt", "old_text": "zzz", "new_text": "x"}),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-    assert!(error.message().contains("not found"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
+    assert!(error.message.contains("not found"));
 
     let error = invoke_tool(
         &sandbox,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "a.txt", "old_text": "", "new_text": "x"}),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-    assert!(error.message().contains("must not be empty"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
+    assert!(error.message.contains("must not be empty"));
 
     let binary: Arc<dyn Sandbox> = Arc::new(StructuredSandbox::with_file("bin.dat", &[0xff, 0xfe]));
     let error = invoke_tool(
         &binary,
-        RigCapability::Edit,
+        AdkCapability::Edit,
         json!({"path": "bin.dat", "old_text": "a", "new_text": "b"}),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-    assert!(error.message().contains("UTF-8"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
+    assert!(error.message.contains("UTF-8"));
 }
 
 #[test]
 fn structured_invalid_args_are_rejected_before_reaching_the_sandbox() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(StructuredSandbox::default());
     for (capability, args) in [
-        (RigCapability::Read, json!({"path": ""})),
-        (RigCapability::Read, json!({"path": "../etc/passwd"})),
-        (RigCapability::Read, json!({"path": "x", "max_bytes": 0})),
-        (RigCapability::Write, json!({"path": "", "data": [1]})),
-        (RigCapability::Write, json!({"path": "x", "data": [0, 256]})),
-        (RigCapability::Ls, json!({"path": ".", "max_results": 0})),
-        (RigCapability::Find, json!({"path": ".", "pattern": ""})),
+        (AdkCapability::Read, json!({"path": ""})),
+        (AdkCapability::Read, json!({"path": "../etc/passwd"})),
+        (AdkCapability::Read, json!({"path": "x", "max_bytes": 0})),
+        (AdkCapability::Write, json!({"path": "", "data": [1]})),
+        (AdkCapability::Write, json!({"path": "x", "data": [0, 256]})),
+        (AdkCapability::Ls, json!({"path": ".", "max_results": 0})),
+        (AdkCapability::Find, json!({"path": ".", "pattern": ""})),
         (
-            RigCapability::Grep,
+            AdkCapability::Grep,
             json!({"path": ".", "pattern": "x", "max_bytes": 0}),
         ),
     ] {
         let error = invoke_tool(&sandbox, capability, args.clone()).unwrap_err();
         assert_eq!(
-            error.kind(),
-            ToolErrorKind::InvalidArgs,
+            error.category,
+            adk_rust::ErrorCategory::InvalidInput,
             "{capability:?} with {args:?}"
         );
     }
 
     // `eval` is not part of the default structured tool surface, so the
     // capability gate fires before argument validation: even invalid args are
-    // surfaced as PermissionDenied rather than InvalidArgs.
+    // surfaced as Unsupported rather than InvalidInput.
     for args in [json!({"code": "  "}), json!({"code": "1+1", "timeout": 0})] {
-        let error = invoke_tool(&sandbox, RigCapability::Eval, args.clone()).unwrap_err();
+        let error = invoke_tool(&sandbox, AdkCapability::Eval, args.clone()).unwrap_err();
         assert_eq!(
-            error.kind(),
-            ToolErrorKind::PermissionDenied,
+            error.category,
+            adk_rust::ErrorCategory::Unsupported,
             "unregistered eval with {args:?}"
         );
-        assert_eq!(error.code(), Some("unsupported_capability"));
+        assert_eq!(error.code, "rfb.tool.unsupported_capability");
     }
 }
 
@@ -930,28 +986,28 @@ fn structured_ls_find_grep_return_typed_json() {
         "src/main.rs",
         b"fn main() {}\n",
     ));
-    let ls = invoke_tool(&sandbox, RigCapability::Ls, json!({"path": "."})).unwrap();
-    let entries = ls.as_json().unwrap()["entries"].as_array().unwrap();
+    let ls = invoke_tool(&sandbox, AdkCapability::Ls, json!({"path": "."})).unwrap();
+    let entries = ls["entries"].as_array().unwrap();
     assert!(entries.iter().any(|entry| entry["name"] == "src/main.rs"));
 
     let find = invoke_tool(
         &sandbox,
-        RigCapability::Find,
+        AdkCapability::Find,
         json!({"path": ".", "pattern": "main"}),
     )
     .unwrap();
-    let matches = find.as_json().unwrap()["matches"].as_array().unwrap();
+    let matches = find["matches"].as_array().unwrap();
     assert!(matches
         .iter()
         .any(|path| path.as_str() == Some("src/main.rs")));
 
     let grep = invoke_tool(
         &sandbox,
-        RigCapability::Grep,
+        AdkCapability::Grep,
         json!({"path": ".", "pattern": "fn main"}),
     )
     .unwrap();
-    let matches = grep.as_json().unwrap()["matches"].as_array().unwrap();
+    let matches = grep["matches"].as_array().unwrap();
     assert!(matches.iter().any(|m| m["text"] == "fn main() {}"));
 }
 
@@ -960,11 +1016,10 @@ fn structured_timeout_error_is_classified_and_safe() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedStructuredError {
         error: SandboxError::Timeout,
     });
-    let error = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "a.txt"})).unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::Timeout);
-    assert_eq!(error.code(), Some("execution_timeout"));
-    assert_eq!(error.retryable(), Some(true));
-    assert_eq!(error.model_feedback(), Some("tool execution timed out"));
+    let error = invoke_tool(&sandbox, AdkCapability::Read, json!({"path": "a.txt"})).unwrap_err();
+    assert_eq!(error.category, adk_rust::ErrorCategory::Timeout);
+    assert_eq!(error.code, "rfb.tool.execution_timeout");
+    assert!(error.retry.should_retry);
 }
 
 #[test]
@@ -973,22 +1028,28 @@ fn structured_transport_error_is_redacted_from_model_visible_output() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedStructuredError {
         error: SandboxError::Transport(secret.to_string()),
     });
-    let error = invoke_tool(&sandbox, RigCapability::Ls, json!({"path": "."})).unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::Network);
-    assert_eq!(error.code(), Some("transport"));
-    assert!(error.message().contains(secret));
-    assert!(!error.model_output().render().contains("secret-token"));
-    assert!(!error.model_output().render().contains("sandbox.internal"));
+    let error = invoke_tool(&sandbox, AdkCapability::Ls, json!({"path": "."})).unwrap_err();
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unavailable);
+    assert_eq!(error.code, "rfb.tool.transport");
+    assert!(!render_adk(&error).contains("secret-token"));
+    assert!(!render_adk(&error).contains("sandbox.internal"));
+    let diagnostics = error
+        .details
+        .metadata
+        .get("diagnostics")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(diagnostics.contains(secret));
 }
 
 #[test]
-fn structured_invalid_spec_error_is_invalid_args() {
+fn structured_invalid_spec_error_is_invalid_input() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedStructuredError {
         error: SandboxError::InvalidSpec(rfb::ContractError::InvalidCwd),
     });
-    let error = invoke_tool(&sandbox, RigCapability::Ls, json!({"path": "."})).unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::InvalidArgs);
-    assert_eq!(error.code(), Some("invalid_spec"));
+    let error = invoke_tool(&sandbox, AdkCapability::Ls, json!({"path": "."})).unwrap_err();
+    assert_eq!(error.category, adk_rust::ErrorCategory::InvalidInput);
+    assert_eq!(error.code, "rfb.tool.invalid_spec");
 }
 
 #[test]
@@ -999,25 +1060,30 @@ fn structured_execution_error_is_classified_and_redacted() {
     });
     let error = invoke_tool(
         &sandbox,
-        RigCapability::Grep,
+        AdkCapability::Grep,
         json!({"path": ".", "pattern": "x"}),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::Other);
-    assert_eq!(error.code(), Some("execution"));
-    assert!(error.message().contains(secret));
-    assert!(!error.model_output().render().contains(secret));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Internal);
+    assert_eq!(error.code, "rfb.tool.execution");
+    assert!(!render_adk(&error).contains(secret));
+    let diagnostics = error
+        .details
+        .metadata
+        .get("diagnostics")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(diagnostics.contains(secret));
 }
 
 #[test]
-fn structured_unsupported_capability_is_permission_denied() {
+fn structured_unsupported_capability_is_unsupported() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(ScriptedStructuredError {
         error: SandboxError::UnsupportedCapability(Capability::Eval),
     });
-    let error = invoke_tool(&sandbox, RigCapability::Read, json!({"path": "a.txt"})).unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::PermissionDenied);
-    assert_eq!(error.code(), Some("unsupported_capability"));
-    assert_eq!(error.model_feedback(), Some("the tool denied the request"));
+    let error = invoke_tool(&sandbox, AdkCapability::Read, json!({"path": "a.txt"})).unwrap_err();
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unsupported);
+    assert_eq!(error.code, "rfb.tool.unsupported_capability");
 }
 
 #[test]
@@ -1028,7 +1094,7 @@ fn structured_stream_tool_drains_guest_events() {
         json!({"command": "sh", "args": ["-c", "echo hi"]}),
     )
     .unwrap();
-    let events = out.as_json().unwrap().as_array().unwrap();
+    let events = out.as_array().unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0]["kind"], "started");
     assert_eq!(events[1]["kind"], "stdout");
@@ -1043,6 +1109,6 @@ fn structured_stream_tool_surfaces_sandbox_errors() {
         error: SandboxError::Transport("stream relay unreachable".into()),
     });
     let error = invoke_stream_tool(&sandbox, json!({"command": "sh"})).unwrap_err();
-    assert_eq!(error.kind(), ToolErrorKind::Network);
-    assert_eq!(error.code(), Some("transport"));
+    assert_eq!(error.category, adk_rust::ErrorCategory::Unavailable);
+    assert_eq!(error.code, "rfb.tool.transport");
 }

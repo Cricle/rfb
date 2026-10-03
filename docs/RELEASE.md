@@ -38,7 +38,7 @@
 - **内核 pin**：e2e（ci.yml）下载的 `vmlinux-5.10.225` 下载后即用固化的 sha256
   校验（`23b3047df7dada3500d06c8012cc030b921da01e213735f7717d2166cfcf5f06`）。
 - **边界脚本增强**：`scripts/check-boundary.sh` 新增依赖方向断言
-  （rfb-sdk ↛ rfb-rig/rfb-ben、rfb-runtime ↛ rfb-sdk/rfb-rig、rfb-rig →
+  （rfb-sdk ↛ rfb-adk/rfb-ben、rfb-runtime ↛ rfb-sdk/rfb-adk、rfb-adk →
   rfb-sdk，经 `cargo metadata` 解析、工具不可用时降级为警告）；
   `scripts/release.sh` 开头先调用它。`scripts/check-tests-folder.sh` 的
   内联测试正则覆盖 `cfg(all(test,…))`/`cfg(any(test,…))` 等变体，扫描范围
@@ -48,7 +48,7 @@
 
 | 渠道 | 产物 | 发布方式 |
 |---|---|---|
-| crates.io | `rfb-runtime` → `rfb-sdk` → `rfb-rig`（0.0.1） | `scripts/release.sh`：门禁（fmt/test/doc）+ 按依赖序逐个 `package`+`publish`，渠道间等待索引传播；`--token` CLI 直传凭据 |
+| crates.io | `rfb-runtime` → `rfb-sdk` → `rfb-adk`（0.0.1） | `scripts/release.sh`：门禁（fmt/test/doc）+ 按依赖序逐个 `package`+`publish`，渠道间等待索引传播；`--token` CLI 直传凭据 |
 | PyPI | `rfb-sdk`（SDK 绑定） | `python -m build` + `pypa/gh-action-pypi-publish`（凭据 `PYPI_KEY`）。CLI 不做 PyPI 渠道：二进制发布不引入 Python 包装壳，CLI 走 crates.io 源码安装、GitHub Release、npm 与 NuGet |
 | Maven Central | `io.github.cricle:rfb-sdk` | GPG 签名 + central-publishing-maven-plugin（自动发布，等待 published） |
 | NuGet | `Rfb.Sdk`（SDK）+ `Rfb.Cli`（binary-only 包） | `dotnet pack` + `dotnet nuget push --skip-duplicate`；二进制同上来自 artifact |

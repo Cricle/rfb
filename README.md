@@ -17,7 +17,7 @@ RFB (Runtime/Resource/Filesystem Boundary) is a sandbox-oriented Rust workspace 
 ```toml
 [dependencies]
 rfb-sdk = "0.0.1"
-rfb-rig = "0.0.1"
+rfb-adk = "0.0.1"
 # Only needed for the guest/Firecracker runtime:
 rfb-runtime = { version = "0.0.1", default-features = false, features = ["host-vsock"] }
 ```
@@ -63,10 +63,10 @@ Published crates contain Rust sources and crate resources only — no Firecracke
 | Crate | Responsibility |
 |---|---|
 | `rfb-sdk` | Minimal sandbox API, capability / filesystem / guest protocol abstractions; optional forkd, ZBRT, and `rfb-cli` integration. |
-| `rfb-rig` | Adapts RFB sandbox capabilities as Rig 0.42 tools; does not own an agent loop. |
+| `rfb-adk` | Adapts RFB sandbox capabilities as ADK (adk-rust) agent tools; assembles a ready-to-run agent; the application owns the model. |
 | `rfb-runtime` | RFB1 guest/runtime, workspace executor, vsock, Firecracker controller, and runtime tests; also hosts library code used by build/acceptance flows. |
 
-Dependency direction: `rfb-rig` / `rfb-runtime` → `rfb-sdk`; `rfb-sdk` never depends on Rig. The application owns agents, prompts, models, HTTP/SSE, credentials, and session storage.
+Dependency direction: `rfb-adk` / `rfb-runtime` → `rfb-sdk`; `rfb-sdk` never depends on adk-rust. The application owns agents, prompts, models, HTTP/SSE, credentials, and session storage.
 
 ## Multi-language SDKs
 
@@ -121,7 +121,7 @@ This repository keeps `resx/firecracker/firecracker-v1.16.1-x86_64.tgz` as the o
 
 - **CI** — every PR and non-main push: Rust checks (fmt, clippy, tests, docs with `--all-features`, boundary checks) plus full SDK builds and tests (Python / C# / Java / Node.js) in a clean Debian 12 container.
 - **Real-VM E2E** — pushes to `main`: boots the real Firecracker/forkd stack on a KVM runner, creates a snapshot from the forkd-agent rootfs, and runs the full `#[ignore]`-gated real-VM test suite.
-- **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-rig` to crates.io, `rfb-sdk` to PyPI, `io.github.cricle:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, and `rfb-sdk` (TypeScript) plus the `rfb-cli` binary to npm, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
+- **Release** — pushing a `vMAJOR.MINOR.PATCH` tag publishes `rfb-runtime` → `rfb-sdk` → `rfb-adk` to crates.io, `rfb-sdk` to PyPI, `io.github.cricle:rfb-sdk` to Maven Central (GPG-signed), and `Rfb.Sdk` to NuGet, and `rfb-sdk` (TypeScript) plus the `rfb-cli` binary to npm, then attaches the `rfb-cli` binary and SHA256SUMS to a GitHub Release. Publishing is idempotent: already-published artifacts are skipped on re-runs.
 
 ## Release & CI
 

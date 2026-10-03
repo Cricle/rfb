@@ -251,12 +251,31 @@ Python SDK 额外携带**宿主侧编排**（`rfb_sdk/host.py`，纯标准库）
 
 ## 11. 已知的有意分歧（documented divergences）
 
+- **guest shell 能力边界（busybox sh v1，agent 实战 2026-10 确认）**：
+  guest 镜像的 `/bin/sh` 是自研多调用二进制（`rfb-busybox`，模块头即规格）：
+  支持 `;`/换行、`&&`/`||`、管道、重定向（`>`/`>>`/`<`/`2>&1` 等）、引号、
+  `$?`、内建 `exit/echo/cd/pwd/true/false/:`；**不支持**变量展开（除 `$?`）、
+  循环、命令替换、glob，且 **只接受 `sh -c SCRIPT`**（`sh SCRIPT` 与交互
+  模式报 "interactive shell is not supported"）。agent 工具调用必须用 -c
+  形式。镜像内的 applet 就这些：`sh/bash/sleep/echo/true/false/netprobe/
+  vsockdial/nproc`——没有 rm/cat/ls/tail/wc（ls/cat 走 FS RPC），脚本里
+  `rm` 要换成 `: > file` 截断、读文件走 read RPC。
+
 - **ZBRT 的 exec deadline 命中**：NDJSON 返回 `ExecResult(timed_out=True,
   exit_code=-1)`；ZBRT 走 guest `Error` 帧（"command timed out"）→ 五 SDK
   一致抛 Remote/guest 错误——ZBRT v1 没有 timed-out 线标志，按消息文本
   反推 timed_out 会分叉传输语义（rust 基线 `client/zbrt.rs` P2 决定，
   实战 2026-10 验证五语言行为一致）。deadline 的**截断本身**两种传输都
   真实生效（子进程被杀）。
+
+- **`rfb-adk`（原 rfb-rig）**：ADK（adk-rust 2.2，edition 2024 / MSRV 1.95）
+  工具面 + `sandbox_agent` 装配（真 runner + 七工具 + OpenAI 兼容网关）；
+  模型可见错误做红线（transport/execution 诊断只进 operator 侧 metadata）。
+  为自治 agent 长驻场景的关键修复：**FC fork 必须在专职 PDEATHSIG holder
+  线程上**——tokio 阻塞池线程空闲 ~10s 即回收，从它 fork 的 FC 会在 boot
+  后 ~10s 整被 SIGKILL（真机演练实测：所有 guest 连接 t≈10s 集体死亡、
+  FC 无退出日志）；holder 线程 spawn 后停驻到 VM teardown（Drop 先杀子
+  进程再放线程）。
 
 - **旧键回退顺序**：~~C# 优先旧键~~（已过时）——实测四语言（Python/Node/Java/C#）与 Rust 基准
   一致，都是**当前键优先**（`stdout`/`output`，见 `GuestResults.cs` 的

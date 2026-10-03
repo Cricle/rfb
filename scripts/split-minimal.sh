@@ -237,8 +237,8 @@ p.write_text(t, encoding="utf-8", newline="")
 # 根 Cargo.toml：简版 workspace 去掉 ben（压测依赖 zeroboot）。
 p = Path("Cargo.toml")
 t = p.read_text(encoding="utf-8").replace(
-    'members = ["rfb", "rfb-rig", "rfb-runtime", "ben"]',
-    'members = ["rfb", "rfb-rig", "rfb-runtime"]')
+    'members = ["rfb", "rfb-adk", "rfb-runtime", "ben"]',
+    'members = ["rfb", "rfb-adk", "rfb-runtime"]')
 p.write_text(t, encoding="utf-8", newline="")
 
 # rfb-runtime：zeroboot/interpreters_lua 的 [[test]] 段 + feature/模块声明。

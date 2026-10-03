@@ -41,6 +41,6 @@ crate 包和源码不携带 Firecracker 可执行文件、Linux kernel、ext4 ro
 
 ## 发布顺序
 
-先发布 `rfb-runtime`，待 crates.io 可解析后再发布 `rfb-sdk`（lib 名仍为 `rfb`）与 `rfb-rig`；发布前用 `cargo test --all-features`（Linux 后端按平台执行）、`cargo doc` 和 `cargo package` 检查 feature/包边界。运行时镜像、kernel、snapshot 与 Firecracker 不随 crate 发布，应作为带目标三元组和 SHA-256 的独立制品发布。
+先发布 `rfb-runtime`，待 crates.io 可解析后再发布 `rfb-sdk`（lib 名仍为 `rfb`）与 `rfb-adk`；发布前用 `cargo test --all-features`（Linux 后端按平台执行）、`cargo doc` 和 `cargo package` 检查 feature/包边界。运行时镜像、kernel、snapshot 与 Firecracker 不随 crate 发布，应作为带目标三元组和 SHA-256 的独立制品发布。
 
 详细构建、验收、安全门禁见仓库根 README 与 `requirements/RFB/0.1.0/`。

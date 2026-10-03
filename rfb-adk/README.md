@@ -1,11 +1,11 @@
-# rfb-rig
+# rfb-adk
 
 Rig adapters for RFB: expose an RFB sandbox to [Rig](https://github.com/0xPlaygrounds/rig)
 agents as callable tools.
 
 ```toml
 [dependencies]
-rfb-rig = "0.0.1"
+rfb-adk = "0.0.1"
 ```
 
 The crate bridges a sandbox handle (forkd or ZeroBoot) into Rig tool definitions:
