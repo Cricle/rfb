@@ -7,6 +7,7 @@
 //! they are never emulated through `exec`.
 
 mod agent;
+mod closure;
 mod capability;
 mod execute;
 mod ops;
@@ -16,6 +17,7 @@ pub use agent::{
     sandbox_agent, sandbox_agent_with_model, SandboxAgent, SandboxAgentConfig, SandboxAgentReply,
 };
 pub use capability::AdkCapability;
+pub use closure::ClosureTool;
 pub use execute::{execute_schema, sandbox_execute_tool, SandboxExecuteTool, SANDBOX_EXECUTE_NAME};
 pub use ops::sandbox_error_to_adk;
 pub use tools::{sandbox_tools, SandboxTools};
